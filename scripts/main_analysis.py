@@ -41,6 +41,20 @@ STEPS = [
     ("grn",              "07_grn.py",               "run_07_grn",              False, "转录因子调控"),
 ]
 
+# 每步会写的状态文件。**跑之前先删掉** —— 否则步骤崩溃时旧文件还在，
+# 下游"产物存在"检查读的是**上一轮的**结果，会给出虚假的通过。
+# 实测踩过：07_grn 因漏 import 崩了，而 grn_status.json 是上一轮的，
+# 验收照样 40 项全绿。
+STEP_STATUS_FILES = {
+    "qc": "qc_status.json",
+    "integrate": "integration_status.json",
+    "cluster_annotate": "cluster_status.json",
+    "pseudobulk_de": "pseudobulk_status.json",
+    "trajectory": "trajectory_status.json",
+    "communication": "communication_status.json",
+    "grn": "grn_status.json",
+}
+
 # 必需产物（相对 results_dir）。(文件名, 中文说明, 是否必需)
 REQUIRED_FILES = [
     ("state.json",                 "步骤状态",           True),
@@ -100,6 +114,10 @@ def run_all(cfg: dict, only: list = None) -> int:
             continue
         log_info("")
         log_info(f"--- {label} ({sid})" + ("" if required else "  [可选]"))
+        # 先删本步的状态文件：崩溃时不留旧文件冒充本轮结果
+        stale = res_dir / STEP_STATUS_FILES.get(sid, "")
+        if sid in STEP_STATUS_FILES and stale.exists():
+            stale.unlink()
         t0 = time.time()
         try:
             fn = load_step_fn(mfile, fn)
@@ -132,8 +150,13 @@ def run_all(cfg: dict, only: list = None) -> int:
         st = {s["id"]: s for s in read_state(cfg).get("steps", [])}.get(sid, {})
         status = st.get("status", "not_run")
         ok = (status == "ok")
-        # 可选步骤的 not_configured / not_applicable / disabled 是**正确行为**
-        if not required and status in ("failed", "not_run"):
+        # **`failed` 不等于"正确地跳过"。**
+        # `not_configured`/`not_applicable`/`disabled`/`not_run` 是**设计如此**
+        # （如没有分组信息就不做拟bulk DE），可选步骤这样算通过。
+        # 但 `failed` 是**崩了** —— 上一版把 failed 也归进 ok=True，
+        # 结果是 07_grn 因漏 import 崩溃而验收全绿、产物还是旧的。
+        if not required and status in ("not_configured", "not_applicable",
+                                       "disabled", "not_run"):
             ok = True
         checks.append({"item": f"步骤 {label}", "ok": ok,
                        "required": required, "detail": status})

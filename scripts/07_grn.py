@@ -39,7 +39,8 @@ import yaml  # noqa: E402
 from scipy import sparse  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed, write_json)
+                    log_warn, parse_args, record_step, save_fig, set_seed, write_json,
+                    W_DOUBLE, W_ONE_HALF, W_SINGLE, mm,)
 
 # 每个调控子保留多少个共表达靶基因
 N_TARGETS = 30
@@ -281,14 +282,14 @@ def run_07_grn(cfg: dict) -> dict:
                     sd[sd == 0] = 1.0
                     matz = np.nan_to_num((mat - mu) / sd)
 
-                    fig, ax = plt.subplots(figsize=(7.2, max(4.0, 0.26 * len(show) + 1.6)))
+                    fig, ax = plt.subplots(figsize=(W_ONE_HALF, max(mm(56), 0.26 * len(show) + 1.6)))
                     im = ax.imshow(matz, aspect="auto", cmap="RdBu_r", vmin=-2, vmax=2)
                     ax.set_yticks(range(len(show)))
                     ax.set_yticklabels(show, fontsize=7)
                     ax.set_xticks(range(nb))
                     ax.set_xticklabels([str(b) for b in range(nb)], fontsize=7)
                     ax.set_xlabel("consensus pseudotime bin (higher = later)")
-                    ax.set_title("Regulon activity along pseudotime (z-scored)", fontsize=10)
+                    ax.set_title("Regulon activity along pseudotime (z-scored)")
                     fig.colorbar(im, ax=ax, label="z-scored activity")
                     save_fig(cfg, "tf_activity_vs_pseudotime", fig)
         except Exception as e:  # noqa: BLE001
@@ -302,7 +303,9 @@ def run_07_grn(cfg: dict) -> dict:
     top_tfs = reg.head(int(grn.get("top_tfs", 10)) * 2)["tf"].tolist()
     if top_tfs:
         sub = act_mat[top_tfs]
-        fig, ax = plt.subplots(figsize=(max(6.0, 0.42 * len(top_tfs) + 2.4),
+        # 宽度夹在 [单栏半, 双栏]：类别少时不至于太空，类别多时也不会
+        # 画出装不进一页的图
+        fig, ax = plt.subplots(figsize=(min(W_DOUBLE, max(W_ONE_HALF, 0.42 * len(top_tfs) + 2.4)),
                                         max(3.4, 0.34 * len(sub) + 1.8)))
         im = ax.imshow(sub.values, aspect="auto", cmap="RdBu_r",
                        vmin=-np.abs(sub.values).max(), vmax=np.abs(sub.values).max())
@@ -310,12 +313,12 @@ def run_07_grn(cfg: dict) -> dict:
         ax.set_xticklabels(top_tfs, rotation=45, ha="right", fontsize=7)
         ax.set_yticks(range(len(sub)))
         ax.set_yticklabels(sub.index, fontsize=7)
-        ax.set_title("TF regulon activity by cluster (top by specificity)", fontsize=10)
+        ax.set_title("TF regulon activity by cluster (top by specificity)")
         fig.colorbar(im, ax=ax, label="mean AUCell-style score")
         save_fig(cfg, "tf_activity_heatmap", fig)
 
     # 特异性 vs 表达细胞比例：识别"只是细胞类型代理"的调控子
-    fig, ax = plt.subplots(figsize=(5.6, 4.2))
+    fig, ax = plt.subplots(figsize=(W_SINGLE, mm(64)))
     ax.scatter(reg["frac_cells_expressing_tf"], reg["cluster_specificity"],
                s=22, color="#2C7FB8", alpha=0.75)
     for r in reg.head(8).itertuples():
@@ -323,7 +326,7 @@ def run_07_grn(cfg: dict) -> dict:
                     fontsize=7, xytext=(3, 3), textcoords="offset points")
     ax.set_xlabel("fraction of cells expressing TF")
     ax.set_ylabel("cluster specificity")
-    ax.set_title("Regulon specificity vs TF detection", fontsize=10)
+    ax.set_title("Regulon specificity vs TF detection")
     save_fig(cfg, "tf_specificity_scatter", fig)
 
     status = {

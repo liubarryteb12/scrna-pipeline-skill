@@ -26,7 +26,8 @@ import numpy as np  # noqa: E402
 import scanpy as sc  # noqa: E402
 
 from common import (ensure_dirs, load_config, log_info, log_warn,  # noqa: E402
-                    parse_args, record_step, save_fig, set_seed, write_json)
+                    parse_args, record_step, save_fig, set_seed, write_json,
+                    W_DOUBLE, W_SINGLE, mm, PAL,)
 
 # 血红蛋白基因（红细胞污染）与核糖体基因的前缀
 HB_PREFIXES = ("HBA", "HBB", "HBD", "HBE", "HBG", "HBM", "HBQ", "HBZ")
@@ -151,27 +152,27 @@ def run_01_qc(cfg: dict) -> dict:
 
     keys = [k for k in ("n_genes_by_counts", "total_counts", "pct_counts_mt",
                         "pct_counts_ribo", "pct_counts_hb") if k in adata.obs.columns]
-    fig, axes = plt.subplots(1, len(keys), figsize=(3.0 * len(keys), 3.2))
+    fig, axes = plt.subplots(1, len(keys), figsize=(W_DOUBLE, mm(58)))
     axes = np.atleast_1d(axes)
     for ax, k in zip(axes, keys):
         ax.violinplot(adata.obs[k].astype(float).values, showmedians=True)
-        ax.set_title(k, fontsize=9)
+        ax.set_title(k)
         ax.set_xticks([])
-    fig.suptitle(f"QC metrics before filtering (n={n0})", fontsize=10)
+    fig.suptitle(f"QC metrics before filtering (n={n0})")
     save_fig(cfg, "qc_violin_before", fig)
 
     # 阈值线：基因数 vs 线粒体比例 —— 双细胞和死细胞在这张图上是两个角
-    fig, ax = plt.subplots(figsize=(5.2, 4.2))
+    fig, ax = plt.subplots(figsize=(W_SINGLE, mm(64)))
     sc_ = ax.scatter(adata.obs["total_counts"], adata.obs["n_genes_by_counts"],
                      c=adata.obs["pct_counts_mt"] if "pct_counts_mt" in adata.obs else None,
                      s=3, cmap="viridis", alpha=0.6)
     if sc_ is not None:
         fig.colorbar(sc_, ax=ax, label="pct_counts_mt")
     q = cfg["qc"]
-    ax.axhline(q["min_genes"], color="#B2182B", lw=1, ls="--")
-    ax.axhline(q["max_genes"], color="#B2182B", lw=1, ls="--")
+    ax.axhline(q["min_genes"], color=PAL["highlight"], lw=1, ls="--")
+    ax.axhline(q["max_genes"], color=PAL["highlight"], lw=1, ls="--")
     ax.set_xlabel("total_counts"); ax.set_ylabel("n_genes_by_counts")
-    ax.set_title("QC thresholds (red = cut-offs)", fontsize=10)
+    ax.set_title("QC thresholds (red = cut-offs)")
     save_fig(cfg, "qc_scatter_thresholds", fig)
 
     # ---- 3. 过滤 ------------------------------------------------------------

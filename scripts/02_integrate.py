@@ -24,7 +24,7 @@ import numpy as np  # noqa: E402
 import scanpy as sc  # noqa: E402
 
 from common import (ensure_dirs, load_config, log_info, log_warn,  # noqa: E402
-                    parse_args, record_step, save_fig, set_seed, write_json)
+                    parse_args, record_step, save_fig, set_seed, write_json, W_DOUBLE, mm,)
 
 
 def run_02_integrate(cfg: dict) -> dict:
@@ -96,7 +96,7 @@ def run_02_integrate(cfg: dict) -> dict:
     import matplotlib.pyplot as plt
     sc.pl.highly_variable_genes(adata, show=False)
     fig = plt.gcf()
-    fig.suptitle(f"HVG ({hvg_flavor_used}, n={n_hvg})", fontsize=10)
+    fig.suptitle(f"HVG ({hvg_flavor_used}, n={n_hvg})")
     save_fig(cfg, "hvg_selection", fig)
 
     # ---- 2. 子集到 HVG ------------------------------------------------------
@@ -107,7 +107,7 @@ def run_02_integrate(cfg: dict) -> dict:
     import matplotlib.pyplot as plt
     sc.pl.pca_variance_ratio(work, log=True, show=False)
     fig = plt.gcf()
-    fig.suptitle("PCA variance ratio (elbow)", fontsize=10)
+    fig.suptitle("PCA variance ratio (elbow)")
     save_fig(cfg, "pca_variance_ratio", fig)
 
     var_ratio = work.uns["pca"]["variance_ratio"]
@@ -157,7 +157,7 @@ def run_02_integrate(cfg: dict) -> dict:
     # 批次效应可视化（有 batch_key 才有意义）
     if batch_key and batch_key in work.obs.columns:
         import matplotlib.pyplot as plt
-        fig, axes = plt.subplots(1, 2, figsize=(9.4, 3.9))
+        fig, axes = plt.subplots(1, 2, figsize=(W_DOUBLE, mm(64)))
         for ax, rep in zip(axes, ["X_pca", use_rep]):
             if rep not in work.obsm:
                 ax.axis("off"); continue
@@ -166,11 +166,11 @@ def run_02_integrate(cfg: dict) -> dict:
             for i, c in enumerate(sorted(set(cats))):
                 m = cats == c
                 ax.scatter(xy[m, 0], xy[m, 1], s=2, alpha=0.5, label=str(c))
-            ax.set_title(f"{rep} by {batch_key}", fontsize=9)
+            ax.set_title(f"{rep} by {batch_key}")
             ax.set_xlabel("dim 1"); ax.set_ylabel("dim 2")
             if len(set(cats)) <= 12:
                 ax.legend(fontsize=6, markerscale=3, loc="best")
-        fig.suptitle("Batch mixing before/after integration", fontsize=10)
+        fig.suptitle("Batch mixing before/after integration")
         save_fig(cfg, "batch_mixing", fig)
 
     # ---- 5. 落盘 ------------------------------------------------------------

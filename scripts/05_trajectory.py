@@ -37,7 +37,7 @@ import scanpy as sc  # noqa: E402
 from scipy.stats import ks_2samp, spearmanr  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed, write_json)
+                    log_warn, parse_args, record_step, save_fig, set_seed, write_json, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm,)
 
 # 校正后的统一方向：**值越大越晚**
 N_MODULES = 6
@@ -283,9 +283,9 @@ def run_05_trajectory(cfg: dict) -> dict:
     conn_df = pd.DataFrame(conn, index=cats, columns=cats)
     conn_df.to_csv(res_dir / "paga_connectivities.csv")
 
-    fig, ax = plt.subplots(figsize=(6.2, 5.4))
+    fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(84)))
     sc.pl.paga(adata, show=False, ax=ax)
-    ax.set_title("PAGA graph (edge width = connectivity)", fontsize=10)
+    ax.set_title("PAGA graph (edge width = connectivity)")
     save_fig(cfg, "paga_graph", fig)
 
     # ---- 2. CytoTRACE GCS：既是方法也是选根依据 ------------------------------
@@ -418,7 +418,7 @@ def run_05_trajectory(cfg: dict) -> dict:
         log_info(f"一致性统计已排除方向参考 {reference_method}"
                  f"（它与参考的相关是定义上的，不是证据）")
 
-    fig, ax = plt.subplots(figsize=(4.6, 4.0))
+    fig, ax = plt.subplots(figsize=(W_SINGLE, mm(66)))
     im = ax.imshow(cmat.values.astype(float), cmap="RdBu_r", vmin=-1, vmax=1)
     ax.set_xticks(range(len(names))); ax.set_xticklabels(names, rotation=40, ha="right")
     ax.set_yticks(range(len(names))); ax.set_yticklabels(names)
@@ -426,7 +426,7 @@ def run_05_trajectory(cfg: dict) -> dict:
         for j in range(len(names)):
             ax.text(j, i, f"{cmat.values[i, j]:.2f}", ha="center", va="center",
                     fontsize=8, color="black")
-    ax.set_title("Pseudotime agreement (Spearman, direction-corrected)", fontsize=9)
+    ax.set_title("Pseudotime agreement (Spearman, direction-corrected)")
     fig.colorbar(im, ax=ax, shrink=0.8)
     save_fig(cfg, "trajectory_method_correlation", fig)
 
@@ -511,11 +511,11 @@ def run_05_trajectory(cfg: dict) -> dict:
                                               index=False)
             log_info(f"基因模块：{len(modules_rows)} 个（k-means on 分箱平滑曲线）")
 
-            fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.0))
+            fig, axes = plt.subplots(1, 2, figsize=(W_DOUBLE, mm(64)))
             im = axes[0].imshow(profz[np.argsort(lab)], aspect="auto",
                                 cmap="RdBu_r", vmin=-2, vmax=2)
             axes[0].set_xlabel("pseudotime bin"); axes[0].set_ylabel("gene (grouped by module)")
-            axes[0].set_title(f"Genes along pseudotime, {N_MODULES} modules", fontsize=9)
+            axes[0].set_title(f"Genes along pseudotime, {N_MODULES} modules")
             fig.colorbar(im, ax=axes[0], label="z-scored mean expression")
             for m in range(N_MODULES):
                 sel_m = np.flatnonzero(lab == m)
@@ -523,7 +523,7 @@ def run_05_trajectory(cfg: dict) -> dict:
                     continue
                 axes[1].plot(np.nanmean(profz[sel_m], axis=0), label=f"M{m} (n={len(sel_m)})")
             axes[1].set_xlabel("pseudotime bin"); axes[1].set_ylabel("z-scored mean")
-            axes[1].set_title("Module profiles", fontsize=9)
+            axes[1].set_title("Module profiles")
             axes[1].legend(fontsize=7)
             save_fig(cfg, "trajectory_modules", fig)
         except Exception as e:  # noqa: BLE001
@@ -570,19 +570,19 @@ def run_05_trajectory(cfg: dict) -> dict:
         pd.DataFrame(branch_rows).to_csv(res_dir / "trajectory_segments.csv", index=False)
 
     # ---- 9. 图：拟时序 UMAP + 每簇分布 --------------------------------------
-    fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.2))
+    fig, axes = plt.subplots(1, 3, figsize=(W_DOUBLE, mm(58)))
     xy = adata.obsm["X_umap"]
     s0 = axes[0].scatter(xy[:, 0], xy[:, 1], c=consensus, s=4, cmap="viridis")
-    axes[0].set_title(f"Consensus pseudotime (root = cluster {root_cluster})", fontsize=9)
+    axes[0].set_title(f"Consensus pseudotime (root = cluster {root_cluster})")
     fig.colorbar(s0, ax=axes[0], label="pseudotime (higher = later)")
     if "dpt" in corrected:
         s1 = axes[1].scatter(xy[:, 0], xy[:, 1], c=corrected["dpt"], s=4, cmap="viridis")
-        axes[1].set_title("DPT pseudotime (direction-corrected)", fontsize=9)
+        axes[1].set_title("DPT pseudotime (direction-corrected)")
         fig.colorbar(s1, ax=axes[1], label="pseudotime")
     s2 = axes[2].scatter(xy[:, 0], xy[:, 1],
                          c=adata.obs["leiden"].astype(str).astype("category").cat.codes,
                          s=4, cmap="tab20")
-    axes[2].set_title("Leiden clusters", fontsize=9)
+    axes[2].set_title("Leiden clusters")
     for ax in axes:
         ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
     save_fig(cfg, "pseudotime_umap", fig)
@@ -599,7 +599,7 @@ def run_05_trajectory(cfg: dict) -> dict:
                    .reset_index())
     per_cluster.to_csv(res_dir / "pseudotime_by_cluster.csv", index=False)
 
-    fig, ax = plt.subplots(figsize=(max(5.5, 0.5 * n_clusters + 2), 3.8))
+    fig, ax = plt.subplots(figsize=(max(W_SINGLE, 0.5 * n_clusters + 2), mm(58)))
     order = per_cluster.sort_values("consensus_median")["cluster"].tolist()
     data = [consensus[adata.obs["leiden"].astype(str).values == c] for c in order]
     # matplotlib 3.9 起 boxplot 的 `labels` 改名 `tick_labels`；老名字在 3.11 直接 TypeError
@@ -609,7 +609,7 @@ def run_05_trajectory(cfg: dict) -> dict:
         ax.boxplot(data, labels=order, showfliers=False)
     ax.set_xlabel("cluster (ordered by median consensus pseudotime)")
     ax.set_ylabel("consensus pseudotime (higher = later)")
-    ax.set_title("Pseudotime distribution per cluster", fontsize=10)
+    ax.set_title("Pseudotime distribution per cluster")
     save_fig(cfg, "pseudotime_by_cluster", fig)
 
     # ---- 10. 每细胞拟时序落盘（供 07_grn 做 regulon×拟时序）-----------------

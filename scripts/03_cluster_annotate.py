@@ -27,7 +27,7 @@ import scanpy as sc  # noqa: E402
 import yaml  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed, write_json)
+                    log_warn, parse_args, record_step, save_fig, set_seed, write_json, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, PAL,)
 
 
 def load_signatures(cfg: dict) -> dict:
@@ -144,12 +144,12 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
     scan.to_csv(res_dir / "cluster_resolution_scan.csv", index=False)
     log_info("分辨率扫描: " + ", ".join(f"{r.resolution}->{r.n_clusters}" for r in scan.itertuples()))
 
-    fig, ax = plt.subplots(figsize=(5.0, 3.6))
-    ax.plot(scan["resolution"], scan["n_clusters"], "o-", color="#2C7FB8")
-    ax.axvline(float(rd["resolution"]), color="#B2182B", ls="--", lw=1,
+    fig, ax = plt.subplots(figsize=(W_SINGLE, mm(58)))
+    ax.plot(scan["resolution"], scan["n_clusters"], "o-", color=PAL["primary"])
+    ax.axvline(float(rd["resolution"]), color=PAL["highlight"], ls="--", lw=1,
                label=f"used: {rd['resolution']}")
     ax.set_xlabel("Leiden resolution"); ax.set_ylabel("number of clusters")
-    ax.set_title("Cluster count vs resolution", fontsize=10)
+    ax.set_title("Cluster count vs resolution")
     ax.legend(fontsize=8)
     save_fig(cfg, "cluster_resolution_scan", fig)
 
@@ -161,18 +161,19 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
     n_clusters = int(adata.obs["leiden"].nunique())
     log_info(f"最终聚类: {n_clusters} 个簇（resolution={res_used}）")
 
-    fig, ax = plt.subplots(figsize=(6.4, 5.4))
+    fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(84)))
     xy = adata.obsm["X_umap"]
     cats = adata.obs["leiden"].astype(str).values
     for c in sorted(set(cats), key=lambda x: int(x) if x.isdigit() else x):
         m = cats == c
         ax.scatter(xy[m, 0], xy[m, 1], s=4, alpha=0.75, label=c)
         cx, cy = xy[m, 0].mean(), xy[m, 1].mean()
-        ax.text(cx, cy, c, fontsize=9, weight="bold",
+        # 直接标注簇号 = 参考规范要的"颜色之外的第二条线索"
+        ax.text(cx, cy, c, weight="bold",
                 ha="center", va="center",
                 bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.75))
     ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
-    ax.set_title(f"Leiden clusters (n={n_clusters}, resolution={res_used})", fontsize=10)
+    ax.set_title(f"Leiden clusters (n={n_clusters}, resolution={res_used})")
     ax.legend(fontsize=6, markerscale=2.5, loc="center left", bbox_to_anchor=(1.0, 0.5))
     save_fig(cfg, "umap_clusters", fig)
 
@@ -192,12 +193,18 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
     # marker 点图：每簇取前 3 个
     top3 = (markers.sort_values(["cluster", "scores"], ascending=[True, False])
             .groupby("cluster", observed=True).head(3)["names"].unique().tolist())
-    top3 = [g for g in top3 if g in adata.raw.var_names][:40]
+    # **上限按图宽算，不是随手取 40。** 双栏 183 mm 下每个基因约 7 mm，
+    # 再多标签就挤成一片。原来取 40 会画出 323 mm 宽的图 —— 装不进任何
+    # 期刊的一页。
+    top3 = [g for g in top3 if g in adata.raw.var_names][:24]
     if top3:
         sc.pl.dotplot(adata, top3, groupby="leiden", use_raw=True, show=False,
                       standard_scale="var")
         fig = plt.gcf()
-        fig.suptitle("Top markers per cluster", fontsize=10)
+        # scanpy 自己按基因数定尺寸，这里拉回标准双栏宽。
+        # 高度 96 mm 是实测值：80 mm 时簇标签顶出画布 +4.5%，88 mm 时 +2.9%
+        fig.set_size_inches(W_DOUBLE, mm(96))
+        fig.suptitle("Top markers per cluster")
         save_fig(cfg, "markers_dotplot", fig)
 
     # ---- 5. 细胞类型打分 ----------------------------------------------------
@@ -223,7 +230,9 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
             log_warn("margin<0.05 的簇其 assignment 不应被当成结论 —— 见 celltype_annotation.csv")
 
         # 打分热图
-        fig, ax = plt.subplots(figsize=(max(6.0, 0.45 * len(per_cell.columns) + 3),
+        # 宽度夹在 [单栏半, 双栏]：类型少时不至于太空，类型多时也不会
+        # 画出装不进一页的图（标签已旋转 45°）
+        fig, ax = plt.subplots(figsize=(min(W_DOUBLE, max(W_ONE_HALF, 0.45 * len(per_cell.columns) + 3)),
                                         max(3.0, 0.32 * len(per_cell) + 1.6)))
         im = ax.imshow(per_cell.values, aspect="auto", cmap="viridis")
         ax.set_xticks(range(len(per_cell.columns)))
@@ -231,7 +240,7 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
         ax.set_yticks(range(len(per_cell)))
         ax.set_yticklabels([str(i) for i in per_cell.index], fontsize=7)
         ax.set_xlabel("cell type signature"); ax.set_ylabel("cluster")
-        ax.set_title("Mean signature score per cluster", fontsize=10)
+        ax.set_title("Mean signature score per cluster")
         fig.colorbar(im, ax=ax, label="score")
         save_fig(cfg, "celltype_scores_heatmap", fig)
 

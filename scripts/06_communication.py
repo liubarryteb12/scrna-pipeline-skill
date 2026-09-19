@@ -33,7 +33,7 @@ import yaml  # noqa: E402
 from scipy import sparse  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed, write_json)
+                    log_warn, parse_args, record_step, save_fig, set_seed, write_json, W_ONE_HALF,)
 
 N_PERMUTATIONS = 200
 
@@ -200,7 +200,7 @@ def run_06_communication(cfg: dict) -> dict:
 
     # 热图：发送 x 接收 的总分
     top = res.head(min(20, len(res)))
-    fig, ax = plt.subplots(figsize=(max(5.0, 0.55 * len(groups) + 2.2),
+    fig, ax = plt.subplots(figsize=(max(W_ONE_HALF, 0.55 * len(groups) + 2.2),
                                     max(3.4, 0.42 * len(top) + 1.8)))
     mat = top.pivot_table(index="pair", columns="receiver", values="score",
                           aggfunc="sum").fillna(0.0)
@@ -210,7 +210,7 @@ def run_06_communication(cfg: dict) -> dict:
     ax.set_yticks(range(len(mat)))
     ax.set_yticklabels(mat.index, fontsize=7)
     ax.set_xlabel("receiver"); ax.set_ylabel("ligand-receptor pair")
-    ax.set_title(f"Top {len(top)} LR pairs by score", fontsize=10)
+    ax.set_title(f"Top {len(top)} LR pairs by score")
     fig.colorbar(im, ax=ax, label="score")
     save_fig(cfg, "communication_heatmap", fig)
 

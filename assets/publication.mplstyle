@@ -1,0 +1,100 @@
+# 出版级出图样式 —— 源自 scientific-agent-skills/skills/scientific-visualization
+#
+# 来源：scientific-agent-skills 仓库
+#   skills/scientific-visualization/assets/publication.mplstyle
+#   （K-Dense Inc.，MIT；该文件标注 "Reviewed with Matplotlib 3.11.1"）
+#
+# 用法：plt.style.use('assets/publication.mplstyle')
+#       common.apply_style() 已经封装好，绘图脚本不用直接调。
+#
+# ---------------------------------------------------------------------------
+# 与参考文件的**两处有意偏离**，都写在这里而不是埋着：
+#
+# 1. `figure.constrained_layout.use` 参考文件是 False（它要求在每个
+#    plt.subplots() 里显式写 layout="constrained"）。本流水线有 20+ 张图、
+#    分散在 8 个脚本里，逐处改容易漏 —— 漏掉的那张图配合下面的
+#    `savefig.bbox: standard` 会被裁掉标签。所以这里设成 True 全局生效。
+#
+# 2. `font.sans-serif` 参考文件是 Arial 优先。本流水线改成 DejaVu Sans 优先：
+#    Arial 在 GitHub 托管 runner（Ubuntu）上不存在，本地 Windows 上存在 ——
+#    同一份代码在两边会渲染出**不同字形**，而本流水线主打可复现。
+#    DejaVu Sans 是 matplotlib 自带字体，处处一致。
+#    真要投稿时把 Arial/Helvetica 提到前面即可，参考文件原本的顺序就是那个。
+# ---------------------------------------------------------------------------
+
+# ---- 图属性 ----
+figure.dpi: 100
+figure.facecolor: white
+figure.autolayout: False
+figure.constrained_layout.use: True
+# 默认单栏 89 mm（Nature 单栏宽度）。多面板图在代码里显式给双栏 183 mm。
+figure.figsize: 3.50, 2.60
+
+# ---- 字体 ----
+font.size: 8
+font.family: sans-serif
+font.sans-serif: DejaVu Sans, Arial, Helvetica
+
+# ---- 坐标轴 ----
+axes.linewidth: 0.6
+axes.labelsize: 8
+axes.titlesize: 8
+axes.labelweight: normal
+# 去掉上/右边框（参考文件的做法）
+axes.spines.top: False
+axes.spines.right: False
+axes.spines.left: True
+axes.spines.bottom: True
+axes.edgecolor: black
+axes.labelcolor: black
+axes.axisbelow: True
+axes.grid: False
+# Okabe-Ito 里对白底达到 3:1 对比度的五个色（Wong, Nat Methods 8:441, 2011）。
+# **颜色不能是唯一线索** —— 分类图仍要加 marker / 线型 / 直接标注。
+axes.prop_cycle: cycler('color', ['0072B2', 'D55E00', '009E73', 'CC79A7', '000000'])
+
+# ---- 刻度 ----
+xtick.major.size: 3
+xtick.minor.size: 2
+xtick.major.width: 0.6
+xtick.minor.width: 0.5
+xtick.labelsize: 7
+xtick.direction: out
+ytick.major.size: 3
+ytick.minor.size: 2
+ytick.major.width: 0.6
+ytick.minor.width: 0.5
+ytick.labelsize: 7
+ytick.direction: out
+
+# ---- 线 ----
+lines.linewidth: 1.5
+lines.markersize: 4
+lines.markeredgewidth: 0.5
+
+# ---- 图例 ----
+legend.fontsize: 7
+legend.frameon: False
+legend.loc: best
+
+# ---- 保存 ----
+savefig.dpi: 300
+savefig.format: pdf
+# **standard 而不是 tight。** bbox_inches="tight" 会改变输出的物理尺寸 ——
+# 投稿时"单栏 89 mm"就不再是 89 mm 了。内容装不下由 constrained layout 解决。
+savefig.bbox: standard
+savefig.pad_inches: 0.05
+savefig.transparent: False
+savefig.facecolor: white
+savefig.edgecolor: white
+
+# PDF/PS 用 Type 42 内嵌 TrueType（文字可编辑）
+pdf.fonttype: 42
+ps.fonttype: 42
+# SVG 文字保持为文字（不内嵌），便于后期编辑
+svg.fonttype: none
+
+# ---- 图像 ----
+# 顺序色标用 viridis（感知均匀，且对色盲友好）
+image.cmap: viridis
+image.aspect: auto
