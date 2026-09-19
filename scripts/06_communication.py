@@ -2,20 +2,27 @@
 """
 06_communication.py — 细胞间通讯（配体-受体）
 
-**没有 LIANA/CellChat 时怎么办。** 那两个包是这类分析的标准工具，但它们
-（以及底层的数据库）依赖较重、版本敏感。这里做的是**数据库驱动的
-配体-受体共表达打分**，并**明确标注它不是 LIANA/CellChat**。
+**两条路都跑，都如实标注。**
 
-做法：
-  1. 用内置的配体-受体对（assets/ligand_receptor.yml）
-  2. 对每对 (发送簇, 接收簇)：配体在发送簇的平均表达 x 受体在接收簇的平均表达
-  3. 用置换检验给出经验 p 值（打乱簇标签）
+文档 §2.7 把 LIANA 定为主工具、CellChat 为辅。本仓库的做法：
+
+  1. **LIANA rank_aggregate**（装得上就跑）→ `liana_results.csv`
+     LIANA 自带 consensus 资源（CellChatDB + CellPhoneDB 等）。
+  2. **自建共表达打分**（始终跑）→ `cell_communication.csv`
+     内置的配体-受体对 + 置换检验 + BH 校正。
+
+**为什么并存而不是替换：** 自建打分的产物已被下游和验收引用，直接换成
+LIANA 会让"现有结果"无从对比。两个都产出，并**量化两者一致性**
+（Spearman + top-N 重叠）—— 不一致本身就是发现，不是谁错了。
+
+**CellChat 是 R 包**，需要 rpy2 + R，与本仓库"云端不装 R"的设计冲突，
+所以未使用，理由写进 status 的 limitations。
 
 **必须说清楚的局限：**
   - 共表达不等于通讯。没有空间信息时，两个细胞类型"能通讯"只是说
     它们分别表达了配体和受体，不代表它们在组织里相邻。
   - 表达量是稳态丰度，不等于蛋白水平，也不等于分泌量。
-  - 打分是启发式，不是 LIANA 的 consensus rank aggregate。
+  - 自建打分是启发式，不是 LIANA 的 consensus rank aggregate。
 """
 
 from __future__ import annotations
@@ -78,6 +85,153 @@ def mean_expression(genes: list, mask, X, var_names: list) -> float:
         return 0.0
     sub = X[np.ix_(mask, idx)]
     return float(sub.mean()) if sub.size else 0.0
+
+
+# ---------------------------------------------------------------------------
+# LIANA（文档 §2.7 指定的主工具）
+# ---------------------------------------------------------------------------
+# **文档把 LIANA 定为主工具、CellChat 为辅。** 本仓库原先只有自建的
+# 共表达打分，产物里必须写"不是 LIANA" —— 因为它没有 consensus rank
+# aggregate，也没有多方法一致性这一层。
+#
+# 装得上就跑，装不上/跑不动就退回自建打分，**两条路都如实记录**。
+# 不要因为"退回的路也能出图"就把方法写成 LIANA。
+#
+# **为什么并存而不是替换：** 自建打分的产物（cell_communication.csv）
+# 已经被下游和验收引用，直接换成 LIANA 会让"现有结果"无从对比。
+# 两个都产出，并**量化两者是否一致** —— 不一致本身就是发现。
+LIANA_N_PERMS = 100
+
+
+def try_liana(adata, group_key: str, cfg: dict, log=log_info):
+    """尝试用 LIANA 跑 rank_aggregate。
+
+    返回 `(res_df | None, info)`。**任何异常都吞掉并写进 info** ——
+    LIANA 跑不动不该让整步失败，但必须让人看见它跑不动。
+    """
+    info = {"attempted": True, "status": None, "reason": "",
+            "n_perms": LIANA_N_PERMS}
+    try:
+        import liana as li
+    except Exception as exc:  # noqa: BLE001
+        info["status"] = "package_missing"
+        info["reason"] = f"liana 未安装（{type(exc).__name__}: {exc}）"
+        log(f"LIANA 不可用：{info['reason']}")
+        return None, info
+
+    info["version"] = getattr(li, "__version__", "unknown")
+
+    # LIANA 在 1.x 里把 `method` 改名成 `mt`。两个都试，别赌版本。
+    fn = None
+    for path in (("mt", "rank_aggregate"), ("method", "rank_aggregate")):
+        obj = li
+        try:
+            for attr in path:
+                obj = getattr(obj, attr)
+            fn = obj
+            info["api"] = ".".join(path)
+            break
+        except AttributeError:
+            continue
+    if fn is None:
+        info["status"] = "api_not_found"
+        info["reason"] = "liana 里找不到 mt.rank_aggregate 或 method.rank_aggregate"
+        log_warn(info["reason"])
+        return None, info
+
+    import warnings
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fn(adata, groupby=group_key, use_raw=True,
+               n_perms=LIANA_N_PERMS, n_jobs=1, verbose=False,
+               seed=cfg["analysis"]["seed"])
+        res = adata.uns.get("liana_res")
+        if res is None:
+            info["status"] = "no_result"
+            info["reason"] = "liana 跑完但 uns['liana_res'] 不存在"
+            log_warn(info["reason"])
+            return None, info
+        res = res.copy()
+        info["status"] = "ok"
+        info["n_rows"] = int(len(res))
+        info["columns"] = sorted(map(str, res.columns))
+        log(f"LIANA rank_aggregate 完成：{len(res)} 行，版本 {info['version']}")
+        return res, info
+    except Exception as exc:  # noqa: BLE001
+        info["status"] = "failed"
+        info["reason"] = f"{type(exc).__name__}: {exc}"
+        log_warn(f"LIANA 跑失败，退回自建共表达打分：{info['reason']}")
+        return None, info
+
+
+def compare_with_liana(liana_res, own: pd.DataFrame, log=log_info) -> dict:
+    """量化自建打分与 LIANA 的一致性。
+
+    **两种方法给出不同排序是常态，不是 bug** —— LIANA 的 rank aggregate
+    综合了 7 种方法的秩，而自建打分只是一个表达量乘积。所以这里报
+    Spearman 相关与 top-N 重叠率，让"差多少"变成数字而不是印象。
+
+    返回的字典直接进 status JSON。
+    """
+    out = {"compared": False}
+    if liana_res is None or own is None or len(own) == 0:
+        return out
+    try:
+        # LIANA 的列名在版本间变过，按优先级找"综合分"那一列
+        score_col = None
+        for c in ("aggregate_rank", "consensus_score", "magnitude_rank",
+                  "expr_prod", "lr_means"):
+            if c in liana_res.columns:
+                score_col = c
+                break
+        if score_col is None:
+            out["reason"] = f"liana_res 里没有可识别的分数列（有 {list(liana_res.columns)[:8]}）"
+            return out
+
+        lr = liana_res.copy()
+        lr["_pair"] = (lr["ligand_complex"].astype(str) + "^" +
+                       lr["receptor_complex"].astype(str))
+        lr["_combo"] = (lr["_pair"] + "|" + lr["source"].astype(str) + "->" +
+                        lr["target"].astype(str))
+        lr_score = lr.groupby("_combo")[score_col].mean()
+
+        ow = own.copy()
+        ow["_pair"] = ow["ligand"].astype(str) + "^" + ow["receptor"].astype(str)
+        ow["_combo"] = (ow["_pair"] + "|" + ow["sender"].astype(str) + "->" +
+                        ow["receiver"].astype(str))
+        # 自建打分越大越强；LIANA 的 *_rank 越小越强，要翻向
+        ascending = score_col.endswith("_rank")
+        ow_score = ow.groupby("_combo")["score"].mean()
+        if ascending:
+            lr_score = -lr_score
+
+        common = ow_score.index.intersection(lr_score.index)
+        out["compared"] = True
+        out["score_column_used"] = score_col
+        out["rank_direction"] = "越小越强（已翻向）" if ascending else "越大越强"
+        out["n_common_combinations"] = int(len(common))
+        out["n_own_only"] = int(len(ow_score.index.difference(lr_score.index)))
+        out["n_liana_only"] = int(len(lr_score.index.difference(ow_score.index)))
+        if len(common) >= 5:
+            from scipy.stats import spearmanr
+            rho, p = spearmanr(ow_score.loc[common], lr_score.loc[common])
+            out["spearman_rho"] = round(float(rho), 4)
+            out["spearman_p"] = float(p)
+        # top-N 重叠
+        for n in (10, 25, 50):
+            if len(common) >= n:
+                a = set(ow_score.loc[common].nlargest(n).index)
+                b = set(lr_score.loc[common].nlargest(n).index)
+                out[f"top{n}_overlap"] = len(a & b)
+                out[f"top{n}_overlap_frac"] = round(len(a & b) / n, 3)
+        log(f"自建 vs LIANA：共同组合 {out['n_common_combinations']}，"
+            f"Spearman rho={out.get('spearman_rho')}，"
+            f"top25 重叠 {out.get('top25_overlap')}/25")
+    except Exception as exc:  # noqa: BLE001
+        out["reason"] = f"对比失败：{type(exc).__name__}: {exc}"
+        log_warn(out["reason"])
+    return out
 
 
 def run_06_communication(cfg: dict) -> dict:
@@ -214,6 +368,21 @@ def run_06_communication(cfg: dict) -> dict:
     fig.colorbar(im, ax=ax, label="score")
     save_fig(cfg, "communication_heatmap", fig)
 
+    # ---- LIANA（文档 §2.7 指定的主工具）------------------------------------
+    # **自建打分照常产出**（cell_communication.csv 已被下游引用），
+    # LIANA 另存一份并量化两者一致性 —— 直接替换会让"现有结果"无从对比。
+    liana_res, liana_info = try_liana(adata, group_key, cfg)
+    liana_cmp = {"compared": False}
+    if liana_res is not None:
+        liana_res.to_csv(res_dir / "liana_results.csv", index=False)
+        liana_cmp = compare_with_liana(liana_res, res)
+        if liana_cmp.get("compared"):
+            liana_cmp["interpretation"] = (
+                "LIANA 的 rank aggregate 综合了多种方法的秩，自建打分只是"
+                "表达量乘积 —— **两者排序不同是预期内的，不是谁错了**。"
+                "这里报出来是为了让『差多少』有数字，而不是让读者以为"
+                "两个工具在回答同一个问题。")
+
     status = {
         "dataset_id": cfg["dataset_id"],
         "status": "ok",
@@ -230,15 +399,29 @@ def run_06_communication(cfg: dict) -> dict:
         "n_significant_bh": n_sig,
         "n_permutations": N_PERMUTATIONS,
         "top_pairs": df_to_records(res.head(15)),
-        "method": ("数据库驱动的配体-受体共表达打分 + 簇标签置换检验 + BH 校正。"
-                   "**不是 LIANA/CellChat** —— 那两个包未安装"),
+        "liana": liana_info,
+        "liana_vs_builtin": liana_cmp,
+        "method": ("**两条路都跑了**：(1) 自建数据库驱动的配体-受体共表达打分"
+                   "+ 簇标签置换检验 + BH 校正 → cell_communication.csv；"
+                   + (f"(2) LIANA rank_aggregate v{liana_info.get('version')} "
+                      f"→ liana_results.csv"
+                      if liana_info.get("status") == "ok"
+                      else f"(2) LIANA **未能运行**（{liana_info.get('status')}："
+                           f"{str(liana_info.get('reason'))[:120]}）")),
+        "primary_tool_per_spec": "LIANA（文档 §2.7）",
         "limitations": [
             "共表达不等于通讯：没有空间信息时，只能说两类细胞分别表达了配体和受体",
             "表达量是稳态丰度，不等于蛋白水平，也不等于分泌量",
-            "打分是启发式，不是 LIANA 的 consensus rank aggregate",
+            "自建打分是启发式，不是 LIANA 的 consensus rank aggregate",
             "置换检验打乱的是细胞标签，保留了每种细胞类型的细胞数",
             f"**内置库只有 {len(pairs)} 对**（免疫为主），远少于 CellChatDB 的数千对；"
             "覆盖不全时『没找到显著通讯』是假阴性，不是真的没有通讯",
+            ("LIANA 用的是它自带的 consensus 资源（CellChatDB + CellPhoneDB 等），"
+             "与内置库不是同一套配体-受体对 —— 两者的组合数不可直接比较"
+             if liana_info.get("status") == "ok" else
+             "LIANA 未运行，本轮只有自建打分这一条路"),
+            "CellChat（文档 §2.7 的辅工具）是 R 包，需要 rpy2 + R —— "
+            "本仓库不装 R，故未使用",
         ],
     }
     write_json(res_dir / "communication_status.json", status)

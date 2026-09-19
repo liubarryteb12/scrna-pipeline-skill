@@ -119,6 +119,10 @@ for (const f of files) {
 const WATCH_SYMBOLS = [
   "W_SINGLE", "W_ONE_HALF", "W_DOUBLE", "mm",
   "PAL", "PAL_CYCLE", "apply_style",
+  // 模块零运行清单（§0.2 / §0.3 / §0.4）。同样是"漏了要到运行时才炸"的一组。
+  "init_manifest", "capture_versions", "manifest_path", "read_manifest",
+  "record_params", "record_input", "record_decision", "record_human_review",
+  "record_cross_language", "manifest_summary",
 ];
 
 /** 去掉注释与字符串字面量，避免"名字只出现在注释里"的误报。 */

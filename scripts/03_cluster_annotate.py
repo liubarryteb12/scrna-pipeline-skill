@@ -7,6 +7,14 @@
 margin 小的 assignment 不该被当成结论，而这一点只有把 margin 写出来
 才看得出来。只报一个类型名等于把不确定性藏起来。
 
+**两条独立的注释路径**（文档 §2.4）：
+  1. **marker 签名打分**（`score_genes` + 簇均值）→ `celltype_annotation.csv`
+  2. **CellTypist 预训练模型**（文档指定的自动注释工具）→ `celltypist_labels.csv`
+
+两者一致时结论更可信，不一致时那个簇值得人看 —— 所以这里**量化一致率**
+而不是只报其中一条。CellTypist 的模型是运行期下载的，拿不到就记
+`model_unavailable`，不退回、不假装。
+
 **聚类分辨率是有后果的选择。** resolution 决定簇的粒度，而下游所有
 marker / 注释 / 通讯分析都建立在这个粒度上。这里额外跑一个
 resolution 扫描，把"多少个簇"随分辨率怎么变落盘 —— 让读者能判断
@@ -96,6 +104,134 @@ def score_celltypes(adata, sig) -> tuple:
         "n_clusters_low_margin": int((~assign["assignment_confident"]).sum()),
     }
     return per_cell, assign, diag
+
+
+# ---------------------------------------------------------------------------
+# CellTypist（文档 §2.4 指定的自动注释工具）
+# ---------------------------------------------------------------------------
+# **与 marker 签名打分是两条独立的路。** marker 打分只看"签名基因在簇里
+# 平均高不高"；CellTypist 用一个在几十万细胞上训过的逻辑回归模型，看
+# **全部基因**的加权组合。两者一致时结论更可信，不一致时那个簇值得人看。
+#
+# **模型文件是运行期下载的**（~50MB，落在 ~/celltypist/）。CI 里可能拿不到，
+# 拿不到就记 not_available，**不退回、不假装**。
+#
+# **输入必须是对数化的全基因集。** 本流水线在 02_integrate 里把 `adata.raw`
+# 设成了全基因集，之后子集到了 HVG —— 直接把 HVG 子集喂给模型会丢掉
+# 模型依赖的大部分基因，标签会退化成噪声。所以这里显式用 `.raw`。
+CELLTYPIST_DEFAULT_MODEL = "Immune_All_Low.pkl"
+
+
+def try_celltypist(adata, cfg: dict, log=log_info):
+    """用 CellTypist 预训练模型给细胞打标签。
+
+    返回 `(labels_series | None, info)`。**任何异常都吞掉并写进 info** ——
+    拿不到模型不该让整步失败，但必须让人看见。
+    """
+    info = {"attempted": True, "status": None, "reason": "",
+            "model": (cfg.get("analysis") or {}).get("celltypist_model",
+                                                     CELLTYPIST_DEFAULT_MODEL)}
+    try:
+        import celltypist
+        from celltypist import models as ctm
+    except Exception as exc:  # noqa: BLE001
+        info["status"] = "package_missing"
+        info["reason"] = f"celltypist 未安装（{type(exc).__name__}: {exc}）"
+        log(f"CellTypist 不可用：{info['reason']}")
+        return None, info
+
+    info["version"] = getattr(celltypist, "__version__", "unknown")
+
+    # 模型：先看本地有没有，没有才下载（下载失败不算致命）
+    try:
+        path = ctm.models_path / info["model"]
+        if not path.exists():
+            log(f"CellTypist 模型 {info['model']} 不在本地，尝试下载…")
+            ctm.download_models(model=info["model"])
+            info["downloaded"] = True
+        else:
+            info["downloaded"] = False
+    except Exception as exc:  # noqa: BLE001
+        info["status"] = "model_unavailable"
+        info["reason"] = (f"模型 {info['model']} 拿不到"
+                          f"（{type(exc).__name__}: {exc}）—— CI 可能无外网")
+        log_warn(f"CellTypist 不可用：{info['reason']}")
+        return None, info
+
+    try:
+        # 用全基因集，不是 HVG 子集 —— 见上面的说明
+        full = adata.raw.to_adata() if adata.raw is not None else adata.copy()
+        if adata.raw is None:
+            info["used_raw"] = False
+            log_warn("adata.raw 为空 —— CellTypist 只能用当前（可能是 HVG）矩阵，"
+                     "标签可靠性下降")
+        else:
+            info["used_raw"] = True
+        info["n_genes_input"] = int(full.n_vars)
+
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            pred = celltypist.annotate(full, model=info["model"],
+                                       majority_voting=True)
+        labels = pred.predicted_labels
+        col = ("majority_voting" if "majority_voting" in labels.columns
+               else "predicted_labels")
+        info["status"] = "ok"
+        info["label_column"] = col
+        info["n_labels"] = int(labels[col].nunique())
+        log(f"CellTypist 完成：{info['n_labels']} 种标签"
+            f"（模型 {info['model']} v{info['version']}，"
+            f"{info['n_genes_input']} 基因输入）")
+        return labels[col].astype(str), info
+    except Exception as exc:  # noqa: BLE001
+        info["status"] = "failed"
+        info["reason"] = f"{type(exc).__name__}: {exc}"
+        log_warn(f"CellTypist 跑失败：{info['reason']}")
+        return None, info
+
+
+def compare_annotations(assign: pd.DataFrame, ct_labels, adata, log=log_info) -> dict:
+    """量化 marker 打分与 CellTypist 在**簇层面**的一致程度。
+
+    簇层面的比较才有意义：marker 打分给的是每个簇一个标签，而
+    CellTypist 给的是每个细胞一个标签。先按簇取众数再比。
+    """
+    out = {"compared": False}
+    if assign is None or ct_labels is None:
+        return out
+    try:
+        df = pd.DataFrame({
+            "cluster": adata.obs["leiden"].astype(str).values,
+            "celltypist": ct_labels.reindex(adata.obs_names).values,
+        }).dropna()
+        # 每簇的众数标签 + 该标签占比（占比低说明这个簇本身不纯）
+        maj = (df.groupby("cluster")["celltypist"]
+                 .agg(lambda s: s.value_counts().index[0]))
+        purity = (df.groupby("cluster")["celltypist"]
+                    .agg(lambda s: float(s.value_counts().iloc[0] / len(s))))
+        own = dict(zip(assign["cluster"].astype(str), assign["assigned"]))
+        common = sorted(set(own) & set(maj.index))
+        agree = [c for c in common if str(own[c]).lower() == str(maj[c]).lower()]
+        out.update({
+            "compared": True,
+            "n_clusters": len(common),
+            "n_agree_exact": len(agree),
+            "agreement_frac": round(len(agree) / len(common), 3) if common else None,
+            "per_cluster": [
+                {"cluster": c, "marker_signature": str(own[c]),
+                 "celltypist_majority": str(maj[c]),
+                 "celltypist_purity": round(float(purity[c]), 3),
+                 "agree": str(own[c]).lower() == str(maj[c]).lower()}
+                for c in common
+            ],
+        })
+        log(f"两种注释在簇层面一致 {len(agree)}/{len(common)}"
+            f"（{out['agreement_frac']}）—— 不一致的簇值得人工看")
+    except Exception as exc:  # noqa: BLE001
+        out["reason"] = f"对比失败：{type(exc).__name__}: {exc}"
+        log_warn(out["reason"])
+    return out
 
 
 def run_03_cluster_annotate(cfg: dict) -> dict:
@@ -244,7 +380,22 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
         fig.colorbar(im, ax=ax, label="score")
         save_fig(cfg, "celltype_scores_heatmap", fig)
 
-    # ---- 6. 落盘 ------------------------------------------------------------
+    # ---- 6. CellTypist 自动注释（文档 §2.4，与 marker 打分并行）------------
+    ct_labels, ct_info = try_celltypist(adata, cfg)
+    ct_cmp = {"compared": False}
+    if ct_labels is not None:
+        pd.DataFrame({"cell": ct_labels.index, "celltypist": ct_labels.values}) \
+            .to_csv(res_dir / "celltypist_labels.csv", index=False)
+        ct_cmp = compare_annotations(assign, ct_labels, adata)
+        if ct_cmp.get("compared"):
+            ct_cmp["interpretation"] = (
+                "marker 签名打分只看签名基因在簇里的平均水平；CellTypist 用"
+                "预训练模型看全部基因的加权组合 —— **两者是独立证据**。"
+                "一致的簇可信度更高；不一致的簇不应只报其中一个。")
+    annot_record["celltypist"] = ct_info
+    annot_record["celltypist_vs_marker"] = ct_cmp
+
+    # ---- 7. 落盘 ------------------------------------------------------------
     out = data_dir / "clustered.h5ad"
     adata.write_h5ad(out)
     log_info(f"已写出 {out}")

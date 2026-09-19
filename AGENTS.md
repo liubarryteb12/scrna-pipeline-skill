@@ -174,3 +174,42 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 （`def verify_alignment(adata, log_info=None)` 的 `log_info`），要正确处理
 得做作用域分析 —— 那是重写一个 linter。同时会剥掉注释和字符串再扫，
 避免"名字只出现在注释里"的误报。
+
+## 16. 每轮运行必须留下可追溯的运行清单（模块零）
+
+参考规范：三大部分整合文档的「模块零」（§0.2–§0.4）。
+
+**没有运行清单的分析结果不是结果。** 半年后拿到一份
+`cell_communication.csv`，如果不知道当时装的是哪个版本的 liana、
+输入的 h5ad 是哪个哈希、随机种子是多少，那份 CSV 就**无法被复现，
+也无法被质疑** —— 而不可质疑的结论没有价值。
+
+`common.py` 提供清单层，产物是 `results/<dataset_id>/run_manifest.json`：
+
+| 函数 | 记录什么 | 规范条款 |
+|---|---|---|
+| `init_manifest` | 开新一轮（**清掉上一轮**） | — |
+| `capture_versions` | 全量已装包 + `KEY_PACKAGES` 逐个 | §0.3 |
+| `record_input` | 输入文件的 sha256 | §0.4 |
+| `record_params` | 全部参数**含 seed** | §0.3 |
+| `record_decision` | Agent 决策链（问题/结论/证据） | §0.4 |
+| `record_human_review` | 人工复核节点及状态 | §0.4 |
+| `record_cross_language` | 跨语言转换前后维度与**丢失字段** | §0.2 |
+| `manifest_summary` | 供验收用的摘要 | — |
+
+**几条不能省的约定：**
+
+1. **未装的工具要记成 `null`，不能省略键。** `key_versions` 里
+   `"liana": null` 和"没有 liana 这个键"是两件事：前者是"查过了，没装"，
+   后者是"没查"。省略会让读者分不清。
+2. **人工复核未确认不算失败。** `human_review` 默认就是 `pending`，
+   判成 FAIL 会让每个 job 都红，反而没人看。但必须**可见**。
+3. **`init_manifest` 必须清掉上一轮。** 和规则 14 同一个道理：
+   上一轮的清单留在那里冒充本轮，比没有清单更糟。
+4. **清单在步骤跑完之后才登记输入。** 可选步骤这轮有没有产物，
+   跑完才知道；在开头登记会把"上轮残留"记成本轮输入。
+5. **`pip freeze` 不用 subprocess 抓。** 沙箱下管道捕获会 EPERM，
+   用 `importlib.metadata` 枚举。
+
+`run_manifest.json` 落在 `results/` 下，随 artifact 一起上传 ——
+**它必须和结果同时可及**，否则追溯链是断的。

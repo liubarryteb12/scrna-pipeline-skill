@@ -192,6 +192,240 @@ def record_step(cfg: dict, step_id: str, status: str, seconds: float = None,
 
 
 # ============================================================================
+# 运行清单（模块零规范层）
+# ============================================================================
+# 规范来源：用户整合文档「模块零：语言与运行时规范」。
+#   §0.2 跨语言接口 —— 只走 CSV；每次转换记录维度/metadata/丢失字段
+#   §0.3 版本记录   —— pip freeze 全量 + 文档点名的关键工具单独记版本
+#   §0.3 随机种子   —— 所有随机过程固定种子并记录
+#   §0.4 运行日志   —— 输入数据哈希、软件版本、关键参数、决策链、
+#                      人工干预记录、跨语言转换记录
+#
+# 产物：results/<dataset_id>/run_manifest.json
+#
+# **为什么不塞进 state.json：** state.json 记的是"这一步跑没跑成"，每步重写；
+# manifest 记的是"本轮是在什么条件下跑出来的"，是证据，写入后不该再变。
+# 混在一起会让后者被前者覆盖。
+#
+# **诚实性要求（AGENTS.md 规则 4）：** 没做的分析、没装的工具、没确认的
+# 复核节点，都要在 manifest 里留下痕迹，不能因为"不影响结论"就不写。
+# `decisions` 记的是**实际的选择**，不是"应该怎么做"。
+
+MANIFEST_NAME = "run_manifest.json"
+
+# 文档 §2 点名的工具。**没装的记 None，不省略键** —— 键消失和"版本是 None"
+# 看起来完全不同，后者才说明"这个工具本该有但没装"。
+KEY_PACKAGES = [
+    # §2 核心 Python 包
+    "scanpy", "anndata", "scvi-tools", "cellbender", "harmonypy", "scvelo",
+    "celltypist", "pyscenic", "liana", "doubletdetection", "scrublet",
+    # §2.6 拟时序
+    "palantir", "scfates", "cytotrace",
+    # §2 点名的 R 包（本仓库无 rpy2 路径，正常就是 None）
+    "monocle3", "slingshot", "cellchat", "soupx", "scdblfinder",
+]
+
+
+def manifest_path(cfg: dict) -> Path:
+    return Path(cfg["output"]["results_dir"]) / MANIFEST_NAME
+
+
+def read_manifest(cfg: dict) -> dict:
+    return read_json(manifest_path(cfg)) or {}
+
+
+def init_manifest(cfg: dict, language: str = "python") -> dict:
+    """建立本轮清单骨架。**会清掉上一轮的内容** —— 清单描述的是本轮。"""
+    m = {
+        "dataset_id": cfg.get("dataset_id"),
+        "language": language,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "seed": (cfg.get("analysis") or {}).get("seed"),
+        "versions": {},
+        "key_versions": {},
+        "inputs": [],
+        "params": {},
+        "decisions": [],
+        "human_review": [],
+        "cross_language": [],
+    }
+    write_json(manifest_path(cfg), m)
+    return m
+
+
+def _manifest_append(cfg: dict, key: str, entry) -> None:
+    m = read_manifest(cfg)
+    m.setdefault(key, [])
+    m[key].append(entry)
+    m["dataset_id"] = cfg.get("dataset_id")
+    m["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    write_json(manifest_path(cfg), m)
+
+
+def _norm_pkg(name: str) -> str:
+    """PEP 503 归一化：包名大小写与 -/_/. 不敏感。"""
+    return str(name).strip().lower().replace("_", "-").replace(".", "-")
+
+
+def capture_versions(cfg: dict, key_packages=None, extra: dict = None) -> dict:
+    """§0.3 版本记录。
+
+    全量走 `importlib.metadata` 枚举已安装发行版，**不起子进程** ——
+    管道捕获输出在受限沙箱里会 EPERM，而这里拿到的信息与 `pip freeze` 等价。
+
+    文档点名的关键工具单独放进 `key_versions`：全量 freeze 有几百行，
+    关键工具淹没在里面。
+    """
+    from importlib import metadata as _md
+
+    full = {}
+    try:
+        for d in _md.distributions():
+            try:
+                n = d.metadata["Name"]
+            except Exception:
+                continue
+            if n:
+                full[_norm_pkg(n)] = d.version
+    except Exception as exc:
+        log_warn(f"枚举已安装包失败（{exc}）—— versions 会不完整")
+
+    key = {}
+    for p in (key_packages if key_packages is not None else KEY_PACKAGES):
+        key[p] = full.get(_norm_pkg(p))
+    for k, v in (extra or {}).items():
+        key[k] = v
+
+    m = read_manifest(cfg)
+    m["versions"] = dict(sorted(full.items()))
+    m["key_versions"] = key
+    m["n_packages"] = len(full)
+    m["python"] = sys.version.split()[0]
+    try:
+        import platform
+        m["platform"] = platform.platform()
+    except Exception:
+        pass
+    m["dataset_id"] = cfg.get("dataset_id")
+    m["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    write_json(manifest_path(cfg), m)
+
+    missing = sorted(k for k, v in key.items() if v is None)
+    if missing:
+        log_warn(f"关键工具未安装（{len(missing)}/{len(key)}）：{', '.join(missing)}")
+    else:
+        log_info(f"关键工具全部就位（{len(key)} 个），共记录 {len(full)} 个已安装包")
+    return key
+
+
+def record_input(cfg: dict, path, label: str = "", required: bool = True) -> dict:
+    """§0.4 输入数据哈希。
+
+    文件不存在时**记 missing 而不是抛异常** —— 调用点未必知道某个输入
+    这轮会不会产生（可选步骤的产物就是）。`required=True` 时 missing
+    会在验收里被看见。
+    """
+    p = Path(path)
+    entry = {"label": label or p.name, "path": str(p), "required": bool(required)}
+    if p.exists() and p.is_file():
+        entry["sha256"] = sha256_file(p)
+        entry["bytes"] = p.stat().st_size
+        entry["status"] = "present"
+    else:
+        entry["status"] = "missing"
+    _manifest_append(cfg, "inputs", entry)
+    return entry
+
+
+def record_params(cfg: dict, params: dict) -> None:
+    """§0.4 关键参数完整记录（含随机种子）。"""
+    m = read_manifest(cfg)
+    m.setdefault("params", {})
+    m["params"].update(params or {})
+    m["seed"] = (cfg.get("analysis") or {}).get("seed")
+    m["dataset_id"] = cfg.get("dataset_id")
+    m["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    write_json(manifest_path(cfg), m)
+
+
+def record_decision(cfg: dict, node: str, question: str, answer, evidence: str = "") -> None:
+    """§0.4 Agent 决策链：从原始问题到最终结论的每一步推理。
+
+    `evidence` 要写**支持这个选择的实际数字**，不是"因为这是通行做法"。
+    没有量化依据的决策也要记，但 evidence 就写"没有量化依据"。
+    """
+    _manifest_append(cfg, "decisions", {
+        "node": node, "question": question, "answer": answer,
+        "evidence": evidence, "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    })
+
+
+def record_human_review(cfg: dict, node: str, required: bool = True,
+                        status: str = "pending", note: str = "") -> None:
+    """§0.4 人工干预记录。
+
+    status：pending（需确认，未确认）/ confirmed / overridden（人推翻了
+    自动结果，note 写改成什么）/ not_needed（本数据集不涉及）。
+
+    **默认 pending 而不是 confirmed。** 自动化流水线不能替人签字 ——
+    把未确认的节点默认记成已确认，等于把复核节点变成摆设。
+    """
+    _manifest_append(cfg, "human_review", {
+        "node": node, "required": bool(required), "status": status,
+        "note": note, "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    })
+
+
+def record_cross_language(cfg: dict, src: str, dst: str, fmt: str,
+                          before: dict = None, after: dict = None,
+                          lost=None, tool: str = "", note: str = "") -> None:
+    """§0.2 跨语言转换记录。
+
+    文档要求记录转换前后维度、metadata 字段数、丢失字段清单。桥接工具限定
+    zellkonverter / anndata2ri，**禁止 sceasy**（维护状态差、metadata 丢失
+    风险高）。
+
+    本仓库与姊妹仓库之间只走 CSV，所以正常路径下 `before`/`after` 是
+    行列数与列名集合；真正发生对象级转换时才填 `tool`。
+    """
+    _manifest_append(cfg, "cross_language", {
+        "src": src, "dst": dst, "format": fmt, "tool": tool,
+        "before": before or {}, "after": after or {},
+        "lost_fields": sorted(lost or []),
+        "note": note, "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    })
+
+
+def manifest_summary(cfg: dict) -> dict:
+    """给验收用的一行摘要。
+
+    **必需项缺失和可选项缺失要分开报。** 可选项（如 `clinical.csv`）本来就
+    允许不存在，把它算进"缺失"会让每个没有该文件的数据集都判失败 ——
+    那是把"设计如此"当成"出错了"。两者都必须**可见**，但只有必需项判失败。
+    """
+    m = read_manifest(cfg)
+    if not m:
+        return {"present": False}
+    ins = m.get("inputs") or []
+    miss = [i for i in ins if i.get("status") == "missing"]
+    return {
+        "present": True,
+        "n_versions": len(m.get("versions") or {}),
+        "n_inputs": len(ins),
+        "inputs_missing": sorted(i.get("label") or "?" for i in miss),
+        "inputs_missing_required": sorted(
+            i.get("label") or "?" for i in miss if i.get("required")
+        ),
+        "n_decisions": len(m.get("decisions") or []),
+        "human_review_pending": sorted(
+            h["node"] for h in (m.get("human_review") or [])
+            if h.get("status") == "pending"
+        ),
+        "n_cross_language": len(m.get("cross_language") or []),
+    }
+
+
+# ============================================================================
 # 出图样式与调色板
 # ============================================================================
 # 规范来源：scientific-agent-skills/skills/scientific-visualization

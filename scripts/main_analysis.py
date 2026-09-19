@@ -25,9 +25,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts" / "lib"))
 
-from common import (load_config, log_error, log_info, log_warn,  # noqa: E402
-                    parse_args, read_json, read_state, record_step,
-                    set_orchestrated, write_json)
+from common import (capture_versions, init_manifest, load_config,  # noqa: E402
+                    log_error, log_info, log_warn, manifest_path,
+                    manifest_summary, parse_args, read_json, read_state,
+                    record_human_review, record_input, record_params,
+                    record_step, set_orchestrated, write_json)
 
 # (步骤 id, 模块文件, 函数名, 是否必需, 中文名)
 STEPS = [
@@ -54,6 +56,27 @@ STEP_STATUS_FILES = {
     "communication": "communication_status.json",
     "grn": "grn_status.json",
 }
+
+# 文档 §2「本部分人工复核节点」。**默认 pending，不是 confirmed** ——
+# 自动化流水线不能替人签字，把未确认的节点记成已确认，等于把复核节点
+# 变成摆设。验收里作为**可见但不阻断**的项列出（required 只标"这节点
+# 是否适用本数据集"）。
+HUMAN_REVIEW_NODES = [
+    ("celltype_labels",      "细胞类型注释最终标签",              True),
+    ("cluster_resolution",   "聚类分辨率选择依据",                True),
+    ("pseudobulk_design",    "拟bulk 差异分析设计",               False),
+    ("trajectory_direction", "拟时序轨迹方向确认（marker 验证）",  True),
+    ("trajectory_branches",  "拟时序分支点的生物学解释",           True),
+]
+
+# 需要登记哈希的输入（相对 data_dir）。(文件名, 中文说明, 是否必需)
+INPUT_FILES = [
+    ("raw.h5ad",          "原始计数矩阵", True),
+    ("dataset_info.json", "数据集元信息",  True),
+    ("qc_filtered.h5ad",  "QC 后矩阵",    True),
+    ("integrated.h5ad",   "整合后矩阵",    True),
+    ("clustered.h5ad",    "聚类后矩阵",    True),
+]
 
 # 必需产物（相对 results_dir）。(文件名, 中文说明, 是否必需)
 REQUIRED_FILES = [
@@ -107,6 +130,24 @@ def run_all(cfg: dict, only: list = None) -> int:
     log_info(f"结果目录 {res_dir}")
     log_info("=" * 68)
 
+    # ---- 模块零：建立本轮运行清单（§0.3 / §0.4）-----------------------------
+    # **必须在任何步骤之前建，且先清掉上一轮** —— 清单描述的是本轮。
+    # 清单和 state.json 分开：state 记"跑没跑成"（每步重写），
+    # 清单记"在什么条件下跑出来的"（证据，写入后不该再变）。
+    init_manifest(cfg)
+    capture_versions(cfg)
+    record_params(cfg, {
+        "seed": cfg.get("analysis", {}).get("seed"),
+        "qc": cfg.get("qc", {}),
+        "cluster": cfg.get("cluster", {}),
+        "integration": cfg.get("integration", {}),
+        "trajectory": cfg.get("trajectory", {}),
+    })
+    for node, label, req in HUMAN_REVIEW_NODES:
+        record_human_review(cfg, node, required=req, status="pending",
+                            note=f"{label} —— 需人工确认，本轮自动化未确认")
+    log_info(f"运行清单：{manifest_path(cfg)}")
+
     failed_required = []
     for sid, mfile, fn, required, label in STEPS:
         if only and sid not in only:
@@ -134,6 +175,19 @@ def run_all(cfg: dict, only: list = None) -> int:
                 # **可选步骤失败不让 job 变红，但必须显眼。**
                 # Part 1 的教训：可选步骤失败时 job 仍然是绿的。
                 log_warn(f"{label} 失败（可选，不影响 job 结论）: {msg}")
+
+    # ---- 模块零：登记输入哈希（§0.4）----------------------------------------
+    # 放在所有步骤之后 —— 可选步骤的产物这轮有没有，跑完才知道。
+    data_dir = Path(cfg["output"]["data_dir"])
+    for fname, desc, req in INPUT_FILES:
+        e = record_input(cfg, data_dir / fname, label=f"{desc} ({fname})",
+                         required=req)
+        if e["status"] == "missing" and req:
+            log_warn(f"输入缺失：{desc} ({fname})")
+    msum = manifest_summary(cfg)
+    log_info(f"输入登记 {msum['n_inputs']} 项"
+             + (f"，其中缺失 {len(msum['inputs_missing'])} 项"
+                if msum["inputs_missing"] else "，全部就位"))
 
     # ---- 验收清单 ----------------------------------------------------------
     log_info("")
@@ -172,6 +226,44 @@ def run_all(cfg: dict, only: list = None) -> int:
         checks.append({"item": f"图 {desc} ({fname}.png)", "ok": ok,
                        "required": True,
                        "detail": "存在" if ok else "**缺失**"})
+
+    # ---- 模块零：运行清单（§0.3 / §0.4）-------------------------------------
+    # 清单缺项不是"分析错了"，而是"这轮跑出来的东西没法追溯"。
+    # **人工复核未确认不算失败** —— 默认就是 pending，那是设计如此；
+    # 把它判成 FAIL 会让每个 job 都红，反而没人看。但必须可见。
+    checks.append({
+        "item": "运行清单存在（run_manifest.json）",
+        "ok": msum.get("present", False), "required": True,
+        "detail": (f"{msum.get('n_versions', 0)} 个包版本、"
+                   f"{msum.get('n_inputs', 0)} 项输入、"
+                   f"{msum.get('n_decisions', 0)} 条决策"
+                   if msum.get("present") else "**缺失**"),
+    })
+    if msum.get("present"):
+        checks.append({
+            "item": "版本记录非空（pip freeze 全量）",
+            "ok": msum["n_versions"] >= 20, "required": True,
+            "detail": f"{msum['n_versions']} 个已安装包",
+        })
+        checks.append({
+            "item": "输入哈希已登记且必需项无缺失",
+            # **只看 required 的缺失。** 可选项（如 clinical.csv）本来就可以
+            # 不存在，算进来会让没有该文件的数据集全部误判失败。
+            "ok": msum["n_inputs"] >= len(INPUT_FILES)
+                  and not msum["inputs_missing_required"],
+            "required": True,
+            "detail": (f"{msum['n_inputs']} 项"
+                       + (f"，必需缺失 {','.join(msum['inputs_missing_required'])}"
+                          if msum["inputs_missing_required"] else "，必需项齐全")
+                       + (f"（可选缺失 {','.join(msum['inputs_missing'])}）"
+                          if msum["inputs_missing"] else "")),
+        })
+        pend = msum["human_review_pending"]
+        checks.append({
+            "item": f"人工复核节点待确认（{len(pend)} 个，不阻断 job）",
+            "ok": True, "required": False,
+            "detail": (", ".join(pend) if pend else "全部已确认"),
+        })
 
     # 可选步骤的"没做"要在报告里可见 —— 不能只是绿
     for sid, fname in (("pseudobulk_de", "pseudobulk_status.json"),
@@ -240,6 +332,59 @@ def run_all(cfg: dict, only: list = None) -> int:
                            "required": True,
                            "detail": "存在" if ok else "**缺失**"})
 
+    # ---- 文档指定工具的落地情况（§2.4 CellTypist / §2.7 LIANA）-------------
+    #
+    # **不阻断 job，但没跑成就要红字显示。** 这两个都是 pip 能装的，
+    # 装了就该跑；没跑成（模型下载失败 / 版本不兼容）是环境问题不是分析
+    # 错了，所以 required=False。但绝不能混在绿字里 ——
+    # 规则 4：可选步骤的"没做"必须和"做了没问题"长得不一样。
+    cj = read_json(res_dir / "cluster_status.json") or {}
+    ann = cj.get("annotation") or {}
+    ct = ann.get("celltypist") or {}
+    ct_cmp = ann.get("celltypist_vs_marker") or {}
+    checks.append({
+        "item": "CellTypist 自动注释（§2.4）",
+        "ok": ct.get("status") == "ok", "required": False,
+        "detail": (f"ok：{ct.get('n_labels')} 种标签，模型 {ct.get('model')}，"
+                   f"{ct.get('n_genes_input')} 基因输入"
+                   if ct.get("status") == "ok" else
+                   f"**未跑成**（{ct.get('status')}：{str(ct.get('reason'))[:120]}）"
+                   " —— marker 打分仍在，但少了第二条独立证据"),
+    })
+    if ct.get("status") == "ok":
+        checks.append({
+            "item": "CellTypist 与 marker 注释的一致性已量化（§2.4）",
+            "ok": bool(ct_cmp.get("compared")), "required": False,
+            "detail": (f"簇层面一致 {ct_cmp.get('n_agree_exact')}/"
+                       f"{ct_cmp.get('n_clusters')}"
+                       f"（{ct_cmp.get('agreement_frac')}）"
+                       if ct_cmp.get("compared") else
+                       f"**未对比**：{ct_cmp.get('reason')}"),
+        })
+
+    cm = read_json(res_dir / "communication_status.json") or {}
+    li = cm.get("liana") or {}
+    li_cmp = cm.get("liana_vs_builtin") or {}
+    checks.append({
+        "item": "LIANA rank_aggregate（§2.7 指定的主工具）",
+        "ok": li.get("status") == "ok", "required": False,
+        "detail": (f"ok：{li.get('n_rows')} 行，v{li.get('version')}，"
+                   f"api {li.get('api')}"
+                   if li.get("status") == "ok" else
+                   f"**未跑成**（{li.get('status')}：{str(li.get('reason'))[:120]}）"
+                   " —— 自建共表达打分仍在，但它不是 consensus rank aggregate"),
+    })
+    if li.get("status") == "ok":
+        checks.append({
+            "item": "LIANA 与自建打分的差异已量化（§2.7）",
+            "ok": bool(li_cmp.get("compared")), "required": False,
+            "detail": (f"共同组合 {li_cmp.get('n_common_combinations')}，"
+                       f"Spearman rho={li_cmp.get('spearman_rho')}，"
+                       f"top25 重叠 {li_cmp.get('top25_overlap')}/25"
+                       if li_cmp.get("compared") else
+                       f"**未对比**：{li_cmp.get('reason')}"),
+        })
+
     n_fail = 0
     for c in checks:
         mark = "PASS" if c["ok"] else "FAIL"
@@ -259,6 +404,7 @@ def run_all(cfg: dict, only: list = None) -> int:
         "checks": checks,
         "steps_failed_required": [{"id": i, "label": l, "error": m}
                                   for i, l, m in failed_required],
+        "manifest": msum,
         "verdict": "ok" if n_fail == 0 else "failed",
     }
     write_json(res_dir / "acceptance.json", summary)
