@@ -1,0 +1,222 @@
+# ============================================================================
+# assets/ligand_receptor.yml — 配体-受体对（精简内置库）
+# ============================================================================
+# **这不是 CellChatDB / OmniPath 的替代品。** 那些数据库有几千对，
+# 这里只有几十对免疫相关的 —— 目的是让流水线在没有任何外部数据库依赖时
+# 仍能跑通，并产出**方向正确、量级可信**的结果。
+#
+# 换真实课题时应该换成完整的数据库（LIANA 可以统一调用 CellChatDB /
+# CellPhoneDB / OmniPath / NATMI / Connectome）。本内置库的覆盖不全
+# 会让"没找到显著通讯"变成一个**假阴性**，而不是真的没有通讯。
+#
+# 字段：
+#   name      对的名字（惯用写法）
+#   ligand    配体基因（多聚体写多个；任一命中即可）
+#   receptor  受体基因
+#   note      已知的生物学背景；**特别是哪些是免疫检查点**
+#
+# 参考：CellChatDB（Jin et al. 2021, Nat Commun）、CellPhoneDB v2
+#      （Efremova et al. 2020, Nat Protoc）
+# ============================================================================
+
+pairs:
+
+  # ---- 免疫检查点（肿瘤单细胞里最常被关注的一组）----------------------------
+  - name: CD274_PDCD1          # PD-L1 -> PD-1
+    ligand: [CD274]
+    receptor: [PDCD1]
+    note: 免疫检查点；PD-L1 在肿瘤/髓系细胞，PD-1 在耗竭 T 细胞
+
+  - name: PDCD1LG2_PDCD1       # PD-L2 -> PD-1
+    ligand: [PDCD1LG2]
+    receptor: [PDCD1]
+    note: 免疫检查点，与 CD274_PDCD1 并行
+
+  - name: CD80_CTLA4
+    ligand: [CD80, CD86]
+    receptor: [CTLA4]
+    note: 免疫检查点；CTLA4 在调节性 T 细胞高表达
+
+  - name: LGALS9_HAVCR2        # Galectin-9 -> TIM-3
+    ligand: [LGALS9]
+    receptor: [HAVCR2]
+    note: 免疫检查点；HAVCR2 即 TIM-3
+
+  - name: PVR_TIGIT
+    ligand: [PVR]
+    receptor: [TIGIT]
+    note: 免疫检查点
+
+  # ---- 抗原呈递 -------------------------------------------------------------
+  - name: HLA_CD4
+    ligand: [HLA-DRA, HLA-DRB1, HLA-DPA1, HLA-DPB1]
+    receptor: [CD4]
+    note: MHC-II -> CD4，抗原呈递的核心
+
+  - name: B2M_CD8A
+    ligand: [B2M, HLA-A, HLA-B, HLA-C]
+    receptor: [CD8A, CD8B]
+    note: MHC-I -> CD8，几乎所有有核细胞都能呈递
+
+  # ---- 共刺激 ---------------------------------------------------------------
+  - name: CD80_CD28
+    ligand: [CD80, CD86]
+    receptor: [CD28]
+    note: 共刺激信号，T 细胞激活的第二信号
+
+  - name: ICOSLG_ICOS
+    ligand: [ICOSLG]
+    receptor: [ICOS]
+    note: 共刺激；ICOS 在激活的 T 细胞
+
+  - name: CD40LG_CD40
+    ligand: [CD40LG]
+    receptor: [CD40]
+    note: T-B 细胞互作的关键
+
+  # ---- 趋化因子 -------------------------------------------------------------
+  - name: CCL5_CCR5
+    ligand: [CCL5]
+    receptor: [CCR5, CCR1]
+    note: T/NK 招募
+
+  - name: CXCL9_CXCR3
+    ligand: [CXCL9, CXCL10, CXCL11]
+    receptor: [CXCR3]
+    note: Th1 型炎症的趋化轴；IFN-γ 诱导
+
+  - name: CXCL12_CXCR4
+    ligand: [CXCL12]
+    receptor: [CXCR4]
+    note: 广泛存在；骨髓归巢
+
+  - name: CCL2_CCR2
+    ligand: [CCL2]
+    receptor: [CCR2]
+    note: 单核细胞招募
+
+  - name: CXCL8_CXCR1
+    ligand: [CXCL8]
+    receptor: [CXCR1, CXCR2]
+    note: 中性粒细胞招募
+
+  - name: CCL19_CCR7
+    ligand: [CCL19, CCL21]
+    receptor: [CCR7]
+    note: 淋巴结归巢；naive/记忆 T 细胞
+
+  # ---- 细胞因子 -------------------------------------------------------------
+  - name: IL2_IL2RA
+    ligand: [IL2]
+    receptor: [IL2RA, IL2RB]
+    note: T 细胞增殖
+
+  - name: IL7_IL7R
+    ligand: [IL7]
+    receptor: [IL7R]
+    note: T 细胞存活
+
+  - name: IL10_IL10RA
+    ligand: [IL10]
+    receptor: [IL10RA, IL10RB]
+    note: 免疫抑制
+
+  - name: TGFB1_TGFBR1
+    ligand: [TGFB1]
+    receptor: [TGFBR1, TGFBR2]
+    note: 免疫抑制；肿瘤微环境常见
+
+  - name: IFNG_IFNGR1
+    ligand: [IFNG]
+    receptor: [IFNGR1, IFNGR2]
+    note: Th1/NK 效应
+
+  - name: TNF_TNFRSF1A
+    ligand: [TNF]
+    receptor: [TNFRSF1A, TNFRSF1B]
+    note: 炎症
+
+  - name: IL1B_IL1R1
+    ligand: [IL1B]
+    receptor: [IL1R1]
+    note: 炎症小体下游
+
+  - name: IL6_IL6R
+    ligand: [IL6]
+    receptor: [IL6R]
+    note: 炎症；JAK-STAT
+
+  - name: CSF1_CSF1R
+    ligand: [CSF1]
+    receptor: [CSF1R]
+    note: 巨噬细胞分化/存活
+
+  # ---- 生长因子 -------------------------------------------------------------
+  - name: VEGFA_KDR
+    ligand: [VEGFA]
+    receptor: [KDR, FLT1]
+    note: 血管生成
+
+  - name: EGF_EGFR
+    ligand: [EGF, TGFA]
+    receptor: [EGFR]
+    note: 上皮增殖；肿瘤常见
+
+  - name: TGFB1_ITGB1
+    ligand: [TGFB1]
+    receptor: [ITGB1, ITGB6]
+    note: 整合素依赖的 TGF-β 激活
+
+  # ---- 细胞黏附 -------------------------------------------------------------
+  - name: CDH1_CDH1
+    ligand: [CDH1]
+    receptor: [CDH1]
+    note: 同型黏附（E-cadherin）
+
+  - name: ICAM1_ITGAL
+    ligand: [ICAM1]
+    receptor: [ITGAL, ITGB2]
+    note: 白细胞黏附/外渗
+
+  - name: VCAM1_ITGA4
+    ligand: [VCAM1]
+    receptor: [ITGA4, ITGB1]
+    note: 白细胞黏附
+
+  # ---- Notch / Wnt ----------------------------------------------------------
+  - name: DLL1_NOTCH1
+    ligand: [DLL1, DLL4]
+    receptor: [NOTCH1, NOTCH2]
+    note: 发育与分化
+
+  - name: WNT5A_FZD1
+    ligand: [WNT5A]
+    receptor: [FZD1, FZD5]
+    note: 非经典 Wnt
+
+  # ---- 补体 -----------------------------------------------------------------
+  - name: C3_ITGAM
+    ligand: [C3]
+    receptor: [ITGAM, ITGB2]
+    note: 补体受体；髓系
+
+  # ---- 其它常见 -------------------------------------------------------------
+  - name: ANXA1_FPR1
+    ligand: [ANXA1]
+    receptor: [FPR1]
+    note: 中性粒细胞趋化
+
+  - name: SPP1_CD44
+    ligand: [SPP1]
+    receptor: [CD44]
+    note: 骨桥蛋白；肿瘤相关巨噬细胞常见
+
+  - name: MIF_CD74
+    ligand: [MIF]
+    receptor: [CD74, CD44]
+    note: 炎症；MIF 通路
+
+  - name: LGALS1_ITGB1
+    ligand: [LGALS1]
+    receptor: [ITGB1]
+    note: 免疫调节

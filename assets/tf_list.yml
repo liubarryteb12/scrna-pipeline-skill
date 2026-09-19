@@ -1,0 +1,306 @@
+# ============================================================================
+# assets/tf_list.yml — 转录因子列表
+# ============================================================================
+# **这是一个精简的、免疫/泛癌相关的 TF 列表，不是完整的 TF 数据库。**
+# 人类基因组有 ~1600 个 TF（HumanTFDB / Lambert et al. 2018, Cell）。
+# 完整列表应该从那些数据库取；这里列了最常见的一批，目的是让流水线
+# 在没有外部数据库依赖时能跑通并产出方向正确的结果。
+#
+# 覆盖不全的后果：**漏掉的 TF 不会被报出来**，而"没报"和"没有活性"
+# 在读报告的人眼里是一样的。所以 `grn_status.json` 里记了
+# `n_tfs_in_list` 与 `n_tfs_present`，让覆盖范围可见。
+#
+# 换成完整列表时：把 `tfs:` 换成 ~1600 个基因名即可，代码不用改。
+#
+# 参考：Lambert SA et al. "The Human Transcription Factors." Cell 2018.
+#      doi:10.1016/j.cell.2018.01.029
+# ============================================================================
+
+tfs:
+
+  # ---- 免疫细胞发育与分化 ---------------------------------------------------
+  - SPI1      # PU.1，髓系主控
+  - CEBPA
+  - CEBPB
+  - CEBPD
+  - CEBPE
+  - IRF1
+  - IRF4
+  - IRF7
+  - IRF8
+  - PAX5      # B 细胞主控
+  - EBF1
+  - TCF3      # E2A
+  - PRDM1     # BLIMP1，浆细胞
+  - XBP1      # 浆细胞 UPR
+  - TCF7      # T 细胞干性
+  - LEF1
+  - TCF7L1
+  - TBX21     # T-bet，Th1
+  - GATA3     # Th2
+  - RORC      # Th17
+  - RORA
+  - FOXP3     # Treg
+  - BCL6      # Tfh / 生发中心
+  - PRDM1
+  - TOX       # 耗竭 T 细胞
+  - TBX21
+  - EOMES     # 效应 T / NK
+  - RUNX3
+  - RUNX1
+  - RUNX2
+  - ZEB2
+  - ID2
+  - TCF4      # E2-2，pDC
+  - BCL11A
+  - BCL11B
+  - IKZF1     # Ikaros
+  - IKZF2     # Helios
+  - IKZF3     # Aiolos
+  - SPIB
+  - NFIL3
+  - MAFB
+  - MAF
+  - KLF4
+  - KLF2
+
+  # ---- 炎症与 NF-κB ---------------------------------------------------------
+  - NFKB1
+  - NFKB2
+  - REL
+  - RELA
+  - RELB
+  - NFATC1
+  - NFATC2
+  - NFATC3
+  - NFAT5
+  - STAT1
+  - STAT2
+  - STAT3
+  - STAT4
+  - STAT5A
+  - STAT5B
+  - STAT6
+  - JUN
+  - JUNB
+  - JUND
+  - FOS
+  - FOSB
+  - FOSL1
+  - FOSL2
+  - ATF3
+  - ATF4
+  - BATF
+  - BATF3
+  - MAFK
+  - NFE2L2    # NRF2
+  - NFKBIA
+
+  # ---- 应激 / 缺氧 ----------------------------------------------------------
+  - HIF1A
+  - HIF3A
+  - EPAS1     # HIF2A
+  - ARNT
+  - VHL
+  - XBP1
+  - ATF6
+  - DDIT3     # CHOP
+  - HSF1
+  - NFE2L2
+  - TP53
+  - TP63
+  - TP73
+  - FOXO1
+  - FOXO3
+  - FOXO4
+  - FOXM1
+
+  # ---- 细胞周期 / 增殖 ------------------------------------------------------
+  - MYC
+  - MYCN
+  - MYB
+  - E2F1
+  - E2F2
+  - E2F3
+  - E2F4
+  - E2F7
+  - E2F8
+  - CCND1
+  - CDK4
+  - CDK6
+  - RB1
+  - EZH2
+  - BMI1
+  - MKI67
+  - PCNA
+  - TYMS
+  - TOP2A
+
+  # ---- 干细胞性 / 发育 ------------------------------------------------------
+  - POU5F1     # OCT4
+  - SOX2
+  - NANOG
+  - KLF4
+  - MYC
+  - LIN28A
+  - LIN28B
+  - SALL4
+  - GATA1
+  - GATA2
+  - GATA6
+  - TAL1
+  - LMO2
+  - MECOM
+  - HOXA9
+  - HOXA10
+  - HOXB4
+  - MEIS1
+  - SNAI1
+  - SNAI2
+  - TWIST1
+  - TWIST2
+  - ZEB1
+  - ZEB2
+  - CDX2
+  - HNF4A
+  - FOXA1
+  - FOXA2
+  - GATA4
+  - NKX2-1
+  - PDX1
+
+  # ---- 泛癌驱动 / 抑癌 ------------------------------------------------------
+  - TP53
+  - RB1
+  - PTEN
+  - BRCA1
+  - BRCA2
+  - AR
+  - ESR1
+  - ESR2
+  - PGR
+  - ERBB2
+  - MYC
+  - KRAS
+  - NRAS
+  - BRAF
+  - CTNNB1
+  - GLI1
+  - GLI2
+  - GLI3
+  - SMO
+  - NOTCH1
+  - NOTCH2
+  - NOTCH3
+  - NOTCH4
+  - RBPJ
+  - HES1
+  - HEY1
+  - TCF7L2
+  - LEF1
+  - SMAD1
+  - SMAD2
+  - SMAD3
+  - SMAD4
+  - SMAD5
+  - SMAD7
+  - YAP1
+  - WWTR1     # TAZ
+  - TEAD1
+  - TEAD4
+
+  # ---- 干扰素 / 抗病毒 ------------------------------------------------------
+  - IRF1
+  - IRF2
+  - IRF3
+  - IRF5
+  - IRF6
+  - IRF9
+  - STAT1
+  - STAT2
+  - MX1
+  - ISG15
+
+  # ---- 代谢 / 核受体 --------------------------------------------------------
+  - PPARG
+  - PPARA
+  - PPARD
+  - NR1H3     # LXR
+  - NR1H2
+  - NR3C1     # 糖皮质激素受体
+  - NR4A1
+  - NR4A2
+  - NR4A3
+  - VDR
+  - RARA
+  - RXRA
+  - THRB
+  - ESRRA
+  - NCOA1
+  - NCOR1
+  - NCOR2
+
+  # ---- 染色质 / 表观 --------------------------------------------------------
+  - EZH2
+  - SUZ12
+  - EED
+  - KDM5A
+  - KDM5B
+  - KDM6A
+  - KDM6B
+  - KMT2A
+  - KMT2D
+  - ARID1A
+  - ARID1B
+  - SMARCA4
+  - CHD1
+  - CHD4
+  - CTCF
+  - EP300
+  - CREBBP
+  - HDAC1
+  - HDAC2
+  - SIRT1
+  - SIRT6
+  - DNMT1
+  - DNMT3A
+  - DNMT3B
+  - TET1
+  - TET2
+
+  # ---- 其它常见 -------------------------------------------------------------
+  - BACH1
+  - BACH2
+  - NFE2
+  - NFE2L1
+  - SP1
+  - SP3
+  - YY1
+  - EGR1
+  - EGR2
+  - EGR3
+  - NR4A1
+  - CREM
+  - CREB1
+  - CREB3
+  - ATF2
+  - ATF7
+  - ELK1
+  - ELK4
+  - ETS1
+  - ETS2
+  - FLI1
+  - ERG
+  - ETV1
+  - ETV4
+  - ETV5
+  - ETV6
+  - GABPA
+  - ELF1
+  - ELF4
+  - MEF2A
+  - MEF2C
+  - MEF2D
+  - SRF
+  - MRTFA
+  - MRTFB

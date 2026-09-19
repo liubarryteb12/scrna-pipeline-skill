@@ -1,0 +1,61 @@
+# ============================================================================
+# assets/datasets.yml — 单细胞数据集登记表
+# ============================================================================
+# 为什么要登记表而不是让用户自己拼 URL：
+#   CI 需要一个**小而稳定**的数据集来验证流水线本身（跑通 ≠ 分析出结果）。
+#   真实疾病数据集往往几百 MB 到几十 GB，且 10x 的下载链接会变。
+#   把"用来验证代码的"和"用来回答生物学问题的"分开，是两件事。
+#
+# 字段：
+#   kind     10x_tar | 10x_h5 | h5ad | csv
+#   url      直链
+#   size_mb  大致体积（用于提示，不强制）
+#   note     说明；**特别标注哪些是"健康对照/验证用"，不是疾病数据**
+#
+# 用法：
+#   config 里 source.dataset 填这里的键，或直接写 source.url。
+# ============================================================================
+
+datasets:
+
+  # ---- 用于 CI 验证流水线本身 -------------------------------------------------
+  # 健康人 PBMC，2700 细胞。选它的理由：体积小（7 MB）、10x 官方直链稳定、
+  # 被 scanpy 教程用了多年所以任何异常都能查到对照。
+  # **它不是疾病数据** —— 用它跑出的细胞类型比例没有生物学结论，
+  # 只有"流水线能跑通"这一个结论。
+  pbmc3k:
+    kind: 10x_tar
+    url: https://cf.10xgenomics.com/samples/cell-exp/1.1.0/pbmc3k/pbmc3k_filtered_gene_bc_matrices.tar.gz
+    size_mb: 7.3
+    organism: Homo sapiens
+    tissue: peripheral blood
+    condition: healthy
+    note: 健康对照；CI 冒烟测试用，细胞比例无生物学含义
+
+  pbmc3k_raw:
+    kind: 10x_tar
+    url: https://cf.10xgenomics.com/samples/cell-exp/1.1.0/pbmc3k/pbmc3k_raw_gene_bc_matrices.tar.gz
+    size_mb: 11.7
+    organism: Homo sapiens
+    tissue: peripheral blood
+    condition: healthy
+    note: 未过滤版本（含空液滴），用于验证 QC 过滤确实在起作用
+
+  pbmc3k_h5ad:
+    kind: h5ad
+    url: https://exampledata.scverse.org/scanpy/pbmc3k_raw.h5ad
+    size_mb: 5.6
+    organism: Homo sapiens
+    tissue: peripheral blood
+    condition: healthy
+    note: 同上，h5ad 格式（验证 h5ad 读入路径）
+
+  # ---- 模板：换成自己的疾病数据集 ---------------------------------------------
+  # GEO 的 10x 数据通常在 supplementary file 里。两种接法：
+  #   1) kind: 10x_tar / 10x_h5 —— 直接给 supplementary 文件的直链
+  #   2) 本地已有 h5ad —— kind: h5ad，url 写 file:///path 或本地路径
+  #
+  # **登记表里不预置具体疾病数据集**，因为：
+  #   - 链接会失效，预置的坏链接比没有更误导（用户会以为数据不存在）
+  #   - 疾病数据集体积通常超出 CI 的合理范围
+  # 用 `python scripts/00_fetch.py --probe <URL>` 可以先验证一个链接再登记。

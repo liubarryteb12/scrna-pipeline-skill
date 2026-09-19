@@ -1,0 +1,133 @@
+name: scRNA analysis
+
+# ============================================================================
+# 单细胞流水线 CI
+# ============================================================================
+# 设计原则（与 geo-brca-microarray-skill 一致）：
+#
+#   1. **静态检查在前，装依赖在后。** 语法错误/规则违反 1 秒就能发现，
+#      不该等 3 分钟装完 scanpy 才知道。
+#
+#   2. **产物必须上传。** 跑通但拿不到结果是没用的 —— 这条踩过坑：
+#      artifact 的 path 清单和脚本实际写出的文件是两份独立的列表，
+#      不一致时 job 绿但用户下载后缺文件。用 check_artifact_paths.mjs 兜住。
+#
+#   3. **图的检查在跑完之后。** 空白图只有真画出来才知道。
+#
+#   4. **可选步骤失败不让 job 变红，但要在验收清单里可见。**
+#
+#   5. 触发路径过滤：改 *.md / references/ 不触发 CI（省时间）。
+#      **改了 scripts/ 或 workflow 本身才跑。**
+# ============================================================================
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - "tools/**"
+      - "assets/**"
+      - "requirements.txt"
+      - ".github/workflows/scrna_analysis.yml"
+  pull_request:
+    paths:
+      - "scripts/**"
+      - "tools/**"
+      - "assets/**"
+      - "requirements.txt"
+      - ".github/workflows/scrna_analysis.yml"
+  workflow_dispatch:
+    inputs:
+      config:
+        description: "配置文件路径"
+        required: false
+        default: "assets/config.pbmc3k.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    # 自设上限。GitHub 托管的硬上限是 6 小时；实测全流程 3-5 分钟，
+    # 给 45 分钟留足余量（含装依赖）。
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          # **不用 3.13/3.14。** harmonypy 等包在新版本上还没有 wheel，
+          # 要从源码编译，且编译时常因缺 numpy 头文件失败（本地实测过）。
+          # 3.12 上这些包都有现成 wheel。
+          python-version: "3.12"
+
+      - name: 静态检查（不装依赖）
+        run: |
+          node tools/check_py_syntax.mjs
+          node tools/check_artifact_paths.mjs
+
+      - name: 缓存 pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -c "import scanpy, anndata, pydeseq2; print('核心依赖 OK')"
+
+      - name: 显示环境
+        run: |
+          python -c "
+          import importlib
+          for m in ['scanpy','anndata','pydeseq2','harmonypy','skmisc','skimage','leidenalg']:
+              try:
+                  importlib.import_module(m); print('  OK  ', m)
+              except Exception as e:
+                  print('  --  ', m, type(e).__name__)
+          "
+
+      - name: 跑流水线
+        run: |
+          python scripts/main_analysis.py --config ${{ github.event.inputs.config || 'assets/config.pbmc3k.yml' }}
+
+      - name: 自检拟bulk DE 代码路径
+        # 单样本数据集会让 04 正确记 not_configured 并跳过 —— 那验证了
+        # "正确跳过"，但没验证真正的 DESeq2 代码。这一步把它跑到。
+        run: |
+          python tools/selftest_pseudobulk.py --config ${{ github.event.inputs.config || 'assets/config.pbmc3k.yml' }}
+
+      - name: 检查图不是空白
+        run: node tools/check_figures.mjs results/pbmc3k/figures
+
+      - name: 汇总产物
+        if: always()
+        run: |
+          echo "===== results ====="
+          find results -type f 2>/dev/null | sort | head -60 || true
+          echo "===== data ====="
+          find data -type f 2>/dev/null | sort | head -30 || true
+          echo "===== 验收结论 ====="
+          cat results/pbmc3k/acceptance.json 2>/dev/null | head -40 || echo "（无 acceptance.json）"
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrna-results-${{ github.run_number }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            results/pbmc3k/
+            data/pbmc3k/raw.h5ad
+            data/pbmc3k/qc_filtered.h5ad
+            data/pbmc3k/integrated.h5ad
+            data/pbmc3k/clustered.h5ad
+            data/pbmc3k/dataset_info.json

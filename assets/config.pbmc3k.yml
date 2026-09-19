@@ -1,0 +1,98 @@
+# ============================================================================
+# assets/config.pbmc3k.yml — 单细胞流水线配置
+# ============================================================================
+# **这个配置对应的是"验证流水线本身"用的健康对照数据集，不是疾病数据。**
+# 它跑出的细胞类型比例没有生物学结论。换成真实疾病数据集时：
+#   1. 复制本文件为 assets/config.<你的数据集>.yml
+#   2. 改 dataset_id 和 source（见 assets/datasets.yml 的说明）
+#   3. 如果有分组/批次信息，填 design 段（否则拟bulk DE 会自动跳过并记录原因）
+#
+# 与 Part 1（geo-brca-microarray-skill）的对应关系：
+#   dataset_id    -> 派生 results/<id> 与 data/<id>，一个数据集一个产物目录
+#   analysis.seed -> 不可删；单细胞里 UMAP/leiden/scrublet 全都吃随机数
+# ============================================================================
+
+dataset_id: pbmc3k
+
+# ---- 数据来源 ---------------------------------------------------------------
+source:
+  dataset: pbmc3k          # assets/datasets.yml 里的键
+  # 也可以直接给直链（绕过登记表）：
+  #   kind: h5ad
+  #   url: https://.../my_disease_data.h5ad
+
+# ---- 实验设计 ---------------------------------------------------------------
+# 单细胞没有"两组对比"这种天然结构，分组信息来自样本元数据。
+# **没有就留空** —— 留空时拟bulk DE 会记 not_configured 并说明原因，
+# 而不是静默跳过（Part 1 规则 24 的同一条道理）。
+design:
+  # 样本（供体/条件）所在的 obs 列。10x 单样本数据里通常没有，留 null。
+  sample_key: null
+  # 分组所在的 obs 列（如 condition / disease / treatment）
+  group_key: null
+  # 对照组的取值（拟bulk DE 里作为 reference level）
+  reference_group: null
+  # 批次列（多供体/多批次整合用）
+  batch_key: null
+
+# ---- QC ---------------------------------------------------------------------
+qc:
+  min_genes: 200           # 每个细胞至少表达的基因数
+  max_genes: 6000          # 双细胞/多倍体通常表现为基因数异常高
+  max_pct_mt: 10           # 线粒体比例上限（死细胞/破损细胞高）
+  min_cells: 3             # 每个基因至少在几个细胞里表达
+  scrublet: true           # 双细胞检测（scanpy 内置，需要 scikit-image）
+  # ambient RNA（胞外游离 RNA 污染）：
+  #   none        —— 不做，并在状态里写明原因
+  #   simple      —— 用"每个细胞的计数分布 vs 空液滴"做粗略估计（无空液滴时不可用）
+  ambient_rna: none
+
+# ---- 标准化与高变基因 -------------------------------------------------------
+norm:
+  target_sum: 10000
+  n_top_genes: 2000
+  # seurat_v3 吃原始计数、不需要先 log —— 这是它与另外两种口味的关键区别
+  hvg_flavor: seurat_v3
+
+# ---- 降维与聚类 -------------------------------------------------------------
+reduce:
+  n_pcs: 40
+  n_neighbors: 15
+  resolution: 1.0
+  # 用多少个 PC 算邻居。null = 用全部 n_pcs。
+  # 给一个数会覆盖 n_pcs —— 通常看 PCA 方差图后调小（如 20）。
+  n_pcs_use: null
+
+# ---- 批次整合 ---------------------------------------------------------------
+integration:
+  method: none             # none | harmony | combat
+  # 单样本数据没有批次，method=none 是**正确的选择**而不是"偷懒"。
+  # 多供体数据必须设 method=harmony 并把 design.batch_key 填上，
+  # 否则聚类会被供体差异主导 —— 那是技术差异，不是细胞类型差异。
+
+# ---- 轨迹 -------------------------------------------------------------------
+trajectory:
+  enabled: true
+  # 起点簇。null = 用 PAGA 连通度自动挑（会记在状态里）。
+  root_cluster: null
+
+# ---- 细胞通讯 ---------------------------------------------------------------
+communication:
+  enabled: true
+  # 用哪些簇做通讯分析。null = 全部。
+  clusters: null
+
+# ---- 转录因子调控 -----------------------------------------------------------
+grn:
+  enabled: true
+  # 每个簇报告前几个 TF
+  top_tfs: 10
+
+# ---- 分析选项 ---------------------------------------------------------------
+analysis:
+  seed: 20260919           # 不可删：UMAP / leiden / scrublet 全部吃随机数
+  figure_dpi: 150
+  # 报告 marker 时每个簇取前几个
+  top_markers: 25
+  # 细胞类型注释：marker 打分用哪套签名（assets/celltype_markers.yml）
+  celltype_markers: default

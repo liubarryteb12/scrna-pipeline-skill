@@ -1,0 +1,11 @@
+# 统一换行符为 LF。CI 在 Linux 上跑，workflow 的 `run: |` 块由 bash 执行；
+# 混入 CRLF 会让 `\r` 变成命令的一部分，报出莫名其妙的 "command not found"。
+* text=auto eol=lf
+
+# 二进制文件不要做换行转换
+*.png binary
+*.pdf binary
+*.h5ad binary
+*.h5 binary
+*.mtx.gz binary
+*.tar.gz binary

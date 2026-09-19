@@ -1,0 +1,27 @@
+# 数据与产物：**不入库**
+# 单细胞数据动辄几百 MB 到几十 GB，入库会让 clone 变得不可用。
+# CI 每次都重新下载（内置数据集只有 7 MB）。
+data/
+results/
+
+# 缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# 环境
+.venv/
+venv/
+env/
+*.egg-info/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 临时
+*.part
+*.tmp

@@ -1,0 +1,77 @@
+# ============================================================================
+# assets/celltype_markers.yml — 细胞类型注释用的 marker 签名
+# ============================================================================
+# **这套 marker 是"打分提示"，不是"注释结论"。**
+#
+# 打分注释的固有局限，必须写在这里而不是埋在代码里：
+#   1. 签名不全 —— 只列了常见类型，稀有类型会拿到低分，然后被错误地
+#      归到"最接近的那个"而不是"未知"。
+#   2. 组织特异 —— 下面这套是**外周血/免疫**为主的。用到肿瘤、脑、
+#      肝等组织上，很多类型根本不在签名里，打分结果没有意义。
+#   3. 状态与类型混淆 —— 激活/耗竭的 T 细胞仍会拿高 T 细胞分，
+#      打分法区分不了"类型"与"状态"。
+#
+# 所以流水线把打分结果记为 `celltype_scores.csv`（每簇每类型的分数），
+# 而 `celltype_annotation.csv` 里的 assignment 带 `score_margin` 字段 ——
+# 第一名与第二名的差距。**margin 小的时候那个 assignment 不该被当成结论。**
+#
+# 换成自己组织时：改这个文件，或者把 config 的 analysis.celltype_markers
+# 指向另一个签名集。**不要用一套血液 marker 去注释肿瘤单细胞。**
+# ============================================================================
+
+signatures:
+
+  default:
+    description: 外周血/免疫为主（pbmc3k 这类数据适用）
+    note: 只覆盖常见免疫细胞；用到其他组织请换签名集
+    celltypes:
+
+      T_cell:
+        markers: [CD3D, CD3E, CD3G, TRAC, IL7R, LTB]
+        note: 泛 T 细胞
+
+      CD4_T:
+        markers: [CD4, IL7R, CCR7, LTB, TCF7]
+        note: 与 T_cell 高度重叠 —— 打分法很难分开，margin 会很小
+
+      CD8_T:
+        markers: [CD8A, CD8B, GZMK, CCL5, NKG7]
+        note: 与 NK 共享细胞毒基因
+
+      NK_cell:
+        markers: [NKG7, GNLY, KLRD1, NCAM1, PRF1, KLRF1]
+
+      B_cell:
+        markers: [CD79A, CD79B, MS4A1, CD19, TCL1A, IGKC]
+
+      Plasma_cell:
+        markers: [MZB1, JCHAIN, IGHG1, DERL3, XBP1]
+
+      Monocyte:
+        markers: [LYZ, S100A8, S100A9, CD14, FCN1, VCAN, CST3]
+
+      Macrophage:
+        markers: [CD68, CD163, MRC1, MSR1, C1QA, C1QB]
+
+      Dendritic_cell:
+        markers: [FCER1A, CST3, CD1C, CLEC10A, LILRA4]
+
+      Platelet:
+        markers: [PPBP, PF4, GP9, ITGA2B, TREML1]
+
+      Erythrocyte:
+        markers: [HBB, HBA1, HBA2, ALAS2, AHSP]
+        note: 常为红细胞污染而非真实细胞类型
+
+      Endothelial:
+        markers: [PECAM1, VWF, CDH5, CLDN5]
+
+      Epithelial:
+        markers: [EPCAM, KRT18, KRT19, KRT8]
+
+      Fibroblast:
+        markers: [COL1A1, COL1A2, DCN, LUM, PDGFRA]
+
+      Proliferating:
+        markers: [MKI67, TOP2A, STMN1, TYMS]
+        note: 是**状态**不是类型 —— 增殖的 T 细胞会同时拿 T_cell 高分
