@@ -179,30 +179,118 @@ analysis." *Bioinformatics* 2023. doi:10.1093/bioinformatics/btad547
 
 ## 6. 轨迹推断
 
-### PAGA
+### 为什么必须至少两种方法
+
+单一方法的拟时序是一个**一维坐标**，把高维状态压成一条线；不同算法
+压出来的线可以完全不同。实测（PBMC3k，2652 细胞）四种方法的**原始**
+拟时序两两 Spearman 相关：
+
+| | dpt | palantir | scFates | CytoTRACE |
+|---|---|---|---|---|
+| dpt | 1.000 | **−0.389** | **+0.855** | +0.250 |
+| palantir | −0.389 | 1.000 | **−0.500** | **−0.467** |
+| scFates | +0.855 | −0.500 | 1.000 | +0.534 |
+| CytoTRACE | +0.250 | −0.467 | +0.534 | 1.000 |
+
+**符号都不一样。** 不做交叉验证就报"轨迹"，报的是某个算法的一次输出，
+不是数据里的结构。
+
+### 四种方法
+
+| 方法 | 实现 | 原始约定 |
+|---|---|---|
+| DPT | scanpy `tl.diffmap` + `tl.dpt` | 0 = 根 = 早 |
+| Palantir | `palantir.core.run_palantir`（扩散图 + Markov 链） | 0 = 起始细胞 = 早 |
+| scFates | `scFates.tl.tree/pseudotime`（主曲线树，Slingshot 的 Python 移植） | 0 = 根 = 早 |
+| CytoTRACE | **本仓库自行实现**的 GCS 统计量 | 1 = 分化潜能高 = 早 |
 
 Wolf FA, Hamey FK, Plass M, et al. "PAGA: graph abstraction reconciles
 clustering with trajectory inference through a topology preserving map of
 single cells." *Genome Biology* 2019. doi:10.1186/s13059-019-1663-x
 
-### 扩散拟时序（DPT）
-
 Haghverdi L, Büttner M, Wolf FA, Buettner F, Theis FJ. "Diffusion
 pseudotime robustly reconstructs lineage branching."
 *Nature Methods* 2016. doi:10.1038/nmeth.3971
 
+Setty M, Kiseliovas V, Levine J, et al. "Characterization of cell fate
+probabilities in single-cell data with Palantir."
+*Nature Biotechnology* 2019. doi:10.1038/s41587-019-0068-4
+
+Street K, Risso D, Fletcher RB, et al. "Slingshot: cell lineage and
+pseudotime inference for single-cell transcriptomics."
+*BMC Genomics* 2018. doi:10.1186/s12864-018-4772-0
+（Python 端用 scFates 实现，Faure L, Soldatov R, Kharchenko PV,
+Adameyko I. *Bioinformatics* 2023. doi:10.1093/bioinformatics/btac746）
+
+Gulati GS, Sikandar SS, Wesche DJ, et al. "Single-cell transcriptional
+diversity is a hallmark of developmental potential."
+*Science* 2020. doi:10.1126/science.aax0249
+（CytoTRACE 原论文。**本仓库实现的是它的核心 GCS 统计量，不是该包** ——
+CytoTRACE2 不在 PyPI 上）
+
+### 方向校正：拟时序的符号是任意的
+
+DPT 从根出发，根选在早期还是晚期，整条轴就反过来。所以本流水线：
+
+1. 每个方法各自算出拟时序（原始符号，不假设谁对）
+2. 用一个**方向参考**判断每个方法是否需要翻转
+3. 统一约定成「**值越大越晚**」后再互相比较
+
+方向参考优先级：配置的 `trajectory.early_markers` / `late_markers`
+（生物学判据）→ 退回 CytoTRACE 分化潜能分（**记进 `direction_source`**）。
+
+**方向参考不能算进一致性统计。** 退回模式下参考就是 CytoTRACE 本身，
+它与参考的相关恒为 ±1 —— 那是定义不是证据。第一版把它算进去了，
+一致性被抬到 0.587；排除后是 **0.636**（DPT/Palantir/scFates 三方），
+这才是真实的一致性。
+
+### 选根：从 PAGA 连通度改成 CytoTRACE
+
+原来的自动选根是"PAGA 连通度最高的簇"。在 PBMC3k 上它挑中了**浆细胞**
+（终末分化）当根 —— 连通度高只说明"在图上居中"，而居中既可能是
+祖细胞也可能是终末态。
+
+改用 CytoTRACE GCS 最高的细胞作根后，DPT 与 GCS 的相关从 **+0.25
+升到 +0.59**。
+
+**但这仍然是统计判据，不是生物学判据。** 要下方向性结论仍需人工用
+已知的早期/晚期 marker 复核。
+
+### 沿轨迹的基因与模块
+
+- `trajectory_genes.csv`：与共识拟时序的 Spearman 相关（表达基因全集）
+- `trajectory_modules.csv`：按拟时序分箱 → 每个基因的平滑表达曲线 →
+  行 z-score → k-means 聚成 6 个模块。**行 z-score 是为了让模块反映
+  "形状"而不是"表达量"**，否则高表达基因会主导聚类
+- 分支点：scFates 的 `seg` 片段 + 每片段的拟时序中位数
+
+### scFates 的两个坑（实测）
+
+1. **`tl.pseudotime()` 之前必须先 `tl.cleanup()`。** 官方顺序是
+   `diffusion → tree → cleanup → root → pseudotime`。漏掉 cleanup 时
+   `pseudotime()` 必定崩在
+   `pd.Series(uns['graph']['milestones']) == t][0]` 的 IndexError ——
+   因为 `map_cells` 读 milestones 时它还没被写入（写入在
+   `pseudotime.py` 第 254 行，而调用在第 87 行）。
+2. **`tl.test_association` / `tl.test_fork` 需要 rpy2 + R + mgcv。**
+   这与"云端不装 R"的设计冲突，所以**没有用**这两个函数 ——
+   沿轨迹的基因分析是本仓库自己实现的。
+   另外 `method='epg'` 与当前 networkx 不兼容
+   （`add_edges_from` 收到 int 就 TypeError），所以用 `method='ppt'`。
+
 ### 适用范围（关键）
 
 - PAGA 给出的是**簇间连通性**，不是分化方向
-- DPT 的方向**完全依赖根的选择**。根选错则整条轨迹反向。
-  本流水线的自动选根是"连通度最高"，那是**启发式**：
-  连通度高只说明它在图上居中，而居中既可能是祖细胞，也可能是
-  被各种中间态包围的终末态
 - 拟时序是**一维坐标**，分支过程（一个祖先进两种细胞）会被压成
   "先后"，而实际是"并列"
 - **没有 RNA 速率（spliced/unspliced）时不能下方向性结论。**
-  本流水线只有计数矩阵，所以报的是相似度排序，不是分化方向。
-  要方向性需要 `scvelo`（需 spliced/unspliced 定量）或 `CellRank`
+  本流水线只有计数矩阵，`scvelo` 记 `not_done`。要速率需要从
+  Cell Ranger 的 `velocyto` 或 `--include-intrins` 输出重新开始
+- **方法间一致性只是内部一致性。** 几种方法都错向同一个伪轨迹时，
+  它们依然彼此高度相关。**一致不等于正确**
+- `regulon × 拟时序` 的显著性在 n 大时很廉价：本数据 n=2652，
+  |rho| 只要约 0.06 就能过 BH<0.05（201 个里 190 个"显著"）。
+  要看效应量分布（本数据 |rho| 中位 0.316，48 个 >0.5）
 
 ---
 

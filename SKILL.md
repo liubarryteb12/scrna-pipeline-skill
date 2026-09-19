@@ -1,6 +1,6 @@
 ---
 name: scrna-pipeline-skill
-description: Run an end-to-end single-cell RNA-seq analysis pipeline (QC, doublet detection, normalization, HVG, PCA, batch integration, Leiden clustering, cell-type annotation, marker genes, pseudobulk DESeq2 differential expression, PAGA/DPT trajectory, ligand-receptor communication, TF regulon activity) and ship it as a GitHub Actions workflow that uploads results as an artifact. Use when the user asks for single-cell analysis, scRNA-seq, 10x Genomics processing, scanpy clustering, cell type annotation, pseudobulk DE, trajectory inference, cell-cell communication, or a reproducible cloud-run single-cell workflow.
+description: Run an end-to-end single-cell RNA-seq analysis pipeline (QC, doublet detection, normalization, HVG, PCA, batch integration, Leiden clustering, cell-type annotation, marker genes, pseudobulk DESeq2 differential expression, cross-validated trajectory inference with DPT/Palantir/scFates/CytoTRACE plus direction correction and gene modules, ligand-receptor communication, TF regulon activity projected onto pseudotime) and ship it as a GitHub Actions workflow that uploads results as an artifact. Use when the user asks for single-cell analysis, scRNA-seq, 10x Genomics processing, scanpy clustering, cell type annotation, pseudobulk DE, trajectory inference, pseudotime, Monocle/Slingshot/Palantir/CytoTRACE alternatives in Python, RNA velocity questions, cell-cell communication, regulon or SCENIC-style analysis, or a reproducible cloud-run single-cell workflow.
 ---
 
 # 单细胞转录组流水线

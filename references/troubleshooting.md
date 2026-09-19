@@ -147,16 +147,61 @@ matplotlib 3.9 把 `labels` 改名为 `tick_labels`，3.11 起旧名字直接报
 
 ### 拟时序的根看起来不对
 
-自动选根是"PAGA 连通度最高"，那是**启发式**：连通度高只说明它在图上
-居中，而居中既可能是祖细胞，也可能是终末态。
+现在的自动选根是"CytoTRACE GCS 最高的细胞"，仍**是统计判据不是生物学
+判据**。（旧版用"PAGA 连通度最高"，在 PBMC3k 上挑中了浆细胞 —— 终末
+分化 —— 当根；连通度高只说明它在图上居中，而居中既可能是祖细胞，
+也可能是终末态。改用 GCS 后 DPT 与 GCS 的相关从 +0.25 升到 +0.59。）
 
 修法：在 config 里设 `trajectory.root_cluster` 指定根。
 `trajectory_status.json` 的 `root_selection` 会记录根是怎么来的。
 
+### 各方法的拟时序符号对不上
+
+**这是正常现象，不是 bug。** 实测四种方法的原始拟时序两两相关从
+−0.50 到 +0.86 —— 符号都不一样。拟时序的符号是任意的：DPT 从根出发，
+根选早或选晚，整条轴就反过来。
+
+本流水线按「值越大越晚」统一方向后才比较。`trajectory_direction.csv`
+记录每个方法是否被翻转。**未配置 marker 时退回 CytoTRACE 作方向参考，
+产物里 `direction_source` 会写明**。
+
+要生物学方向，在 config 里填 `trajectory.early_markers` / `late_markers`。
+
+### `scFates` 的 `pseudotime()` 崩在 `IndexError: index 0 is out of bounds`
+
+`pd.Series(adata.uns["graph"]["milestones"]) == t][0]` 报 IndexError。
+
+**原因：漏了 `tl.cleanup()`。** 官方顺序是
+`pp.diffusion → tl.tree → tl.cleanup → tl.root → tl.pseudotime`。
+不 cleanup 时 `map_cells` 要读 `graph['milestones']`，而它直到
+`pseudotime.py` 第 254 行才被写入 —— 调用在第 87 行，顺序矛盾。
+
+### `scFates` 报 `rpy2 installation is necessary`
+
+`tl.test_association` / `tl.test_fork` 需要 rpy2 + R + mgcv。
+这与"云端不装 R"的设计冲突，所以**本流水线不用这两个函数** ——
+沿轨迹的基因分析是自己实现的（`trajectory_genes.csv` /
+`trajectory_modules.csv`）。
+
+### `scFates` 的 `method='epg'` 报 `TypeError: object of type 'int' has no len()`
+
+`elpigraph.utils.getPseudotime` → `networkx.add_edges_from`。
+这是 elpigraph 与当前 networkx 的版本不兼容。用默认的
+`method='ppt'`（本流水线的选择）。
+
 ### 轨迹报"没有方向性"
 
 **这是正确行为。** 没有 RNA 速率（spliced/unspliced）时拟时序只能说
-相似度排序，不能说分化方向。要方向性需要 `scvelo` 或 `CellRank`。
+相似度排序，不能说分化方向。`trajectory_status.json` 的 `scvelo`
+字段记 `not_done` 并说明原因。要速率需要从 Cell Ranger 的 `velocyto`
+或 `--include-introns` 输出重新开始。
+
+### `regulon×拟时序` 里几乎全部"显著"
+
+n 大时正常。本数据 n=2652，|rho| 只要约 0.06 就能过 BH<0.05，
+201 个里 190 个"显著"。**看效应量不看显著个数** ——
+`tf_activity_vs_pseudotime.csv` 有 rho，产物里也写了效应量分布
+（本数据 |rho| 中位 0.316，48 个 >0.5）。
 
 ---
 
