@@ -179,6 +179,125 @@ def run_07_grn(cfg: dict) -> dict:
         index=[f"cluster_{c}" for c in clusters])
     act_mat.to_csv(res_dir / "tf_activity_by_cluster.csv")
 
+    # ---- 2b. regulon 活性 × 拟时序 ------------------------------------------
+    #
+    # 把调控子活性投到 step 05 的共识拟时序上，找"沿轨迹动态变化"的调控子。
+    # 这一步依赖 05 的产物，所以放在 07（顺序：05 在 07 之前）。
+    #
+    # **p 值必须校正。** 200 多个调控子同时检验，不做 BH 的话按 alpha=0.05
+    # 会有 10 个左右纯靠运气"显著"。
+    pt_df = None
+    pt_path = res_dir / "pseudotime_per_cell.csv"
+    if pt_path.exists():
+        try:
+            pt_df = pd.read_csv(pt_path)
+        except Exception as e:  # noqa: BLE001
+            log_warn(f"读取 {pt_path.name} 失败: {type(e).__name__}: {e}")
+
+    traj_rows, traj_status = [], {"status": "not_available",
+                                  "reason": f"{pt_path.name} 不存在（step 05 未产出）"}
+    if pt_df is not None and "consensus_pseudotime" in pt_df.columns:
+        try:
+            from scipy.stats import spearmanr
+
+            pt = pt_df["consensus_pseudotime"].astype(float).values
+            # 细胞顺序必须与 activities 对齐：两者都来自同一个 clustered.h5ad，
+            # 但保险起见按 cell 名重排，而不是假设顺序一致。
+            if "cell" in pt_df.columns and len(pt_df) == adata.n_obs:
+                idx = pd.Index(pt_df["cell"].astype(str)).get_indexer(
+                    adata.obs_names.astype(str))
+                if (idx >= 0).all():
+                    pt = pt[idx]
+                else:
+                    log_warn(f"pseudotime_per_cell.csv 有 {(idx < 0).sum()} 个细胞"
+                             "在 adata 里找不到，按原顺序使用（**可能错位**）")
+            if len(pt) != adata.n_obs:
+                raise ValueError(f"拟时序长度 {len(pt)} != 细胞数 {adata.n_obs}")
+
+            for tf in activities:
+                r, p = spearmanr(activities[tf], pt)
+                if not np.isfinite(r):
+                    continue
+                traj_rows.append({"tf": tf,
+                                  "rho_with_pseudotime": round(float(r), 4),
+                                  "p_value": float(p),
+                                  "direction": "increases" if r > 0 else "decreases"})
+            if traj_rows:
+                tdf = pd.DataFrame(traj_rows)
+                # Benjamini-Hochberg
+                p = tdf["p_value"].values
+                order = np.argsort(p)
+                n = len(p)
+                q = np.empty(n)
+                prev = 1.0
+                for rank, i in enumerate(order[::-1]):
+                    k = n - rank
+                    val = min(prev, p[i] * n / k)
+                    q[i] = val
+                    prev = val
+                tdf["q_value_BH"] = q
+                tdf = tdf.sort_values("q_value_BH")
+                tdf.to_csv(res_dir / "tf_activity_vs_pseudotime.csv", index=False)
+
+                n_sig = int((tdf["q_value_BH"] < 0.05).sum())
+                traj_status = {
+                    "status": "ok",
+                    "n_regulons_tested": int(len(tdf)),
+                    "n_significant_BH05": n_sig,
+                    "top": df_to_records(tdf.head(15)),
+                    "method": "调控子活性（AUCell 式）vs 共识拟时序的 Spearman 相关，BH 校正",
+                    "limitations": [
+                        "相关不等于沿轨迹的因果驱动；调控子活性本身是共表达推断的产物",
+                        "拟时序方向若整体反掉，这里的 rho 符号会全部反过来"
+                        "（见 trajectory_status.json 的 direction_source）",
+                        "拟时序是一维坐标，分支上的反向变化会被压掉",
+                        # **这条必须写：n 大时显著性很廉价。**
+                        f"**{n_sig}/{len(tdf)} 个调控子 BH<0.05，但这个数字本身信息量很低** ——"
+                        f"细胞数 n={adata.n_obs}，|rho| 只要约 0.06 就能过 BH<0.05。"
+                        "要看的是效应量：本数据 |rho| 中位数 "
+                        f"{np.median(np.abs(tdf['rho_with_pseudotime'].values)):.3f}，"
+                        f"|rho|>0.3 的 {int((tdf['rho_with_pseudotime'].abs() > 0.3).sum())} 个，"
+                        f">0.5 的 {int((tdf['rho_with_pseudotime'].abs() > 0.5).sum())} 个。"
+                        "**报显著个数而不报效应量分布，等于把弱关联说成发现**",
+                    ],
+                }
+                log_info(f"regulon×拟时序：{len(tdf)} 个调控子，"
+                         f"BH<0.05 的 {n_sig} 个")
+
+                # 图：前 20 个显著调控子的活性沿拟时序分箱
+                show = tdf.head(20)["tf"].tolist()
+                if show:
+                    nb = 20
+                    bins = pd.qcut(pt, nb, labels=False, duplicates="drop")
+                    nb = int(np.nanmax(bins)) + 1
+                    mat = np.zeros((len(show), nb), dtype=float)
+                    for i, tf in enumerate(show):
+                        v = activities[tf]
+                        for b in range(nb):
+                            m = bins == b
+                            mat[i, b] = float(np.mean(v[m])) if m.sum() else np.nan
+                    mu = np.nanmean(mat, axis=1, keepdims=True)
+                    sd = np.nanstd(mat, axis=1, keepdims=True)
+                    sd[sd == 0] = 1.0
+                    matz = np.nan_to_num((mat - mu) / sd)
+
+                    fig, ax = plt.subplots(figsize=(7.2, max(4.0, 0.26 * len(show) + 1.6)))
+                    im = ax.imshow(matz, aspect="auto", cmap="RdBu_r", vmin=-2, vmax=2)
+                    ax.set_yticks(range(len(show)))
+                    ax.set_yticklabels(show, fontsize=7)
+                    ax.set_xticks(range(nb))
+                    ax.set_xticklabels([str(b) for b in range(nb)], fontsize=7)
+                    ax.set_xlabel("consensus pseudotime bin (higher = later)")
+                    ax.set_title("Regulon activity along pseudotime (z-scored)", fontsize=10)
+                    fig.colorbar(im, ax=ax, label="z-scored activity")
+                    save_fig(cfg, "tf_activity_vs_pseudotime", fig)
+        except Exception as e:  # noqa: BLE001
+            traj_status = {"status": "failed",
+                           "reason": f"{type(e).__name__}: {e}"}
+            log_warn(f"regulon×拟时序失败: {traj_status['reason']}")
+    else:
+        log_info(f"regulon×拟时序：{traj_status['reason']}")
+
     # ---- 3. 出图 ------------------------------------------------------------
     top_tfs = reg.head(int(grn.get("top_tfs", 10)) * 2)["tf"].tolist()
     if top_tfs:
@@ -216,6 +335,7 @@ def run_07_grn(cfg: dict) -> dict:
         "n_targets_per_regulon": N_TARGETS,
         "n_genes_used_for_inference": len(cand),
         "top_regulons": df_to_records(reg.head(15)),
+        "regulon_vs_pseudotime": traj_status,
         "method": ("共表达推断（Pearson 相关取 top 靶基因）+ AUCell 式调控子活性打分。"
                    "**不是 SCENIC**"),
         "limitations": [

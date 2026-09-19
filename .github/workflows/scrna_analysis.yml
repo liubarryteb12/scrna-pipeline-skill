@@ -87,7 +87,8 @@ jobs:
         run: |
           python -c "
           import importlib
-          for m in ['scanpy','anndata','pydeseq2','harmonypy','skmisc','skimage','leidenalg']:
+          for m in ['scanpy','anndata','pydeseq2','harmonypy','skmisc','skimage',
+                    'leidenalg','palantir','scFates']:
               try:
                   importlib.import_module(m); print('  OK  ', m)
               except Exception as e:

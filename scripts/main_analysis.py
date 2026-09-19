@@ -163,6 +163,60 @@ def run_all(cfg: dict, only: list = None) -> int:
         checks.append({"item": f"可选步骤状态 {sid} = {st}", "ok": True,
                        "required": False, "detail": str(note)[:150]})
 
+    # ---- 内容级检查：状态文件在 ≠ 结果是对的 --------------------------------
+    #
+    # Part 1 的教训：TF 第一次跑时 tf_status.json 正常产出、验收全绿，
+    # 而 figure_written 其实是 false（图一张没出），同时 121 个样本因列名
+    # 写错全部匹配失败、组间比较静默为空。
+    #
+    # 所以这里**读 status 里的真实字段**，而不是只看文件在不在。
+    tj = read_json(res_dir / "trajectory_status.json") or {}
+    if tj.get("status") == "ok":
+        n_m = int(tj.get("n_methods") or 0)
+        checks.append({
+            "item": "轨迹用了 >=2 种方法交叉验证",
+            "ok": n_m >= 2, "required": True,
+            "detail": (f"{n_m} 种：{','.join(tj.get('methods_ok', {}).keys())}"
+                       if n_m >= 2 else
+                       f"**只有 {n_m} 种** —— 单一方法的拟时序是某个算法的一次"
+                       f"输出，不是数据里的结构"),
+        })
+        cv = tj.get("cross_validated_methods") or []
+        mean_rho = tj.get("method_correlation_mean_offdiag")
+        checks.append({
+            "item": "轨迹方法间一致性已量化（且排除方向参考）",
+            "ok": bool(cv) and mean_rho is not None,
+            "required": True,
+            "detail": (f"交叉验证 {len(cv)} 种，平均 rho={mean_rho:+.4f}，"
+                       f"参考方法 {tj.get('direction_reference_method')}"
+                       if bool(cv) and mean_rho is not None else
+                       "**缺 cross_validated_methods 或一致性数值**"),
+        })
+        checks.append({
+            "item": "轨迹方向来源已写明",
+            "ok": bool(tj.get("direction_source")),
+            "required": True,
+            "detail": str(tj.get("direction_source") or "**缺失**"),
+        })
+        checks.append({
+            "item": "scVelo 的不可得已如实记录",
+            "ok": bool((tj.get("scvelo") or {}).get("status")),
+            "required": False,
+            "detail": str((tj.get("scvelo") or {}).get("status", "**缺失**")),
+        })
+        checks.append({
+            "item": "轨迹方法学限定已写明（>=4 条）",
+            "ok": len(tj.get("limitations") or []) >= 4,
+            "required": True,
+            "detail": f"{len(tj.get('limitations') or [])} 条",
+        })
+        for fn, desc in (("trajectory_method_correlation", "方法一致性矩阵"),
+                         ("trajectory_modules", "沿轨迹基因模块")):
+            ok = has_file(fig_dir / f"{fn}.png")
+            checks.append({"item": f"图 {desc} ({fn}.png)", "ok": ok,
+                           "required": True,
+                           "detail": "存在" if ok else "**缺失**"})
+
     n_fail = 0
     for c in checks:
         mark = "PASS" if c["ok"] else "FAIL"

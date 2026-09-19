@@ -40,3 +40,21 @@ scikit-misc>=0.3
 pydeseq2>=0.4
 # 批次整合（多供本数据需要）
 harmonypy>=0.0.10
+
+# ---- 轨迹推断（step 05 的交叉验证方法）--------------------------------------
+# **至少两种方法才叫交叉验证。** 实测（PBMC3k）三种方法的原始拟时序两两
+# Spearman 相关从 -0.47 到 +0.25 —— 符号都不一样。只有一种方法时，
+# 报出来的"轨迹"是某个算法的一次输出，不是数据里的结构。
+#
+# palantir: 扩散图 + Markov 链，给出拟时序与命运概率。
+#   依赖全都有 wheel（scanpy/mellon/anndata/ml_dtypes/igraph/...），
+#   无编译、无 GPU。会连带装 jax —— 大但稳。
+palantir>=1.4,<2
+# scFates: Slingshot 的 Python 移植（主曲线树）。
+#   注意 `tl.pseudotime()` 之前**必须**先 `tl.cleanup()`，否则必崩在
+#   `pd.Series(uns['graph']['milestones']) == t][0]` 的 IndexError。
+#   另：`tl.test_association` / `tl.test_fork` 需要 rpy2 + R + mgcv，
+#   与"云端不装 R"的设计冲突，所以**没有用**这两个函数 ——
+#   沿轨迹的基因分析是本仓库自己实现的（见 05_trajectory.py）。
+scFates>=1.2,<2
+
