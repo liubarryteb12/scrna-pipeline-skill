@@ -112,3 +112,65 @@ artifact 路径形如 `data/<dataset_id>/raw.h5ad`，脚本里是
 
 不要凭猜测改代码。Part 1 有过一次把浮点末位分叉错误归因、白跑一轮的教训。
 先读日志，再改，一次只改日志支持的那一处。
+
+## 13. 图幅按毫米，宽度夹在标准栏宽内
+
+参考规范：K-Dense `scientific-visualization` skill（样式文件已 vendored 到
+`assets/publication.mplstyle`）。
+
+**期刊栏宽是按毫米规定的**，英寸是排版软件内部单位。写英寸时"这图多宽"
+要靠换算才知道，写毫米时一眼能对上投稿要求。
+
+| 常量 | 值 | 用途 |
+|---|---|---|
+| `W_SINGLE` | 89 mm | 单栏 |
+| `W_ONE_HALF` | 136 mm | 一栏半 |
+| `W_DOUBLE` | 183 mm | 双栏（通栏）|
+
+- **宽度随类别数增长的图必须夹住**：`min(W_DOUBLE, max(W_ONE_HALF, ...))`。
+  无上限增长会画出装不进任何期刊一页的图 —— 实测修之前最宽的
+  `domain_markers_dotplot` 是 370 mm。
+- `save_fig()` 默认**不再用 tight bbox**。`bbox_inches="tight"` 会**改变物理
+  输出尺寸**，让上面的毫米约定失效。溢出改由 `_content_overflow()` 检测并告警。
+- **`set_seed()` 末尾会 `apply_style()`** —— rcParams 在**图创建时**就被读取，
+  在 `save_fig()` 里设样式已经太晚。
+- 图上文字一律英文：matplotlib 自带的 DejaVu Sans 没有中文字形。
+
+**两处与参考规范的偏差**（已写在 `.mplstyle` 文件头）：
+
+1. `figure.constrained_layout.use: True` 全局开启。参考规范要求逐图 opt-in，
+   但本仓库有 20+ 张图、8 个脚本，逐处改容易漏。
+2. `font.sans-serif: DejaVu Sans, Arial, Helvetica`。参考规范首选 Arial，
+   但 Ubuntu CI 上没有 Arial 而 Windows 上有 —— 会导致 CI 与本地渲染出
+   **不同的字形**，破坏可复现性。DejaVu Sans 随 matplotlib 分发，处处一致。
+
+**constrained layout 不会自动折行长标题。** 实测 `domains_on_he` 的单行
+suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下文件照样
+生成、`check_figures.mjs` 也照样报"有墨"）。长标题必须自己换行。
+
+## 14. 可选步骤崩溃必须让验收变红
+
+`main_analysis.py` 里可选步骤的 `failed` **不等于**"正确地跳过"。
+`not_configured` / `not_applicable` / `disabled` / `not_run` 是设计如此；
+`failed` 是崩了。
+
+第一版把 `failed` 也归进 `ok=True`，后果是实测 `07_grn` 因漏 import 崩溃
+而验收 40 项全绿 —— 而 `grn_status.json` 是**上一轮的**旧文件。
+
+两条一起改才有效：
+
+1. `failed` 记为不通过（可见但不阻断 job，因为步骤本身是可选的）
+2. **每步开跑前先删掉自己的状态文件** —— 否则崩溃时旧文件冒充本轮结果
+
+## 15. 静态检查要挡住"未定义名字"
+
+`py_compile` **只做编译，看不出未定义名字**。漏 import 一个 `W_SINGLE`
+时它照样报"语法通过"，要等运行时才炸 —— 实测因此白跑一整轮流水线。
+
+`tools/check_py_syntax.mjs` 现在会检查：用到的 `W_SINGLE` / `W_ONE_HALF` /
+`W_DOUBLE` / `mm` / `PAL` / `PAL_CYCLE` / `apply_style` 是否都 import 了。
+
+名单是**写死的**，不是"common 导出的所有名字"。后者会把函数参数名当成用法
+（`def verify_alignment(adata, log_info=None)` 的 `log_info`），要正确处理
+得做作用域分析 —— 那是重写一个 linter。同时会剥掉注释和字符串再扫，
+避免"名字只出现在注释里"的误报。
