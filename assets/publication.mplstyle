@@ -49,9 +49,19 @@ axes.edgecolor: black
 axes.labelcolor: black
 axes.axisbelow: True
 axes.grid: False
-# Okabe-Ito 里对白底达到 3:1 对比度的五个色（Wong, Nat Methods 8:441, 2011）。
+# 分类循环色 —— **必须与 scripts/lib/common.py 的 `PAL_CYCLE` 逐色相同**，
+# `tools/check_palette.mjs` 会拦不一致。两处各定义了一份，是因为
+# matplotlib 读样式文件、而脚本里也可能直接用 PAL_CYCLE；
+# `apply_style()` 会把 common.py 那份写进 rcParams，所以**那边才是实际生效的**，
+# 这份必须跟着改，否则它变成一句谎话。
+#
+# 前 5 个是 Okabe-Ito 里对白底达到 3:1 对比度的五个（Wong, Nat Methods 8:441, 2011）。
+# **原来只有这 5 个，而实测 resolution=1.0 给 10 个簇** —— 于是 0≡5 / 1≡6 / …，
+# 图上簇 5 与簇 0 是相邻的两个同色团块，完全看不出分界。
+# 后 5 个是按 OKLCh 色相补的（已有色相 244.0/47.5/165.5/346.3/无彩色，
+# 补色落空档），两两色相 >=15°、色盲 Δ>=0.05、对比度 >=2.0。
 # **颜色不能是唯一线索** —— 分类图仍要加 marker / 线型 / 直接标注。
-axes.prop_cycle: cycler('color', ['0072B2', 'D55E00', '009E73', 'CC79A7', '000000'])
+axes.prop_cycle: cycler('color', ['0072B2', 'D55E00', '009E73', 'CC79A7', '000000', 'E69F00', '17BECF', 'A50F15', '5B4FCF', 'A8A8A8'])
 
 # ---- 刻度 ----
 xtick.major.size: 3

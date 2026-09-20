@@ -187,6 +187,16 @@ jobs:
       - name: 检查图分辨率达到 300 dpi
         run: node tools/check_fig_dpi.mjs results/pbmc3k/figures
 
+      # 调色板：分类循环色够不够、两两分不分得开。
+      # **上三步都看不出这个**：10 个簇配 5 个颜色时，图照样"有墨"、
+      # 照样在 183 mm 以内、照样 300 dpi —— 只是 0≡5 / 1≡6 / …，
+      # 图上簇 5 与簇 0 是**上下相邻的两个同色团块**，读者看不出分界。
+      # 判据是算出来的，不是看出来的：两两 OKLCh 色相 >=15°、
+      # 三种色盲下 OKLab 距离 >=0.05、白底对比度 >=2.0，
+      # 外加 PAL_CYCLE 与 publication.mplstyle 的 axes.prop_cycle 必须逐色相同。
+      - name: 检查调色板
+        run: node tools/check_palette.mjs
+
       - name: 汇总产物
         if: always()
         run: |

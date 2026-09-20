@@ -610,11 +610,18 @@ def manifest_summary(cfg: dict) -> dict:
 # **颜色不能是唯一线索。** Okabe-Ito 只是把颜色本身做成色盲友好；
 # 分类图上仍要加 marker / 线型 / 直接标注，否则灰度打印就全糊了。
 PAL = {
-    # Okabe-Ito（Wong, Nature Methods 8:441, 2011）八个标准色
+    # Okabe-Ito（Wong, Nature Methods 8:441, 2011）里**能做实心标记的**几个。
+    #
+    # **原来的八个标准色里有两个用不了**，理由是实测的，不是偏好：
+    #   * `yellow` #F0E442 —— 白底对比度只有 **1.32:1**，实心圆点在白底上
+    #     几乎看不见（`tools/check_palette.mjs` 会拦下来）；
+    #   * `sky_blue` #56B4E9 —— 与 `blue` 色相只差约 5°，远小于 15° 判据，
+    #     同一张图上会被读成同一个颜色。
+    #
+    # 所以这两个**从 PAL 里删掉了**：留着等于暗示"可以用"，
+    # 而下一个想用它们的人只会得到一张看不清的图。理由记在这里。
     "orange": "#E69F00",
-    "sky_blue": "#56B4E9",
     "green": "#009E73",
-    "yellow": "#F0E442",
     "blue": "#0072B2",
     "vermillion": "#D55E00",
     "purple": "#CC79A7",
@@ -623,10 +630,54 @@ PAL = {
     "primary": "#0072B2",     # 主序列（原 #2C7FB8）
     "highlight": "#D55E00",   # 阈值线 / 强调（原 #B2182B）
     "muted": "#999999",       # 次要参照（如随机基线）
+    # 循环色扩到 10 色时补的（挑法见 PAL_CYCLE 的说明）
+    "cyan": "#17BECF",
+    "maroon": "#A50F15",
+    "indigo": "#5B4FCF",
+    "grey": "#A8A8A8",
 }
-# 对白底达到 3:1 对比度的五个，用作分类循环色
+# **分类循环色必须 >= 类别数，否则会撞色 —— 而撞色不报错。**
+#
+# 原来只有 5 色，而实测 `resolution=1.0` 给 **10 个簇**，于是
+# 0≡5 / 1≡6 / 2≡7 / 3≡8 / 4≡9：图上簇 5 与簇 0 是**上下相邻的两个同色团块**，
+# 读者看不出分界在哪；`trajectory_modules` 的 M0 与 M5 同理。
+#
+# 前 5 个**保持原样**（blue / vermillion / green / purple / black）——
+# 这样 <=5 个类别的图（占多数）外观不变，改动的影响面最小。
+#
+# 后 5 个是**按 `tools/check_palette.mjs` 的三条判据挑出来的，不是凭眼睛选的**：
+# 两两色相 >=15°、三种色盲（protanopia / deuteranopia / tritanopia）下
+# OKLab 距离 >=0.05、白底对比度 >=2.0。
+#
+# 挑的过程值得记下来，因为**它证明了色空间是饱和的**：试了 13 个候选色，
+# 12 个都被拦下，而且每个只差一项 ——
+#
+# | 候选 | 被什么拦下 |
+# |---|---|
+# | `#3D3D00` 暗橄榄 | protanopia 下与 maroon 撞（Δ=0.018）|
+# | `#7F7F7F` 中灰 | deuteranopia 下与 green 撞（Δ=0.033）|
+# | `#1F5C3A` 暗绿 | 色相与 green 只差 9.9° |
+# | `#4A2A00` 暗棕 | 色相与 orange 只差 10.1° |
+# | `#008080` 青绿 | tritanopia 下与 blue 撞，且色相与 cyan 只差 11.7° |
+# | `#9467BD` 紫罗兰 | protanopia 下与 blue 撞（Δ=0.019）|
+# | `#8C564B` 棕 | 色相与 maroon 只差 5.2° |
+# | `#D3D3D3` 浅灰 | 对比度 1.50:1 |
+# | `#B4B4B4` / `#B0B0B0` / `#ADADAD` | protanopia 下与 cyan 撞 |
+# | `#A0A0A0` | deuteranopia 下与 purple 撞 |
+#
+# **规律：红绿色盲把 20°–110° 的暖色区压成一条轴，只剩亮度能区分。**
+# 暖色区已有三个亮度级（maroon 0.460 / vermillion 0.621 / orange 0.753），
+# 第 4 个暖色无论放哪个亮度都会撞上其中之一。
+# 所以最后补的是**无彩色**（grey）：它不受色相判据约束，
+# 且亮度 0.72 与所有彩色都拉得开。**grey 排最后** ——
+# 它最不显眼，让它承担第 10 个簇而不是第 8 个。
+#
+# **10 色不是"够用"，是这三条判据下的上限。** 类别再多就要靠
+# marker / 直接标注（这张 `umap_clusters` 已经在质心标了簇号）——
+# 见上面那句"颜色不能是唯一线索"。
 PAL_CYCLE = [PAL["blue"], PAL["vermillion"], PAL["green"], PAL["purple"],
-             PAL["black"]]
+             PAL["black"], PAL["orange"], PAL["cyan"], PAL["maroon"],
+             PAL["indigo"], PAL["grey"]]
 
 _STYLE_APPLIED = False
 
