@@ -64,8 +64,8 @@ from scipy import sparse  # noqa: E402
 from scipy.stats import spearmanr  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed,
-                    write_json, W_ONE_HALF, W_SINGLE, mm,)
+                    log_warn, parse_args, record_cross_language, record_step,
+                    save_fig, set_seed, write_json, W_ONE_HALF, W_SINGLE, mm,)
 
 # 候选基因没有外部靶基因表时，用调控子按簇特异性排序取前 N 个
 DEFAULT_TOP_N = 20
@@ -136,6 +136,32 @@ def load_targets(cfg: dict, reg: pd.DataFrame) -> tuple:
                 out = out.dropna(subset=["gene"]).drop_duplicates("gene")
                 log_info(f"候选靶基因来自 Part 1 交接表 {p.name}：{len(out)} 个"
                          + (f"，含 logFC（{fcol}）" if fcol else "，**无 logFC 列**"))
+                # §0.2 跨语言转换记录。**这是本仓库唯一一处真正的跨语言交接** ——
+                # 上游是 R（Part 1 的 `09_export_targets.R`），下游是 Python。
+                #
+                # 记的是"丢了什么"，不是"传了什么"：`gene` 留下，
+                # 其余列**全部**进 `lost_fields`。Part 1 那边同一件事也记了一条
+                # （`record_cross_language` 的 before/after 从 R 侧视角写），
+                # 两条合起来才能核对"两边说的是不是同一批字段"。
+                _lost = [c for c in df.columns if c != gcol]
+                if fcol is None:
+                    _lost.append("logFC 列（上游有，但列名不在这批别名里 → "
+                                 "signature_alignment 会是 NaN）")
+                record_cross_language(
+                    cfg,
+                    src=f"Part 1 (R) {p.name}", dst="08_virtual_perturbation 候选表",
+                    fmt="csv",
+                    before={"n_rows": int(len(df)), "n_cols": int(df.shape[1]),
+                            "columns": [str(c) for c in df.columns]},
+                    after={"n_genes": int(len(out)),
+                           "n_with_logfc": int(out["logfc"].notna().sum()),
+                           "kept_columns": ["gene", "logfc"]},
+                    lost=_lost,
+                    note=("**只走 CSV，不做对象级转换**（§0.2 禁止 sceasy，"
+                          "本仓库也不用 zellkonverter / anndata2ri）。"
+                          "`logfc` 是**唯一**跨部分传过来的数值列；"
+                          "Part 1 的模块归属、来源计数等没有交接，"
+                          "所以这边无法按来源分层看扰动结果。"))
                 return out, f"part1_handoff:{p.name}"
         else:
             log_warn(f"配置指定的 Part 1 交接表不存在: {p} —— 回退到内部调控子")

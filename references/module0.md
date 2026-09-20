@@ -223,40 +223,59 @@ m["cross_language"]  # 跨语言转换记录
 
 **这是版本差异，不是回归。** 所以比对数值前先比对 `key_versions`。
 
-### 9.2 多线程 BLAS 归约顺序（CI 内部，同一版本）
+### 9.2 库内部的并行 kNN（CI 内部，同一版本）
 
-**同一个 Python 3.12、同一批包版本的两轮 CI 也会对不上。** 实测：
+**同一个 Python 3.12、同一批包版本的三轮 CI 也会对不上。** 实测：
 
-| 轮次 | commit | 四条轨迹平均 ρ | scFates 拓扑 |
-|---|---|---|---|
-| A | `8f3f56c0` | `+0.6363` | 4 个片段，6 个 milestone |
-| B | `9af13b42`（**只改了注释**） | `+0.6254` | 6 个片段，8 个 milestone |
+| 轮次 | commit | dpt | palantir | **scfates** | scFates 拓扑 | 平均 ρ |
+|---|---|---|---|---|---|---|
+| A | `8f3f56c0` | +0.5856 | +0.4674 | **+0.5644** | 4 片段 / 6 milestone | +0.6363 |
+| B | `9af13b42`（**只改注释**） | +0.5856 | +0.4674 | **+0.5296** | 6 片段 / 8 milestone | +0.6254 |
+| C | `5b241a3`（钉了 OMP/OPENBLAS/MKL） | +0.5856 | +0.4674 | **+0.5328** | 6 片段 / 8 milestone | +0.6265 |
 
-逐方法比对后定位到 **scFates 一个**：`dpt` `+0.5856`、`palantir`
-`+0.4674` 两轮**完全相同**，只有 `scfates` 从 `+0.5644` 变成 `+0.5296`
-—— 而且**拓扑本身变了**（片段数 4→6，milestone 数 6→8）。
-上游的聚类、分辨率扫描、CytoTRACE 两轮都逐字节一致。
+**`dpt` 与 `palantir` 三轮逐位相同**，上游的聚类数（10）、分辨率扫描、
+CytoTRACE 也完全一致。**只有 scFates 一个在变，而且钉了 BLAS 线程数之后还在变。**
 
-**为什么种子管不到它**（这是关键）：
+> **A→C 那一栏是一条否证。** 我第一版把原因归到"多线程 BLAS 归约顺序"，
+> 于是照搬 geo 规则 12 的两组变量 —— **C 轮证明归因错了**。
+> `dpt`/`palantir` 逐位相同本身就说明 BLAS 不是变量：
+> 真是归约顺序的话，同一条代码路径上的其他方法也该漂。
 
-- `scFates.pp.diffusion`（1.2.5 `preprocessing/diffusion.py`）**没有
-  `seed` 参数**，内部直接 `eigsh(T, n_components, tol=1e-4, maxiter=1000)`，
-  连 `v0` 都不给。
-- 后面的 PPT 主曲线树（`simpleppt`）对输入的**末位差异极其敏感** ——
-  它会拟合成另一个拓扑，再被 `pseudotime()` 放大成可见的 ρ 变化。
+**真正的路径**（读源码得到）：
 
-**这不是 scFates 的 bug，是"多线程归约的末位差异"在非线性拟合里的放大。**
-和姊妹项目 `geo-normal-pipeline-skill` 的 AGENTS 规则 12 是同一类问题
-（那边表现为极小的 P 值被放大到可见）。
+```
+scf.pp.diffusion(device="cpu")            # 签名里没有 seed
+  -> palantir.run_diffusion_maps(...)     # 靠 palantir 默认 seed=0
+       -> compute_kernel(backend="scanpy")
+            -> scanpy 默认 method="umap" -> pynndescent 近似 kNN
+       -> diffusion_maps_from_kernel(..., seed=0)
+            -> eigs(T, ..., v0=rng.random(...))     # 这步是干净的
+```
 
-**处理**：两个 Python 仓库的 workflow 现在都在 **job 级**钉住了
-`OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `MKL_NUM_THREADS` = 1
-以及 `OPENBLAS_CORETYPE=Haswell`。**两组缺一不可**：线程数管不到
-"OpenBLAS 按宿主 CPU 型号分发 SIMD 内核"这一层。
+- **特征求解器没问题**：`v0` 来自 `np.random.default_rng(0)`。
+- **脏的是它上游的 kNN**：`pynndescent` 是 Numba `prange` 并行的近似最近邻，
+  候选堆的更新顺序依赖线程调度，**给了 `random_state` 也不保证逐位可复现**。
+- 然后 simpleppt 的 PPT 主曲线树对输入的末位差异极其敏感 ——
+  会拟合成**另一个拓扑**，再被 `pseudotime()` 放大成可见的 ρ 变化。
+
+**处理**：两个 Python 仓库的 workflow 现在在 **job 级**钉住三组变量 ——
+**它们是三个独立的旋钮，缺一个都不够**：
+
+| 旋钮 | 管什么 |
+|---|---|
+| `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `MKL_NUM_THREADS` | BLAS 归约顺序 |
+| `OPENBLAS_CORETYPE=Haswell` | OpenBLAS 按宿主 CPU 型号分发 SIMD 内核（线程数管不到） |
+| **`NUMBA_NUM_THREADS=1`** | **Numba `prange` 的线程数 —— `pynndescent` 走这条** |
 
 > **教训**：`set_seed()` 只覆盖"用 numpy/random 的随机调用"。
-> 第三方库内部的迭代求解器（`eigsh` 不给 `v0`）、并行归约、
-> GPU 内核都不在里面。**看到"我明明设了种子"时，先问一句
-> "这个函数有没有 seed 参数"** —— 没有的话，设多少遍都没用。
+> 第三方库内部的迭代求解器、并行归约、**并行 kNN** 都不在里面。
+> **看到"我明明设了种子"时，先问一句"这个函数有没有 seed 参数"** ——
+> 没有的话，设多少遍都没用。
+
+### 9.3 报数的时候
+
+`trajectory_status.json` 的 `reproducibility` 字段记的就是这一段：
+哪些方法可以按定值报、哪些必须带范围。**别只写在文档里** ——
+拿到产物的人不一定读得到这里。
 
 ---

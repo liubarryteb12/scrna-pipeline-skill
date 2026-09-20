@@ -329,36 +329,76 @@ runner 的出网策略、换镜像、加超时 —— 而真正要改的只有�
 姊妹项目 `geo-normal-pipeline-skill` 的规则 12 记了同一类问题（那边是极小的
 P 值把浮点末位放大到可见）。单细胞这边实测的表现是**拓扑变了**。
 
-**证据（同一 Python 3.12、同一批包版本的两轮 CI）：**
+**证据（同一 Python 3.12、同一批包版本的三轮 CI）：**
 
-| 轮次 | commit | 四条轨迹平均 ρ | scFates 拓扑 |
-|---|---|---|---|
-| A | `8f3f56c0` | `+0.6363` | 4 个片段，6 个 milestone |
-| B | `9af13b42`（**只改了注释**） | `+0.6254` | 6 个片段，8 个 milestone |
+| 轮次 | commit | dpt | palantir | **scfates** | scFates 拓扑 | 平均 ρ |
+|---|---|---|---|---|---|---|
+| A | `8f3f56c0` | +0.5856 | +0.4674 | **+0.5644** | 4 片段 / 6 milestone | +0.6363 |
+| B | `9af13b42`（**只改注释**） | +0.5856 | +0.4674 | **+0.5296** | 6 片段 / 8 milestone | +0.6254 |
+| C | `5b241a3`（**钉了 OMP/OPENBLAS/MKL**） | +0.5856 | +0.4674 | **+0.5328** | 6 片段 / 8 milestone | +0.6265 |
 
-逐方法比对定位到 **scFates 一个**：`dpt` `+0.5856`、`palantir` `+0.4674`
-两轮**完全相同**，只有 `scfates` 从 `+0.5644` 变成 `+0.5296`。
-上游的聚类数、分辨率扫描、CytoTRACE 两轮逐字节一致。
+`dpt` 与 `palantir` **三轮逐位相同**，上游的聚类数（10）、分辨率扫描、
+CytoTRACE 也完全一致。**只有 scFates 一个在变，而且钉了线程数之后还在变。**
 
-**根因**：`scFates.pp.diffusion`（1.2.5 `preprocessing/diffusion.py`）
-**没有 `seed` 参数**，内部直接
-`eigsh(T, n_components, tol=1e-4, maxiter=1000)`，连 `v0` 都不给。
-`05_trajectory.py` 把 `seed` 传给了 `sct.tree()` 和 `sct.pseudotime()`
-（这两处是对的），但**扩散图那一步根本没地方传** ——
-于是 PPT 主曲线树吃到一个每次都有末位差异的输入，
-拟合成另一个拓扑，再被 `pseudotime()` 放大成可见的 ρ 变化。
+### 20.1 先记一条否证：钉 BLAS 并行度**没有**修好它
 
-### 三条要记住的
+我第一版的结论是"多线程 BLAS 归约顺序"，于是把 geo 规则 12 那两组环境变量
+搬了过来。**C 轮证明这个归因是错的** —— 钉住之后 scFates 依旧从 +0.5296
+变成 +0.5328（拓扑恰好都落在 6/8，所以只看拓扑会以为修好了）。
+
+**教训：`dpt`/`palantir` 三轮逐位相同，恰恰说明 BLAS 不是变量。**
+如果真是归约顺序，同一条代码路径上的其他方法也该漂。
+**"某个量在变"不等于"所有量都在变"** —— 先看哪些**没**变，
+范围一下就缩小了。
+
+### 20.2 真正的路径（读源码得到，不是推理）
+
+`05_trajectory.py` 的 `compute_scfates()` 走的是：
+
+```
+scf.pp.diffusion(device="cpu")
+  -> palantir.utils.run_diffusion_maps(data_df, n_components=10, knn=30, alpha=0)
+       -> compute_kernel(..., backend="scanpy")            # palantir 默认后端
+            -> scanpy.neighbors.Neighbors(temp)
+                 .compute_neighbors(n_neighbors=30, n_pcs=0, method=None)
+                      -> scanpy 默认 method="umap" -> **pynndescent 近似 kNN**
+       -> diffusion_maps_from_kernel(kernel, n_components, seed=0)
+            -> eigs(T, ..., v0=rng.random(...))            # v0 来自 seeded RNG，没问题
+```
+
+**两处关键事实：**
+
+1. **扩散图那一步没有 seed 可传。** `scFates.pp.diffusion`（1.2.5
+   `preprocessing/diffusion.py`）**签名里根本没有 `seed`**，内部调
+   `run_diffusion_maps` 时也不传 —— 靠 palantir 的默认 `seed=0`。
+   `05_trajectory.py` 把 seed 传给了 `sct.tree()` 和 `sct.pseudotime()`
+   （这两处是对的），**但扩散图那一步没地方传**。
+2. **特征求解器是干净的**（`eigs(..., v0=rng.random(...))`，`v0` 来自
+   `np.random.default_rng(0)`）。**脏的是它上游的 kNN** ——
+   `pynndescent` 是 Numba `prange` 并行的近似最近邻，候选堆的更新顺序
+   依赖线程调度，**即使给了 `random_state` 也不保证逐位可复现**。
+
+然后 simpleppt 的 PPT 主曲线树（`ppt.py:210-213`，`np.random.seed(seed)`
+之后 `np.random.choice` 取初始节点）对输入的末位差异**极其敏感** ——
+它会拟合成另一个拓扑，再被 `pseudotime()` 放大成可见的 ρ 变化。
+
+**Numba 的线程数由 `NUMBA_NUM_THREADS` 控制，不是 `OMP_NUM_THREADS`。**
+所以补了第三个变量（见下）。
+
+### 20.3 三条要记住的
 
 1. **看到"我明明设了种子"时，先问"这个函数有没有 seed 参数"。**
    没有的话设多少遍都没用。`set_seed()` 只覆盖用 numpy/random 的随机调用；
    第三方库内部的迭代求解器、并行归约、GPU 内核都不在里面。
    排查顺序：`grep -n seed <包的源码>` —— 看 `seed` 是**出现在签名里**
    还是**只出现在 docstring 里**。
-2. **限制并行度要在 job 级、两组一起设。** 只设线程数不够 ——
-   OpenBLAS 还会在**运行期**按宿主 CPU 型号分发 SIMD 内核
-   （向量宽度不同 → 归约顺序不同 → 末位不同），这一层线程数管不到。
-   GitHub 托管 runner 的 CPU 型号在同一 Azure 区域内也不单一。
+2. **并行度有三个独立的旋钮，缺一个都不够：**
+
+   | 旋钮 | 管什么 |
+   |---|---|
+   | `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `MKL_NUM_THREADS` | BLAS 归约顺序 |
+   | `OPENBLAS_CORETYPE` | OpenBLAS 按宿主 CPU 型号分发 SIMD 内核（线程数管不到） |
+   | **`NUMBA_NUM_THREADS`** | **Numba `prange` 的线程数 —— `pynndescent` 走这条** |
 
    ```yaml
    env:
@@ -366,15 +406,20 @@ P 值把浮点末位放大到可见）。单细胞这边实测的表现是**拓�
      OPENBLAS_NUM_THREADS: 1
      MKL_NUM_THREADS: 1
      OPENBLAS_CORETYPE: Haswell
+     NUMBA_NUM_THREADS: 1
    ```
 
 3. **"版本不同"不是万能借口。** 版本相同也能对不上。别一看到数字变了
    就归因到版本上 —— 那会掩盖真正的回归。先比对 `key_versions`，
-   相同就怀疑归约顺序。
+   相同就怀疑并行度。
 
-### 非线性拟合会放大末位差异
+### 20.4 结论怎么报
 
-这条比"数值差一点点"严重：**域划分、片段数、milestone 数是离散的**，
-末位差异直接体现为**结论变了**（4 个片段 → 6 个片段）。
-所以对这类输出，"跑两遍差不多"是不够的，必须钉死并行度。
+**scFates 的 ρ 不要当单一确定值报。** 实测范围 **+0.5296 ~ +0.5644**，
+平均 ρ 因此是 **+0.6254 ~ +0.6363**。`05_trajectory.py` 会把这段写进
+`trajectory_status.json` 的 `reproducibility` 字段 ——
+**结论的适用范围要跟着产物走，不能只写在 AGENTS 里。**
+
+`dpt` / `palantir` / `cytotrace` 三轮逐位相同，可以按确定值报。
+
 

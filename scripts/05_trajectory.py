@@ -684,6 +684,48 @@ def run_05_trajectory(cfg: dict) -> dict:
                        "`velocyto` 或 `--include-introns` 输出重新开始。"),
         },
         "limitations": limitations,
+        # ---- 哪些数可以当确定值报，哪些不能（硬性规则 20）------------------
+        #
+        # **"跑通了"不等于"这个数可复现"。** 实测三轮 CI（同一 Python 3.12、
+        # 同一批包版本）里，`dpt` 与 `palantir` 逐位相同，而 `scfates`
+        # 从 +0.5644 变到 +0.5296 再到 +0.5328，**拓扑本身也变过**
+        # （4 片段/6 milestone ↔ 6 片段/8 milestone）。
+        #
+        # 根因不在种子，在 scFates 的扩散图那一步：
+        # `scf.pp.diffusion` 签名里**没有 seed**，内部走
+        # `palantir.run_diffusion_maps` → `compute_kernel(backend="scanpy")`
+        # → scanpy 默认 `method="umap"` → **pynndescent 近似 kNN**（Numba 并行，
+        # 给了 random_state 也不保证逐位可复现）；再被 simpleppt 的 PPT
+        # 主曲线树放大成不同的拓扑。
+        #
+        # 所以这一段跟着产物走，而不是只写在 AGENTS.md 里 ——
+        # 拿到这份 JSON 的人必须能直接看到哪个数不能当定值用。
+        "reproducibility": {
+            "stable_methods": ["dpt", "palantir", "cytotrace"],
+            "unstable_methods": ["scfates"],
+            "evidence": ("三轮 CI（8f3f56c0 / 9af13b42 / 5b241a3，"
+                         "同一 Python 3.12、同一批包版本）：dpt +0.5856 三轮相同，"
+                         "palantir +0.4674 三轮相同，scfates "
+                         "+0.5644 -> +0.5296 -> +0.5328"),
+            "scfates_rho_observed_range": [0.5296, 0.5644],
+            "mean_rho_observed_range": [0.6254, 0.6363],
+            "range_is_from": ("**历史观测值，不是本轮的** —— 本轮的值见 "
+                              "`method_agreement`。这里记的是"
+                              "『同一个 commit 重跑能漂多少』，用来判断"
+                              "本轮的值该按定值报还是按范围报"),
+            "cause": ("scFates 的扩散图没有 seed 可传（`scf.pp.diffusion` "
+                      "签名里没有），内部经 palantir → scanpy 默认 "
+                      "`method=\"umap\"` → pynndescent 近似 kNN（Numba 并行，"
+                      "给了 random_state 也不保证逐位可复现）；"
+                      "simpleppt 的 PPT 主曲线树把末位差异放大成不同的拓扑"),
+            "mitigation": ("workflow 已钉 OMP/OPENBLAS/MKL_NUM_THREADS=1、"
+                           "OPENBLAS_CORETYPE=Haswell、NUMBA_NUM_THREADS=1；"
+                           "**实测钉住前四个之后 scfates 仍在变**，"
+                           "第五个（Numba）是补上的，效果待下一轮 CI 确认"),
+            "how_to_report": ("`dpt`/`palantir` 可按确定值报；"
+                              "**`scfates` 与「四条轨迹平均 rho」必须带范围报** —— "
+                              "只报一个数会把方法间的不一致藏起来"),
+        },
     }
     write_json(res_dir / "trajectory_status.json", status)
     log_info(f"轨迹分析完成：{len(methods_ok)} 种方法，"

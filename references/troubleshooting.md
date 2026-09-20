@@ -8,10 +8,25 @@
 > `key_versions` 与 `seed`。
 >
 > **但"版本不同"不是唯一解释，别把它当成万能借口。** 实测同一份代码、
-> **同一个 Python 3.12 + 同一批包版本**的两轮 CI，轨迹一致性给过
-> `+0.6363` 和 `+0.6254` —— 那两轮之间只隔了一个**只改注释**的 commit。
-> 所以顺序是：**先比对版本 → 版本相同再比对 `key_versions` 里有没有
-> BLAS 相关项 → 都相同就怀疑多线程归约**（见下面"数值不稳定"一节）。
+> **同一个 Python 3.12 + 同一批包版本**的三轮 CI，轨迹一致性给过
+> `+0.6363`、`+0.6254`、`+0.6265` —— 其中一轮只隔了一个**只改注释**的
+> commit，另一轮已经钉了 BLAS 线程数。
+>
+> 排查顺序：
+>
+> 1. **先比对版本**（`key_versions`）。不同 → 大概率是版本。
+> 2. **版本相同 → 看哪些量没变。** 三轮里 `dpt`(+0.5856) 与
+>    `palantir`(+0.4674) **逐位相同**，只有 `scfates` 在变。
+>    **"某个量在变"不等于"所有量都在变"** —— 没变的那些会立刻
+>    排除掉一大类原因（比如多线程 BLAS：真是归约顺序的话，
+>    同一条代码路径上的其他方法也该漂）。
+> 3. **定位到方法后，去读它的源码找随机源**（`grep -n seed`）。
+>    重点看 `seed` 是**出现在签名里**还是**只在 docstring 里**。
+> 4. **确认并行度的三个旋钮都钉了**（`OMP/MKL/OPENBLAS_NUM_THREADS`、
+>    `OPENBLAS_CORETYPE`、**`NUMBA_NUM_THREADS`**）。缺一个都不够 ——
+>    实测钉了前四个之后 scFates 仍在变，第五个管的是
+>    `pynndescent`（scanpy 默认的近似 kNN）那条 Numba 并行路径。
+>
 > **先比对版本，再怀疑代码**这条仍然对，但"版本一样就一定是回归"是错的。
 
 ---
@@ -213,6 +228,62 @@ n 大时正常。本数据 n=2652，|rho| 只要约 0.06 就能过 BH<0.05，
 201 个里 190 个"显著"。**看效应量不看显著个数** ——
 `tf_activity_vs_pseudotime.csv` 有 rho，产物里也写了效应量分布
 （本数据 |rho| 中位 0.316，48 个 >0.5）。
+
+---
+
+## 数值不稳定（同一个 commit 重跑结果不一样）
+
+### `scFates` 的 rho 每次都不一样，其他方法完全一样
+
+**症状**：`dpt`、`palantir` 三轮 CI 逐位相同，`scfates` 在
+`+0.5644` / `+0.5296` / `+0.5328` 之间跳，**拓扑也变过**
+（4 片段/6 milestone ↔ 6 片段/8 milestone）。
+
+**别急着怪版本。** 那三轮是**同一个 Python 3.12、同一批包版本**。
+
+**根因不在种子，在这条路径：**
+
+```
+scf.pp.diffusion(device="cpu")            # 签名里没有 seed
+  -> palantir.run_diffusion_maps(...)     # 靠 palantir 默认 seed=0
+       -> compute_kernel(backend="scanpy")
+            -> scanpy 默认 method="umap" -> pynndescent 近似 kNN
+       -> diffusion_maps_from_kernel(..., seed=0)
+            -> eigs(T, ..., v0=rng.random(...))     # 这步是干净的
+```
+
+- `scFates.pp.diffusion`（1.2.5）**签名里没有 `seed`**，内部调
+  `run_diffusion_maps` 时也不传 —— **想设也没地方设**。
+- 特征求解器本身没问题（`v0` 来自 `np.random.default_rng(0)`）。
+- **脏的是上游的 kNN**：`pynndescent` 是 Numba `prange` 并行的近似最近邻，
+  候选堆的更新顺序依赖线程调度，**给了 `random_state` 也不保证逐位可复现**。
+- simpleppt 的 PPT 主曲线树（`ppt.py:210-213`）对输入的末位差异极其敏感，
+  会拟合成**另一个拓扑**，再被 `pseudotime()` 放大。
+
+**处理**：workflow 在 job 级钉住**三个独立旋钮**：
+
+| 旋钮 | 管什么 |
+|---|---|
+| `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `MKL_NUM_THREADS` | BLAS 归约顺序 |
+| `OPENBLAS_CORETYPE=Haswell` | OpenBLAS 按宿主 CPU 型号分发 SIMD 内核 |
+| **`NUMBA_NUM_THREADS=1`** | **Numba `prange` 的线程数 —— `pynndescent` 走这条** |
+
+> **只钉前两组是不够的。** 实测钉了前四个变量之后 scFates 仍在变
+> （`+0.5296` → `+0.5328`，拓扑恰好都落在 6/8，**只看拓扑会以为修好了**）。
+> `NUMBA_NUM_THREADS` 是补上的第五个。
+
+**报数要求**：`trajectory_status.json` 的 `reproducibility` 字段会写明
+哪些方法可以按定值报、哪些必须带范围。**别只报一个数** ——
+把方法间的不一致藏起来，比报一个范围糟糕得多。
+
+### 通用排查顺序
+
+1. 比对 `key_versions`。不同 → 大概率是版本。
+2. **版本相同 → 先看哪些量没变。** 没变的那些会立刻排除掉一大类原因
+   （多线程 BLAS 真是元凶的话，同一条代码路径上的其他方法也该漂）。
+3. 定位到方法后，**去读源码找随机源**：`grep -n seed`。
+   重点看 `seed` 是**出现在签名里**还是**只在 docstring 里**。
+4. 确认并行度的三个旋钮都钉了（见上表）。
 
 ---
 
