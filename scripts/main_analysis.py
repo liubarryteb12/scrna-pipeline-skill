@@ -28,7 +28,7 @@ sys.path.insert(0, str(REPO / "scripts" / "lib"))
 from common import (capture_versions, init_manifest, load_config,  # noqa: E402
                     log_error, log_info, log_warn, manifest_path,
                     manifest_summary, named_tools_note, parse_args,
-                    probe_named_tools, read_json, read_state,
+                    probe_named_tools, read_json, read_manifest, read_state,
                     record_decision, record_human_review, record_input,
                     record_params, record_step, set_orchestrated, write_json)
 
@@ -317,7 +317,12 @@ def run_all(cfg: dict, only: list = None) -> int:
         # 将来真加了跨语言步骤却忘了记，这条会立刻变红。
         #
         # **读全量清单而不是 `msum`** —— `manifest_summary()` 只给计数。
-        _full = read_json(res_dir / "run_manifest.json") or {}
+        #
+        # 用 `read_manifest(cfg)` 而不是 `read_json(res_dir /
+        # "run_manifest.json")`：两者等价，但**文件名只该有一处** ——
+        # `MANIFEST_NAME` 改了而这里写死字符串的话，这条检查会静默地
+        # 读一个不存在的文件、`_dec_nodes` 变空，然后报"没解释"。
+        _full = read_manifest(cfg)
         _cl = msum.get("n_cross_language", 0)
         _dec_nodes = {d.get("node") for d in (_full.get("decisions") or [])}
         checks.append({
@@ -512,8 +517,10 @@ def run_all(cfg: dict, only: list = None) -> int:
     # 必须存在的原因是产物**看不出来**：每一步都有东西产出，
     # 而 §2 点名的 R 包（SCTransform / scran / DESeq2 / Monocle3 /
     # Slingshot / CellChat / SoupX）一个都跑不了。
-    msum = read_json(res_dir / "run_manifest.json") if has_file(
-        res_dir / "run_manifest.json") else {}
+    # 用 `read_manifest(cfg)` 而不是拼 `res_dir / "run_manifest.json"` ——
+    # 文件名只该有一处（`MANIFEST_NAME`）。`read_manifest` 在文件不存在时
+    # 已经返回 `{}`，所以这里不需要 `has_file` 判断。
+    msum = read_manifest(cfg)
     named = (msum.get("params") or {}).get("named_tools")
     if not isinstance(named, dict) or not named:
         checks.append({
