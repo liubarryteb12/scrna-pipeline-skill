@@ -1,7 +1,7 @@
 """
 lib/common.py — 单细胞流水线公共库
 
-约定与 geo-brca-microarray-skill 保持一致（同一套心智模型）：
+约定与 geo-normal-pipeline-skill 保持一致（同一套心智模型）：
   - `parse_args()` **故意没有默认配置** —— 多数据集下静默默认到其中某一个，
     正是"跑错数据集"的来源。
   - 日志走 log_info/log_warn/log_error，不用裸 print。

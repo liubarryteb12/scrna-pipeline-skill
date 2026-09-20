@@ -1,6 +1,6 @@
 # 单细胞流水线的工程规则
 
-姊妹项目 `geo-brca-microarray-skill/AGENTS.md` 的规则在这里同样适用。
+姊妹项目 `geo-normal-pipeline-skill/AGENTS.md` 的规则在这里同样适用。
 本文只写**单细胞特有的**部分。
 
 ---

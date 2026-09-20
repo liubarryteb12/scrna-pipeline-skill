@@ -7,7 +7,7 @@
 #   2. 改 dataset_id 和 source（见 assets/datasets.yml 的说明）
 #   3. 如果有分组/批次信息，填 design 段（否则拟bulk DE 会自动跳过并记录原因）
 #
-# 与 Part 1（geo-brca-microarray-skill）的对应关系：
+# 与 Part 1（geo-normal-pipeline-skill）的对应关系：
 #   dataset_id    -> 派生 results/<id> 与 data/<id>，一个数据集一个产物目录
 #   analysis.seed -> 不可删；单细胞里 UMAP/leiden/scrublet 全都吃随机数
 # ============================================================================

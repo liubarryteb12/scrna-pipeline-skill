@@ -1,7 +1,7 @@
 # 模块零：运行清单
 
 参考规范：三大部分整合文档「模块零：语言与运行时规范」。
-姊妹项目 `geo-brca-microarray-skill` / `spatial-pipeline-skill` 的
+姊妹项目 `geo-normal-pipeline-skill` / `spatial-pipeline-skill` 的
 `references/module0.md` 是同一份文档，接口**同名同义**，
 三部分的清单可以并排读。
 
