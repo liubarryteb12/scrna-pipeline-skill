@@ -40,7 +40,8 @@ import yaml  # noqa: E402
 from scipy import sparse  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed, write_json, W_ONE_HALF,)
+                    log_warn, parse_args, record_step, save_fig, set_seed,
+                    write_json, W_DOUBLE, W_ONE_HALF,)
 
 N_PERMUTATIONS = 200
 
@@ -352,21 +353,45 @@ def run_06_communication(cfg: dict) -> dict:
     log_info(f"通讯打分: {len(res)} 个 (配体受体, 发送, 接收) 组合，"
              f"BH 校正后 {n_sig} 个 p<0.05")
 
-    # 热图：发送 x 接收 的总分
-    top = res.head(min(20, len(res)))
-    fig, ax = plt.subplots(figsize=(max(W_ONE_HALF, 0.55 * len(groups) + 2.2),
-                                    max(3.4, 0.42 * len(top) + 1.8)))
+    # 热图：配体-受体对 x 接收细胞类型 的总分
+    #
+    # **按"配体-受体对"选前 N，不是按三元组选。**
+    # `res` 的每一行是 (配体受体对, 发送, 接收) 三元组，所以
+    # `res.head(20)` 拿到的是 20 个**组合**；再 pivot 到 pair x receiver，
+    # 行数就塌成"这 20 个组合里出现过几个不同的 pair" —— 实测 pbmc3k 只有 **3** 个。
+    # 于是图上出现 3 行、标题却写着 "Top 20 LR pairs"，而且画布约 8/8 是空的 0 值区。
+    # **判据要匹配图在问的那件事**：这张图的行是 pair，就该按 pair 排序。
+    # （同一批数据里 B2M_CD8A 的单个组合分就很高，把另外两个 pair 全挤出去了。）
+    pair_score = res.groupby("pair")["score"].sum().sort_values(ascending=False)
+    n_pairs = min(20, len(pair_score))
+    top_pairs = list(pair_score.head(n_pairs).index)
+    top = res[res["pair"].isin(top_pairs)]
     mat = top.pivot_table(index="pair", columns="receiver", values="score",
                           aggfunc="sum").fillna(0.0)
+    # 行序按总分从高到低，与 `pair_score` 一致 —— 否则行序是 pivot 的字母序，
+    # "按分数取的前 N"这句话在图上就看不出来。
+    mat = mat.reindex([p for p in top_pairs if p in mat.index])
+
+    # **高度按实际画出来的行数算，不按请求数算。** 原来用 `len(top)`（=20）算，
+    # 而实际只有 3 行 -> 每行 3.4 英寸，格子被拉成巨大的纯色块。
+    # 同时**必须夹到 W_DOUBLE**：实测原来算出 259.1 mm，装不进任何期刊的一栏
+    # （规则 13）。
+    fig_h = min(W_DOUBLE, max(2.6, 0.16 * len(mat) + 1.9))
+    fig_w = min(W_DOUBLE, max(W_ONE_HALF, 0.55 * len(groups) + 2.2))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     im = ax.imshow(mat.values, aspect="auto", cmap="viridis")
     ax.set_xticks(range(len(mat.columns)))
     ax.set_xticklabels(mat.columns, rotation=45, ha="right", fontsize=7)
     ax.set_yticks(range(len(mat)))
     ax.set_yticklabels(mat.index, fontsize=7)
     ax.set_xlabel("receiver"); ax.set_ylabel("ligand-receptor pair")
-    ax.set_title(f"Top {len(top)} LR pairs by score")
+    # 标题写**实际画出来的**行数。原来写的是 `len(top)` = 组合数，
+    # 标题对图上内容的描述是错的。
+    ax.set_title(f"Top {len(mat)} ligand-receptor pairs by summed score")
     fig.colorbar(im, ax=ax, label="score")
     save_fig(cfg, "communication_heatmap", fig)
+    log_info(f"通讯热图: {len(mat)} 个配体受体对 x {mat.shape[1]} 个接收类型"
+             f"（{len(res)} 个组合 -> {len(pair_score)} 个不同 pair，取前 {n_pairs}）")
 
     # ---- LIANA（文档 §2.7 指定的主工具）------------------------------------
     # **自建打分照常产出**（cell_communication.csv 已被下游引用），

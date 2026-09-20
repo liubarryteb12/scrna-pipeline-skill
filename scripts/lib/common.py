@@ -105,7 +105,14 @@ def load_config(path: str) -> dict:
 
     ana = cfg.setdefault("analysis", {})
     ana.setdefault("seed", 20260919)
-    ana.setdefault("figure_dpi", 150)
+    # **300 dpi 是投稿图的底线，不是"够用就行"。**
+    # 原来默认 150：183 mm 宽的图在 150 dpi 下只有 1080 px，放大或印刷后
+    # 字形和细线都发虚 —— 而"发虚"从图注上完全看不出来，文件大小也正常。
+    # 实测 PPI 那张图改成 300 后是 2161x2338（原来 1080x1169）。
+    # **改默认值而不是改调用点**：全仓库没有任何一处传过 `dpi`，
+    # 所以这里一处就等于修好所有 PNG（PDF 是矢量，dpi 只影响 PNG）。
+    # 姊妹项目 geo-normal-pipeline-skill 的 `save_pdf()` 是同一条改动。
+    ana.setdefault("figure_dpi", 300)
     return cfg
 
 
