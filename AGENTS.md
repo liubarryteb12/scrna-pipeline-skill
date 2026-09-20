@@ -329,29 +329,41 @@ runner 的出网策略、换镜像、加超时 —— 而真正要改的只有�
 姊妹项目 `geo-normal-pipeline-skill` 的规则 12 记了同一类问题（那边是极小的
 P 值把浮点末位放大到可见）。单细胞这边实测的表现是**拓扑变了**。
 
-**证据（同一 Python 3.12、同一批包版本的三轮 CI）：**
+**证据（同一 Python 3.12、同一批包版本的五轮 CI）：**
 
-| 轮次 | commit | dpt | palantir | **scfates** | scFates 拓扑 | 平均 ρ |
-|---|---|---|---|---|---|---|
-| A | `8f3f56c0` | +0.5856 | +0.4674 | **+0.5644** | 4 片段 / 6 milestone | +0.6363 |
-| B | `9af13b42`（**只改注释**） | +0.5856 | +0.4674 | **+0.5296** | 6 片段 / 8 milestone | +0.6254 |
-| C | `5b241a3`（**钉了 OMP/OPENBLAS/MKL**） | +0.5856 | +0.4674 | **+0.5328** | 6 片段 / 8 milestone | +0.6265 |
+| 轮次 | commit | 并行度设置 | dpt | palantir | **scfates** | scFates 拓扑 | 平均 ρ |
+|---|---|---|---|---|---|---|---|
+| A | `8f3f56c0` | 无钉 | +0.5856 | +0.4674 | **+0.5644** | 4 片段 / 6 milestone | +0.6363 |
+| B | `9af13b42`（**只改注释**） | 无钉 | +0.5856 | +0.4674 | **+0.5296** | 6 片段 / 8 milestone | +0.6254 |
+| C | `5b241a3` | +OMP/OB/MKL/CORETYPE | +0.5856 | +0.4674 | **+0.5328** | 6 片段 / 8 milestone | +0.6265 |
+| D | `db778bb` | +`NUMBA_NUM_THREADS=1` | +0.5856 | +0.4674 | **+0.5328** | 6 片段 / 8 milestone | +0.6265 |
+| E | `f99eab1` | 同上 | +0.5856 | +0.4674 | **+0.5328** | 6 片段 / 8 milestone | +0.6265 |
+| F | `e549477` | 同上 | +0.5856 | +0.4674 | **+0.5646** | 6 片段 / 8 milestone | +0.6353 |
 
-`dpt` 与 `palantir` **三轮逐位相同**，上游的聚类数（10）、分辨率扫描、
-CytoTRACE 也完全一致。**只有 scFates 一个在变，而且钉了线程数之后还在变。**
+`dpt` 与 `palantir` **六轮逐位相同**，上游的聚类数（10）、分辨率扫描、
+CytoTRACE 也完全一致。**只有 scFates 一个在变。**
 
-### 20.1 先记一条否证：钉 BLAS 并行度**没有**修好它
+### 20.1 两次归因都被否证了
 
-我第一版的结论是"多线程 BLAS 归约顺序"，于是把 geo 规则 12 那两组环境变量
-搬了过来。**C 轮证明这个归因是错的** —— 钉住之后 scFates 依旧从 +0.5296
-变成 +0.5328（拓扑恰好都落在 6/8，所以只看拓扑会以为修好了）。
+**第一次：多线程 BLAS 归约顺序。** 把 geo 规则 12 那两组变量搬了过来 ——
+**C 轮否证**：钉住之后 scfates 从 +0.5296 变成 +0.5328，没有收敛。
 
-**教训：`dpt`/`palantir` 三轮逐位相同，恰恰说明 BLAS 不是变量。**
-如果真是归约顺序，同一条代码路径上的其他方法也该漂。
-**"某个量在变"不等于"所有量都在变"** —— 先看哪些**没**变，
-范围一下就缩小了。
+**第二次：`pynndescent` 的 Numba 并行。** 读源码发现扩散图那一步经过
+scanpy 默认的 `method="umap"`，于是补了 `NUMBA_NUM_THREADS=1` ——
+**D/E/F 三轮否证**：0.5328 / 0.5328 / **0.5646**。
+最后那个值几乎回到 A 轮未钉时的 +0.5644。
 
-### 20.2 真正的路径（读源码得到，不是推理）
+**两次否证留下的线索：**
+
+- **拓扑稳住了。** A 轮是 4 片段/6 milestone，B 轮之后**六轮全部是
+  6 片段/8 milestone** —— 钉并行度确实让**离散的**结构稳定了。
+- **但连续量（ρ）还在漂**，而且看起来有两个吸引子：`≈+0.5328` 与
+  `≈+0.5645`。**残留随机源尚未定位。**
+
+**这一条比"我修好了"更有用：钉并行度能让拓扑稳定，但不足以让 ρ 稳定。**
+第三次动手之前先读日志 —— 本仓库规则 12 就是为这个写的。
+
+### 20.2 真正的路径（读源码得到）
 
 `05_trajectory.py` 的 `compute_scfates()` 走的是：
 
@@ -361,7 +373,7 @@ scf.pp.diffusion(device="cpu")
        -> compute_kernel(..., backend="scanpy")            # palantir 默认后端
             -> scanpy.neighbors.Neighbors(temp)
                  .compute_neighbors(n_neighbors=30, n_pcs=0, method=None)
-                      -> scanpy 默认 method="umap" -> **pynndescent 近似 kNN**
+                      -> scanpy 默认 method="umap"
        -> diffusion_maps_from_kernel(kernel, n_components, seed=0)
             -> eigs(T, ..., v0=rng.random(...))            # v0 来自 seeded RNG，没问题
 ```
@@ -374,16 +386,10 @@ scf.pp.diffusion(device="cpu")
    `05_trajectory.py` 把 seed 传给了 `sct.tree()` 和 `sct.pseudotime()`
    （这两处是对的），**但扩散图那一步没地方传**。
 2. **特征求解器是干净的**（`eigs(..., v0=rng.random(...))`，`v0` 来自
-   `np.random.default_rng(0)`）。**脏的是它上游的 kNN** ——
-   `pynndescent` 是 Numba `prange` 并行的近似最近邻，候选堆的更新顺序
-   依赖线程调度，**即使给了 `random_state` 也不保证逐位可复现**。
-
-然后 simpleppt 的 PPT 主曲线树（`ppt.py:210-213`，`np.random.seed(seed)`
-之后 `np.random.choice` 取初始节点）对输入的末位差异**极其敏感** ——
-它会拟合成另一个拓扑，再被 `pseudotime()` 放大成可见的 ρ 变化。
-
-**Numba 的线程数由 `NUMBA_NUM_THREADS` 控制，不是 `OMP_NUM_THREADS`。**
-所以补了第三个变量（见下）。
+   `np.random.default_rng(0)`）。
+3. simpleppt 的 PPT 主曲线树（`ppt.py:210-213`，`np.random.seed(seed)`
+   之后 `np.random.choice` 取初始节点）本身是 seed 了的 ——
+   它只是把上游的末位差异放大成可见的 ρ 变化。
 
 ### 20.3 三条要记住的
 
@@ -392,13 +398,13 @@ scf.pp.diffusion(device="cpu")
    第三方库内部的迭代求解器、并行归约、GPU 内核都不在里面。
    排查顺序：`grep -n seed <包的源码>` —— 看 `seed` 是**出现在签名里**
    还是**只出现在 docstring 里**。
-2. **并行度有三个独立的旋钮，缺一个都不够：**
+2. **并行度有三个独立的旋钮，缺一个都不够**（但它们**不保证**解决）：
 
    | 旋钮 | 管什么 |
    |---|---|
    | `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `MKL_NUM_THREADS` | BLAS 归约顺序 |
    | `OPENBLAS_CORETYPE` | OpenBLAS 按宿主 CPU 型号分发 SIMD 内核（线程数管不到） |
-   | **`NUMBA_NUM_THREADS`** | **Numba `prange` 的线程数 —— `pynndescent` 走这条** |
+   | **`NUMBA_NUM_THREADS`** | **Numba `prange` 的线程数** |
 
    ```yaml
    env:
@@ -409,17 +415,19 @@ scf.pp.diffusion(device="cpu")
      NUMBA_NUM_THREADS: 1
    ```
 
+   **这五个变量现在都设着，但 scFates 的 ρ 仍然在漂（D/E/F 三轮）。**
+   设它们是对的（拓扑因此稳住了），**但不要以为设了就可复现。**
 3. **"版本不同"不是万能借口。** 版本相同也能对不上。别一看到数字变了
    就归因到版本上 —— 那会掩盖真正的回归。先比对 `key_versions`，
-   相同就怀疑并行度。
+   相同就去看**哪些量没变**。
 
 ### 20.4 结论怎么报
 
-**scFates 的 ρ 不要当单一确定值报。** 实测范围 **+0.5296 ~ +0.5644**，
+**scFates 的 ρ 不要当单一确定值报。** 实测范围 **+0.5296 ~ +0.5646**，
 平均 ρ 因此是 **+0.6254 ~ +0.6363**。`05_trajectory.py` 会把这段写进
 `trajectory_status.json` 的 `reproducibility` 字段 ——
 **结论的适用范围要跟着产物走，不能只写在 AGENTS 里。**
 
-`dpt` / `palantir` / `cytotrace` 三轮逐位相同，可以按确定值报。
+`dpt` / `palantir` / `cytotrace` 六轮逐位相同，可以按确定值报。
 
 

@@ -703,11 +703,12 @@ def run_05_trajectory(cfg: dict) -> dict:
         "reproducibility": {
             "stable_methods": ["dpt", "palantir", "cytotrace"],
             "unstable_methods": ["scfates"],
-            "evidence": ("三轮 CI（8f3f56c0 / 9af13b42 / 5b241a3，"
-                         "同一 Python 3.12、同一批包版本）：dpt +0.5856 三轮相同，"
-                         "palantir +0.4674 三轮相同，scfates "
-                         "+0.5644 -> +0.5296 -> +0.5328"),
-            "scfates_rho_observed_range": [0.5296, 0.5644],
+            "evidence": ("六轮 CI（8f3f56c0 / 9af13b42 / 5b241a3 / db778bb / "
+                         "f99eab1 / e549477，同一 Python 3.12、同一批包版本）："
+                         "dpt +0.5856 六轮相同，palantir +0.4674 六轮相同，"
+                         "scfates +0.5644 -> +0.5296 -> +0.5328 -> +0.5328 -> "
+                         "+0.5328 -> +0.5646"),
+            "scfates_rho_observed_range": [0.5296, 0.5646],
             "mean_rho_observed_range": [0.6254, 0.6363],
             "range_is_from": ("**历史观测值，不是本轮的** —— 本轮的值见 "
                               "`method_agreement`。这里记的是"
@@ -715,14 +716,24 @@ def run_05_trajectory(cfg: dict) -> dict:
                               "本轮的值该按定值报还是按范围报"),
             "cause": ("scFates 的扩散图没有 seed 可传（`scf.pp.diffusion` "
                       "签名里没有），内部经 palantir → scanpy 默认 "
-                      "`method=\"umap\"` → pynndescent 近似 kNN（Numba 并行，"
-                      "给了 random_state 也不保证逐位可复现）；"
-                      "simpleppt 的 PPT 主曲线树把末位差异放大成不同的拓扑"),
-            "mitigation": ("workflow 已钉 OMP/OPENBLAS/MKL_NUM_THREADS=1、"
-                           "OPENBLAS_CORETYPE=Haswell、NUMBA_NUM_THREADS=1；"
-                           "**实测钉住前四个之后 scfates 仍在变**，"
-                           "第五个（Numba）是补上的，效果待下一轮 CI 确认"),
-            "how_to_report": ("`dpt`/`palantir` 可按确定值报；"
+                      "`method=\"umap\"` 的近似 kNN；simpleppt 的 PPT "
+                      "主曲线树把上游的末位差异放大成可见的 ρ 变化。"
+                      "**残留随机源尚未定位** —— 两次归因都被实测否证"),
+            "falsified_hypotheses": [
+                ("多线程 BLAS 归约顺序 —— 否证：钉住 OMP/OPENBLAS/MKL + "
+                 "OPENBLAS_CORETYPE 之后 scfates 仍从 +0.5296 变成 +0.5328"),
+                ("pynndescent 的 Numba 并行 —— 否证：补上 "
+                 "NUMBA_NUM_THREADS=1 之后三轮仍给 +0.5328 / +0.5328 / +0.5646"),
+            ],
+            "what_pinning_did_fix": ("**离散的拓扑稳住了**：A 轮是 4 片段/6 "
+                                     "milestone，之后六轮全部是 6 片段/8 "
+                                     "milestone。所以钉并行度不是白做，"
+                                     "**但它不足以让 ρ 稳定**"),
+            "mitigation": ("workflow 在 job 级钉了 OMP/OPENBLAS/MKL/"
+                           "NUMBA_NUM_THREADS=1 与 OPENBLAS_CORETYPE=Haswell。"
+                           "**实测这五个变量不足以让 scFates 的 ρ 可复现**，"
+                           "所以不要以为设了就可复现 —— 按范围报"),
+            "how_to_report": ("`dpt`/`palantir`/`cytotrace` 可按确定值报；"
                               "**`scfates` 与「四条轨迹平均 rho」必须带范围报** —— "
                               "只报一个数会把方法间的不一致藏起来"),
         },

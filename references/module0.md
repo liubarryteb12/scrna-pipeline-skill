@@ -225,52 +225,66 @@ m["cross_language"]  # 跨语言转换记录
 
 ### 9.2 库内部的并行 kNN（CI 内部，同一版本）
 
-**同一个 Python 3.12、同一批包版本的三轮 CI 也会对不上。** 实测：
+**同一个 Python 3.12、同一批包版本的多轮 CI 也会对不上。** 实测六轮：
 
-| 轮次 | commit | dpt | palantir | **scfates** | scFates 拓扑 | 平均 ρ |
-|---|---|---|---|---|---|---|
-| A | `8f3f56c0` | +0.5856 | +0.4674 | **+0.5644** | 4 片段 / 6 milestone | +0.6363 |
-| B | `9af13b42`（**只改注释**） | +0.5856 | +0.4674 | **+0.5296** | 6 片段 / 8 milestone | +0.6254 |
-| C | `5b241a3`（钉了 OMP/OPENBLAS/MKL） | +0.5856 | +0.4674 | **+0.5328** | 6 片段 / 8 milestone | +0.6265 |
+| 轮次 | commit | 并行度 | dpt | palantir | **scfates** | 拓扑 | 平均 ρ |
+|---|---|---|---|---|---|---|---|
+| A | `8f3f56c0` | 无钉 | +0.5856 | +0.4674 | **+0.5644** | 4 片段 / 6 mil | +0.6363 |
+| B | `9af13b42`（**只改注释**） | 无钉 | +0.5856 | +0.4674 | **+0.5296** | 6 / 8 | +0.6254 |
+| C | `5b241a3` | +BLAS 线程/CORETYPE | +0.5856 | +0.4674 | **+0.5328** | 6 / 8 | +0.6265 |
+| D | `db778bb` | +`NUMBA_NUM_THREADS` | +0.5856 | +0.4674 | **+0.5328** | 6 / 8 | +0.6265 |
+| E | `f99eab1` | 同上 | +0.5856 | +0.4674 | **+0.5328** | 6 / 8 | +0.6265 |
+| F | `e549477` | 同上 | +0.5856 | +0.4674 | **+0.5646** | 6 / 8 | +0.6353 |
 
-**`dpt` 与 `palantir` 三轮逐位相同**，上游的聚类数（10）、分辨率扫描、
-CytoTRACE 也完全一致。**只有 scFates 一个在变，而且钉了 BLAS 线程数之后还在变。**
+**`dpt` 与 `palantir` 六轮逐位相同**，上游的聚类数（10）、分辨率扫描、
+CytoTRACE 也完全一致。**只有 scFates 一个在变。**
 
-> **A→C 那一栏是一条否证。** 我第一版把原因归到"多线程 BLAS 归约顺序"，
-> 于是照搬 geo 规则 12 的两组变量 —— **C 轮证明归因错了**。
-> `dpt`/`palantir` 逐位相同本身就说明 BLAS 不是变量：
-> 真是归约顺序的话，同一条代码路径上的其他方法也该漂。
+> **两次归因都被否证了，记在这里比"我修好了"有用。**
+>
+> 1. **"多线程 BLAS 归约顺序"** —— 钉住 OMP/OPENBLAS/MKL + CORETYPE
+>    之后（C 轮）scfates 仍从 +0.5296 变 +0.5328。
+> 2. **"`pynndescent` 的 Numba 并行"** —— 补上 `NUMBA_NUM_THREADS=1`
+>    之后（D/E/F 轮）三轮给 +0.5328 / +0.5328 / **+0.5646**，
+>    最后那个几乎回到未钉时的 +0.5644。
+>
+> **但钉并行度不是白做**：离散的**拓扑稳住了** —— A 轮是 4 片段/6
+> milestone，B 轮之后六轮全部是 6 片段/8 milestone。
+> **它让结构稳定，不足以让 ρ 稳定。残留随机源尚未定位。**
 
-**真正的路径**（读源码得到）：
+**路径**（读源码得到）：
 
 ```
 scf.pp.diffusion(device="cpu")            # 签名里没有 seed
   -> palantir.run_diffusion_maps(...)     # 靠 palantir 默认 seed=0
        -> compute_kernel(backend="scanpy")
-            -> scanpy 默认 method="umap" -> pynndescent 近似 kNN
+            -> scanpy 默认 method="umap"
        -> diffusion_maps_from_kernel(..., seed=0)
             -> eigs(T, ..., v0=rng.random(...))     # 这步是干净的
 ```
 
 - **特征求解器没问题**：`v0` 来自 `np.random.default_rng(0)`。
-- **脏的是它上游的 kNN**：`pynndescent` 是 Numba `prange` 并行的近似最近邻，
-  候选堆的更新顺序依赖线程调度，**给了 `random_state` 也不保证逐位可复现**。
-- 然后 simpleppt 的 PPT 主曲线树对输入的末位差异极其敏感 ——
-  会拟合成**另一个拓扑**，再被 `pseudotime()` 放大成可见的 ρ 变化。
+- **扩散图那一步没有 seed 可传**（`scFates.pp.diffusion` 1.2.5 签名里没有）。
+- simpleppt 的 PPT 主曲线树（`ppt.py:210-213`）本身是 seed 了的，
+  它只是把上游的末位差异放大成可见的 ρ 变化。
 
-**处理**：两个 Python 仓库的 workflow 现在在 **job 级**钉住三组变量 ——
-**它们是三个独立的旋钮，缺一个都不够**：
+**处理**：两个 Python 仓库的 workflow 在 **job 级**钉住三组变量 ——
+**它们是三个独立的旋钮，但实测不足以解决这个问题**：
 
 | 旋钮 | 管什么 |
 |---|---|
 | `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `MKL_NUM_THREADS` | BLAS 归约顺序 |
 | `OPENBLAS_CORETYPE=Haswell` | OpenBLAS 按宿主 CPU 型号分发 SIMD 内核（线程数管不到） |
-| **`NUMBA_NUM_THREADS=1`** | **Numba `prange` 的线程数 —— `pynndescent` 走这条** |
+| `NUMBA_NUM_THREADS=1` | Numba `prange` 的线程数 |
 
 > **教训**：`set_seed()` 只覆盖"用 numpy/random 的随机调用"。
-> 第三方库内部的迭代求解器、并行归约、**并行 kNN** 都不在里面。
+> 第三方库内部的迭代求解器、并行归约、并行 kNN 都不在里面。
 > **看到"我明明设了种子"时，先问一句"这个函数有没有 seed 参数"** ——
 > 没有的话，设多少遍都没用。
+>
+> **更重要的教训：设了环境变量不等于问题解决了。**
+> 两次归因都看着很有道理（源码路径也读对了），但 CI 日志两次都否证了。
+> **`dpt`/`palantir` 逐位相同这条线索，一开始就该让"BLAS"出局** ——
+> 真是归约顺序的话，同一条代码路径上的其他方法也该漂。
 
 ### 9.3 报数的时候
 

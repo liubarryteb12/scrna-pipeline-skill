@@ -56,27 +56,35 @@ jobs:
     # 把浮点结果钉死。**这是"设了种子也没用"的那一类随机源**，
     # 和 UMAP/leiden/scrublet 那些"没设种子"的不是一回事。
     #
-    # **实测（三轮 CI，同一 Python 3.12、同一批包版本）**：
+    # **实测（六轮 CI，同一 Python 3.12、同一批包版本）**：
     #
-    #   commit       dpt       palantir   scfates    拓扑        平均 rho
-    #   8f3f56c0   +0.5856   +0.4674   +0.5644   4/6        +0.6363
-    #   9af13b42   +0.5856   +0.4674   +0.5296   6/8        +0.6254   <- 只改注释
-    #   5b241a3    +0.5856   +0.4674   +0.5328   6/8        +0.6265   <- 钉了下面 4 个
+    #   commit      并行度            dpt       palantir   scfates   拓扑     平均 rho
+    #   8f3f56c0   无钉              +0.5856   +0.4674   +0.5644   4/6     +0.6363
+    #   9af13b42   无钉              +0.5856   +0.4674   +0.5296   6/8     +0.6254  <- 只改注释
+    #   5b241a3    下面 1)+2)        +0.5856   +0.4674   +0.5328   6/8     +0.6265
+    #   db778bb    下面 1)+2)+3)     +0.5856   +0.4674   +0.5328   6/8     +0.6265
+    #   f99eab1    同上              +0.5856   +0.4674   +0.5328   6/8     +0.6265
+    #   e549477    同上              +0.5856   +0.4674   +0.5646   6/8     +0.6353
     #
-    # **第 3 轮证明前 4 个变量没有修好它。** `dpt`/`palantir` 三轮逐位相同，
-    # 恰恰说明 BLAS 不是变量 —— 真正的路径是 scFates 的扩散图：
+    # **下面这三组变量不足以让 scFates 的 rho 可复现**（最后一行几乎回到
+    # 未钉时的 +0.5644）。两次归因都被否证：
     #
-    #   scf.pp.diffusion(device="cpu")           # 签名里没有 seed
-    #     -> palantir.run_diffusion_maps(...)    # 靠默认 seed=0
-    #          -> compute_kernel(backend="scanpy")
-    #               -> scanpy 默认 method="umap" -> pynndescent 近似 kNN
+    #   1) "多线程 BLAS 归约顺序" —— 钉住 1)+2) 后仍从 +0.5296 变 +0.5328
+    #   2) "pynndescent 的 Numba 并行" —— 补上 3) 后三轮仍给
+    #      +0.5328 / +0.5328 / +0.5646
     #
-    # `pynndescent` 是 **Numba `prange` 并行**的，候选堆更新顺序依赖线程调度，
-    # **给了 random_state 也不保证逐位可复现**。而 Numba 的线程数由
-    # `NUMBA_NUM_THREADS` 控制，**不是 OMP_NUM_THREADS** —— 所以补第 5 个。
+    # **它们确实修好了一件事：离散的拓扑稳住了** —— A 轮是 4 片段/6
+    # milestone，之后六轮全部是 6 片段/8 milestone。所以不是白做，
+    # **但不要以为设了就可复现。**
     #
-    # 然后 simpleppt 的 PPT 主曲线树对输入末位差异极其敏感：
-    # 会拟合成另一个拓扑，再被 pseudotime() 放大成可见的 rho 变化。
+    # `dpt` 与 `palantir` 六轮逐位相同，说明变量只在 scFates 那条路径上。
+    # 残留随机源**尚未定位** —— 第三次动手前先读日志（AGENTS 规则 12），
+    # 并把 `trajectory_status.json` 的 `reproducibility` 一起更新。
+    #
+    # 根因线索：`scFates.pp.diffusion`（1.2.5）**签名里没有 seed**，
+    # 内部走 `palantir.run_diffusion_maps` → `compute_kernel(backend="scanpy")`
+    # → scanpy 默认 `method="umap"`；然后 simpleppt 的 PPT 主曲线树
+    # 把上游的末位差异放大成可见的 rho 变化。
     env:
       # 1) 线程数：多线程归约的求和顺序取决于线程调度，每次运行都不同。
       OMP_NUM_THREADS: 1
@@ -88,7 +96,8 @@ jobs:
       #    Azure 区域内也不单一。钉住内核类型后不再取决于宿主 CPU。
       OPENBLAS_CORETYPE: Haswell
       # 3) Numba 的线程池。**和上面两组是三个独立的旋钮** ——
-      #    pynndescent（scanpy 默认的近似 kNN）走的是这条，不走 BLAS。
+      #    Numba 的 `prange` 线程数由它控制，不走 OMP/MKL。
+      #    **但实测它也没解决 scFates 的漂移**（见上表最后一行）。
       NUMBA_NUM_THREADS: 1
 
     steps:

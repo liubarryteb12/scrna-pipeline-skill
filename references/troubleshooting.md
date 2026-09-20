@@ -266,15 +266,21 @@ scf.pp.diffusion(device="cpu")            # 签名里没有 seed
 |---|---|
 | `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `MKL_NUM_THREADS` | BLAS 归约顺序 |
 | `OPENBLAS_CORETYPE=Haswell` | OpenBLAS 按宿主 CPU 型号分发 SIMD 内核 |
-| **`NUMBA_NUM_THREADS=1`** | **Numba `prange` 的线程数 —— `pynndescent` 走这条** |
+| `NUMBA_NUM_THREADS=1` | Numba `prange` 的线程数 |
 
-> **只钉前两组是不够的。** 实测钉了前四个变量之后 scFates 仍在变
-> （`+0.5296` → `+0.5328`，拓扑恰好都落在 6/8，**只看拓扑会以为修好了**）。
-> `NUMBA_NUM_THREADS` 是补上的第五个。
+> **但实测这五个变量不足以让 scFates 的 ρ 可复现。** 补上
+> `NUMBA_NUM_THREADS=1` 之后三轮 CI 仍给 `+0.5328` / `+0.5328` /
+> **`+0.5646`**（最后那个几乎回到未钉时的 `+0.5644`）。
+>
+> 两次归因都被否证：先怪 BLAS 归约顺序，后怪 `pynndescent` 的 Numba 并行。
+> **钉并行度确实修好了一件事**：离散的拓扑稳住了（A 轮 4 片段/6
+> milestone → 之后六轮全部 6/8）。**它让结构稳定，不足以让 ρ 稳定。**
+>
+> **残留随机源尚未定位。** 第三次动手之前先读日志 —— 别再猜。
 
 **报数要求**：`trajectory_status.json` 的 `reproducibility` 字段会写明
-哪些方法可以按定值报、哪些必须带范围。**别只报一个数** ——
-把方法间的不一致藏起来，比报一个范围糟糕得多。
+哪些方法可以按定值报、哪些必须带范围，以及**被否证的假设**。
+**别只报一个数** —— 把方法间的不一致藏起来，比报一个范围糟糕得多。
 
 ### 通用排查顺序
 
