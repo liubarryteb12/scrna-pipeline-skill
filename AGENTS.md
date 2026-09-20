@@ -323,3 +323,58 @@ runner 的出网策略、换镜像、加超时 —— 而真正要改的只有�
 工具跑不成时（`model_unavailable` / `package_missing` / `failed`），
 验收项**可见但非阻断**（`required=False`）：那是环境问题不是分析错了，
 但**绝不能混在绿字里** —— 规则 4 的同一条理由。
+
+## 20. `set_seed()` 管不到"库内部的迭代求解器"
+
+姊妹项目 `geo-normal-pipeline-skill` 的规则 12 记了同一类问题（那边是极小的
+P 值把浮点末位放大到可见）。单细胞这边实测的表现是**拓扑变了**。
+
+**证据（同一 Python 3.12、同一批包版本的两轮 CI）：**
+
+| 轮次 | commit | 四条轨迹平均 ρ | scFates 拓扑 |
+|---|---|---|---|
+| A | `8f3f56c0` | `+0.6363` | 4 个片段，6 个 milestone |
+| B | `9af13b42`（**只改了注释**） | `+0.6254` | 6 个片段，8 个 milestone |
+
+逐方法比对定位到 **scFates 一个**：`dpt` `+0.5856`、`palantir` `+0.4674`
+两轮**完全相同**，只有 `scfates` 从 `+0.5644` 变成 `+0.5296`。
+上游的聚类数、分辨率扫描、CytoTRACE 两轮逐字节一致。
+
+**根因**：`scFates.pp.diffusion`（1.2.5 `preprocessing/diffusion.py`）
+**没有 `seed` 参数**，内部直接
+`eigsh(T, n_components, tol=1e-4, maxiter=1000)`，连 `v0` 都不给。
+`05_trajectory.py` 把 `seed` 传给了 `sct.tree()` 和 `sct.pseudotime()`
+（这两处是对的），但**扩散图那一步根本没地方传** ——
+于是 PPT 主曲线树吃到一个每次都有末位差异的输入，
+拟合成另一个拓扑，再被 `pseudotime()` 放大成可见的 ρ 变化。
+
+### 三条要记住的
+
+1. **看到"我明明设了种子"时，先问"这个函数有没有 seed 参数"。**
+   没有的话设多少遍都没用。`set_seed()` 只覆盖用 numpy/random 的随机调用；
+   第三方库内部的迭代求解器、并行归约、GPU 内核都不在里面。
+   排查顺序：`grep -n seed <包的源码>` —— 看 `seed` 是**出现在签名里**
+   还是**只出现在 docstring 里**。
+2. **限制并行度要在 job 级、两组一起设。** 只设线程数不够 ——
+   OpenBLAS 还会在**运行期**按宿主 CPU 型号分发 SIMD 内核
+   （向量宽度不同 → 归约顺序不同 → 末位不同），这一层线程数管不到。
+   GitHub 托管 runner 的 CPU 型号在同一 Azure 区域内也不单一。
+
+   ```yaml
+   env:
+     OMP_NUM_THREADS: 1
+     OPENBLAS_NUM_THREADS: 1
+     MKL_NUM_THREADS: 1
+     OPENBLAS_CORETYPE: Haswell
+   ```
+
+3. **"版本不同"不是万能借口。** 版本相同也能对不上。别一看到数字变了
+   就归因到版本上 —— 那会掩盖真正的回归。先比对 `key_versions`，
+   相同就怀疑归约顺序。
+
+### 非线性拟合会放大末位差异
+
+这条比"数值差一点点"严重：**域划分、片段数、milestone 数是离散的**，
+末位差异直接体现为**结论变了**（4 个片段 → 6 个片段）。
+所以对这类输出，"跑两遍差不多"是不够的，必须钉死并行度。
+

@@ -53,6 +53,34 @@ jobs:
     # 给 45 分钟留足余量（含装依赖）。
     timeout-minutes: 45
 
+    # 把浮点结果钉死。**这是"设了种子也没用"的那一类随机源**，
+    # 和 UMAP/leiden/scrublet 那些"没设种子"的不是一回事 ——
+    # 只有限制并行度才能消除。姊妹项目 `geo-normal-pipeline-skill`
+    # 的 AGENTS 规则 12 有完整实测记录，这里是同一套处理。
+    #
+    # **实测（本轮）**：同一份代码、只改注释的 commit `9af13b42`
+    # 前后两轮 CI，轨迹一致性从 rho=+0.6363 变成 +0.6254。
+    # 逐方法对比后定位到 **scFates 一个**（dpt +0.5856、palantir +0.4674
+    # 两轮完全相同），而它的**拓扑本身也变了**：
+    # 「4 个片段，6 个 milestone」→「6 个片段，8 个 milestone」。
+    #
+    # 为什么种子管不到：`scFates.pp.diffusion` **没有 seed 参数**
+    # （1.2.5 的 `preprocessing/diffusion.py`），内部直接
+    # `eigsh(T, n_components, tol=1e-4, maxiter=1000)` 也不给 `v0`；
+    # 后面 PPT 主曲线树对输入的微小差异极其敏感 ——
+    # 末位差异会把树拟合成另一个拓扑，再被 pseudotime 放大成可见的 rho 变化。
+    # **这不是 scFates 的 bug，是"多线程 BLAS 归约顺序"在非线性拟合里的放大。**
+    env:
+      # 1) 线程数：多线程归约的求和顺序取决于线程调度，每次运行都不同。
+      OMP_NUM_THREADS: 1
+      OPENBLAS_NUM_THREADS: 1
+      MKL_NUM_THREADS: 1
+      # 2) 内核选择：OpenBLAS 在**运行期**按检测到的 CPU 型号分发 SIMD 内核
+      #    （SSE/AVX2/AVX512 向量宽度不同 → 归约顺序不同 → 末位不同）。
+      #    这一层线程数管不到；GitHub 托管 runner 的 CPU 型号在同一
+      #    Azure 区域内也不单一。钉住内核类型后不再取决于宿主 CPU。
+      OPENBLAS_CORETYPE: Haswell
+
     steps:
       - uses: actions/checkout@v4
 
