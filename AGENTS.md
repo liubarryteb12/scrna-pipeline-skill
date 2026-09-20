@@ -455,4 +455,30 @@ scf.pp.diffusion(device="cpu")
 
 `dpt` / `palantir` / `cytotrace` 六轮逐位相同，可以按确定值报。
 
+---
+
+## 21. 文档改动走独立的 `docs_check.yml`
+
+`scrna_analysis.yml` 有 `paths:` 过滤（只跑 `scripts/` `tools/` `assets/`
+`requirements.txt`），**`*.md` 的改动不触发它** —— 所以文档里的死链接
+以前**没有任何门禁能挡住**，CI 每次都是绿的。
+
+实测就踩到了：`references/methods.md` 与 `references/troubleshooting.md`
+让读者去看 `pseudotime.py` 第 254 行，**但没说那是哪个包的** ——
+它是 scFates 包内的文件，不在本仓库里。
+
+现在 `tools/check_doc_refs.mjs` + `.github/workflows/docs_check.yml` 兜住这一类，
+**约 20 秒**、不装依赖、不跑分析。两个逃生舱写在工具文件头：
+
+| 逃生舱 | 标记 | 为什么必须写 |
+|---|---|---|
+| 指向**已删**的文件 | 已删 / 已移除 / 不再存在 / 曾经 / 当时的 / deleted | 读者要能区分"历史"和"笔误" |
+| 指向**第三方包**源码 | 包内 / 上游 / 源码 / site-packages / 该包 | 读者要知道去哪个包里翻 |
+
+**两个逃生舱都故意做成"要写一句话"的** —— 静默豁免会让检查退化成没有检查。
+
+> **为什么文档不并进主 workflow：** 那样改一个错别字要跑完整的单细胞流水线
+> （约 25 分钟），而且会被主流水线的偶发失败牵连 —— 文档改动因无关原因判红，
+> 反而让"每次推送 CI 必须绿"这条失效。
+
 

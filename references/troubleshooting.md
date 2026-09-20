@@ -199,8 +199,8 @@ matplotlib 3.9 把 `labels` 改名为 `tick_labels`，3.11 起旧名字直接报
 
 **原因：漏了 `tl.cleanup()`。** 官方顺序是
 `pp.diffusion → tl.tree → tl.cleanup → tl.root → tl.pseudotime`。
-不 cleanup 时 `map_cells` 要读 `graph['milestones']`，而它直到
-`pseudotime.py` 第 254 行才被写入 —— 调用在第 87 行，顺序矛盾。
+不 cleanup 时 `map_cells` 要读 `graph['milestones']`，而它直到 scFates
+包内的 `pseudotime.py` 第 254 行才被写入 —— 调用在第 87 行，顺序矛盾。
 
 ### `scFates` 报 `rpy2 installation is necessary`
 

@@ -293,8 +293,8 @@ DPT 从根出发，根选在早期还是晚期，整条轴就反过来。所以�
    `diffusion → tree → cleanup → root → pseudotime`。漏掉 cleanup 时
    `pseudotime()` 必定崩在
    `pd.Series(uns['graph']['milestones']) == t][0]` 的 IndexError ——
-   因为 `map_cells` 读 milestones 时它还没被写入（写入在
-   `pseudotime.py` 第 254 行，而调用在第 87 行）。
+   因为 `map_cells` 读 milestones 时它还没被写入（scFates 包内的
+   `pseudotime.py` 第 254 行才写入，而调用在第 87 行）。
 2. **`tl.test_association` / `tl.test_fork` 需要 rpy2 + R + mgcv。**
    这与"云端不装 R"的设计冲突，所以**没有用**这两个函数 ——
    沿轨迹的基因分析是本仓库自己实现的。

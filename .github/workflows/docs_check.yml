@@ -1,0 +1,54 @@
+name: Docs check
+
+# ============================================================================
+# 文档引用检查（只查 *.md，约 20 秒）
+# ============================================================================
+# **为什么需要单独一个 workflow：**
+#
+# 主 workflow（scrna_analysis.yml）有 `paths:` 过滤，只跑
+# scripts/ tools/ assets/ —— **`*.md` 的改动根本不触发 CI**。
+# 所以文档里指向已删文件的死链接可以一直躺着，CI 每次都是绿的。
+#
+# 实测就踩到了：`AGENTS.md` 规则 29 让读者去跑 `_smoke_survival_diag.py`，
+# 而那个文件早就删了。这类错误**当时没有任何门禁能挡住**。
+#
+# **为什么不把 *.md 加进主 workflow 的 paths：**
+# 那样改一个错别字就要跑完整的 R 流水线（约 25 分钟），
+# 而且会把这个 job 暴露在主流水线的偶发失败之下（geo 的浮点末位分叉
+# 有实测记录，见 AGENTS 规则 12）—— 文档改动被无关原因判红，
+# 反而让"每次推送 CI 必须绿"这条约束失效。
+#
+# 所以：**文档改动走这条轻量通道**，只做静态检查，不装 R / 不跑分析。
+# ============================================================================
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/*.md"
+      - "tools/check_doc_refs.mjs"
+      - ".github/workflows/docs_check.yml"
+  pull_request:
+    paths:
+      - "**/*.md"
+      - "tools/check_doc_refs.mjs"
+      - ".github/workflows/docs_check.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  doc_refs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # 判据：文档里引用的仓库文件必须真的存在。
+      # 见 tools/check_doc_refs.mjs 文件头的完整说明与两个逃生舱。
+      - name: Check doc references point at real files
+        run: node tools/check_doc_refs.mjs
