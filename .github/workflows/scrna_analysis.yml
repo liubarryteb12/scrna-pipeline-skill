@@ -167,6 +167,14 @@ jobs:
       - name: 检查图不是空白
         run: node tools/check_figures.mjs results/pbmc3k/figures
 
+      # 图幅（毫米）是否符合栏宽约定（规则 13）。
+      # 上一步只看"有没有墨"，看不出图**有多宽** ——
+      # 宽度随类别数增长的图（`max(...)` 只夹下限）会一直长下去，
+      # 而它在"有墨迹"这个判据下永远是通过的。
+      # 这里读 PDF 的 /MediaBox 换算成毫米，超出 W_DOUBLE 就红。
+      - name: 检查图幅在栏宽以内
+        run: node tools/check_fig_sizes.mjs results/pbmc3k/figures
+
       - name: 汇总产物
         if: always()
         run: |
