@@ -268,3 +268,58 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 **靶基因名与权重必须成对取** —— 分开写（一个列表取名字、另一个按位置取
 相关系数）在过滤 `corr > 0` 之后会错位，而错位不报错，
 只会给每个靶基因配上一个别人的相关系数。
+
+
+## 18. 笼统的 `except Exception` 会把代码 bug 记成环境问题
+
+`try_celltypist()` 的第一版把 `celltypist.models_path` 当成
+`pathlib.Path` 用了：
+
+```python
+path = ctm.models_path / info["model"]     # TypeError: str / str
+```
+
+而它其实是 **`str`**（`models.py:19` 是 `os.path.join(data_path, "models")`）。
+这个 `TypeError` 被下面那个笼统的 `except Exception` 接住，于是状态里
+写成：
+
+> 模型 `Immune_All_Low.pkl` 拿不到（TypeError: ...）—— **CI 可能无外网**
+
+**一个纯本地代码 / API 版本 bug 被记成了网络问题。** 下一个人会去查
+runner 的出网策略、换镜像、加超时 —— 而真正要改的只有那一行。
+（实测模型服务器 `celltypist.cog.sanger.ac.uk` 一直是可达的。）
+
+所以**兜底的 `except Exception` 里必须把失败分类**，而不是把
+`type(exc).__name__` 原样拼进一句预设的结论。现在拆成三类：
+
+| 失败点 | status | 说明 |
+|---|---|---|
+| 路径构造 | `failed` | celltypist API 与调用方不匹配，**不是网络问题** |
+| 下载抛异常 | `model_unavailable` | 服务器不可达或超时 |
+| 下载没抛异常但文件仍不在 | `model_unavailable` | 名字不在模型清单里 |
+
+第 3 类必须单独查：`download_models` 内部把每个模型的下载异常
+**吞掉只打日志**（`models.py:512-517`），所以"下载失败"并不总是抛出来 ——
+只看有没有异常会把"清单里没这个名字"漏成"下载成功"。
+
+**规则：`except Exception` 里不要写结论，写事实。**
+`{type(exc).__name__}: {exc}` 是事实；"CI 可能无外网"是猜测。
+猜测写进产物就会被当成证据。
+
+## 19. 点名工具跑了，就必须量化它与自建方法的一致性
+
+和空间仓库同一条（那边写在 `spatial-pipeline-skill/AGENTS.md` 规则 20）。
+
+**"跑通了"不是结论。** `main_analysis.py` 里 §2.4 CellTypist 与
+§2.7 LIANA 的验收项分两层：
+
+1. `status == "ok"` —— 工具跑成了没有
+2. `compared == True` —— **它与自建方法的差异被量化了没有**
+
+第 2 层是容易被省掉的。实测 LIANA 与自建打分的 Spearman rho ≈ 0.13，
+而 top25 重叠 24/25 —— **头部一致、中段排序差异大**。
+只报"LIANA 跑通了"会把这两件事都藏起来。
+
+工具跑不成时（`model_unavailable` / `package_missing` / `failed`），
+验收项**可见但非阻断**（`required=False`）：那是环境问题不是分析错了，
+但**绝不能混在绿字里** —— 规则 4 的同一条理由。

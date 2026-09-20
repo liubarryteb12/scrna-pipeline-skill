@@ -134,11 +134,34 @@ doi:10.1038/s41598-019-41695-z
 **margin 小的 assignment 不该被当成结论** —— 只报类型名等于把
 不确定性藏起来。
 
+### 第二条独立证据：CellTypist（文档 §2.4 点名，**本流水线已实现**）
+
+marker 打分是**无监督**的：它只知道"这个簇里这几个基因高"。
+CellTypist 用预训练的 logistic 回归模型（免疫图谱）给每个细胞打分，
+是**独立的第二条证据**。两者不一致的簇才值得人工看。
+
+- 模型：`Immune_All_Low.pkl`（可在 config 里改 `analysis.celltypist_model`）
+- 输入：**`adata.raw` 全基因集**，不是 HVG 子集 —— 模型依赖的大部分基因
+  不在 HVG 里，喂 HVG 会让标签退化成噪声
+- 一致性的量化在**簇层面**（marker 给每簇一个标签，CellTypist 给每个细胞
+  一个标签，先按簇取众数再比），并报每簇的 `celltypist_purity`
+- 跑不成时如实记 `package_missing` / `model_unavailable` / `failed`，
+  **marker 打分仍然是主结果**，不会因为第二条证据缺失而消失
+
+**一个踩过的坑（值得记下来）：** 第一版把 `celltypist.models_path` 当成
+`pathlib.Path` 用了（`models_path / model_name`），而它其实是 **`str`**
+（`models.py:19` 是 `os.path.join(...)`）—— 抛 `TypeError`。
+那个 `TypeError` 被笼统的 `except Exception` 接住，于是状态里写成
+**「模型拿不到 —— CI 可能无外网」**。**一个纯本地代码 bug 被记成了网络问题**，
+下一个人会去查 runner 的出网策略。现在失败被拆成三类分别记原因：
+路径构造失败 → `failed`；下载抛异常 / 下载后文件仍不存在 →
+`model_unavailable`。
+
 ### 更严格的做法（本流水线未实现）
 
 - 有参考数据集时用 **label transfer**（Seurat 的 `FindTransferAnchors`
   或 scanpy 的 `sc.tl.ingest`）
-- 用 **scANVI / CellTypist** 这类有监督模型
+- 用 **scANVI** 这类需要自己训练的有监督模型（CellTypist 用的是现成模型）
 - 人工核对每个簇的 marker 后再定名
 
 ---
@@ -302,27 +325,42 @@ DPT 从根出发，根选在早期还是晚期，整条轴就反过来。所以�
 `配体在发送簇的平均表达 × 受体在接收簇的平均表达`，
 配合簇标签置换检验（200 次）+ BH 多重检验校正。
 
-### 标准工具（本流水线未用）
+### 主工具：LIANA（文档 §2.7 点名，**本流水线已跑**）
 
 - **LIANA**：Dimitrov D, et al. "Comparison of methods and resources for
   cell–cell communication inference from single-cell RNA-Seq data."
   *Nature Communications* 2022. doi:10.1038/s41467-022-30755-0
+
+LIANA 把多个通讯打分方法（CellPhoneDB / NATMI / Connectome / logFC 等）
+聚合成一个 **consensus rank aggregate**。本流水线跑它的
+`rank_aggregate`，用的是**全基因集**（`adata.raw`），与自建打分同一套
+簇标签。**两者用同一份输入，所以差异只来自方法本身** —— 这才是有信息量的
+对照。产物里报共同组合数、Spearman rho、top25 重叠。
+
+**与自建打分的差异必须报，不能只报"跑通了"。** 实测 rho 并不高
+（≈0.13），top25 却重叠 24/25 —— 这说明**头部一致、中段排序差异大**。
+只报一个数会把这两件事混成一件。
+
+### 其他标准工具（本流水线未用）
+
 - **CellChat**：Jin S, et al. "Inference and analysis of cell-cell
   communication using CellChat." *Nature Communications* 2021.
-  doi:10.1038/s41467-021-21246-9
+  doi:10.1038/s41467-021-21246-9 —— R 包，CI 不装 R
 - **CellPhoneDB v2**：Efremova M, Vento-Tormo M, Teichmann SA, Vento-Tormo R.
   "CellPhoneDB: inferring cell–cell communication from combined expression
   of multi-subunit ligand–receptor complexes." *Nature Protocols* 2020.
-  doi:10.1038/s41596-020-0292-x
+  doi:10.1038/s41596-020-0292-x —— LIANA 内部已调用它的打分方法
 
 ### 适用范围（关键）
 
 1. **共表达不等于通讯。** 没有空间信息时，只能说两类细胞**分别**
    表达了配体和受体，不代表它们在组织里相邻
 2. 表达量是稳态丰度，**不等于蛋白水平，也不等于分泌量**
-3. 打分是启发式，**不是 LIANA 的 consensus rank aggregate**
+3. **自建打分是启发式，不是 consensus rank aggregate** —— 所以主结论
+   以 LIANA 为准，自建打分作为可复算的对照
 4. **内置库只有 38 对**（免疫为主），远少于 CellChatDB 的数千对。
-   覆盖不全时"没找到显著通讯"是**假阴性**，不是真的没有通讯
+   LIANA 用的是它自带的 `consensus` 资源，对数多得多；
+   两个来源的"没找到显著通讯"都是**假阴性**，不是真的没有通讯
 
 ---
 

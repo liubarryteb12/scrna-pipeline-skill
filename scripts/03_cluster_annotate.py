@@ -140,23 +140,73 @@ def try_celltypist(adata, cfg: dict, log=log_info):
         log(f"CellTypist 不可用：{info['reason']}")
         return None, info
 
-    info["version"] = getattr(celltypist, "__version__", "unknown")
+    # **版本要拿得到，不能写 "unknown"。** `celltypist.__version__` 不一定存在
+    # （它没在 `__init__.py` 里保证导出），而"用的是哪个版本的模型/代码"
+    # 是复现的前提 —— 这正是模块零 §0.3 要记的东西。所以退回发行版元数据。
+    info["version"] = getattr(celltypist, "__version__", None)
+    if not info["version"]:
+        try:
+            from importlib import metadata as _md
+            info["version"] = _md.version("celltypist")
+        except Exception:  # noqa: BLE001
+            info["version"] = "unknown"
 
-    # 模型：先看本地有没有，没有才下载（下载失败不算致命）
+    # ---- 模型文件：先看本地有没有，没有才下载 --------------------------------
+    #
+    # **`models_path` 是 `str`，不是 `Path`。** celltypist 1.7.1 的
+    # `models.py:19` 是 `models_path = os.path.join(data_path, "models")`，
+    # 对它做 `/` 直接抛
+    # `TypeError: unsupported operand type(s) for /: 'str' and 'str'`。
+    #
+    # 实测（run 35486399043）这个 TypeError 被下面那个笼统的
+    # `except Exception` 接住，于是记成了
+    # **「模型拿不到 —— CI 可能无外网」** —— 一个纯本地代码/API 版本 bug
+    # 被写成了网络问题。**归因错了比报错更糟**：下一个人会去查 runner 的
+    # 出网策略、换镜像、加超时，而真正要改的是这一行。
+    #
+    # 所以这里把失败拆成三类，各自记自己的原因：
+    #   1. 路径构造失败（本地代码 / celltypist API 变了）→ status="failed"
+    #   2. 下载抛异常（网络）                            → "model_unavailable"
+    #   3. 下载没抛异常但文件仍不在（名字不在清单里）     → "model_unavailable"
+    #
+    # 第 3 类必须单独查：`download_models` 内部把每个模型的下载异常
+    # **吞掉只打日志**（models.py:512-517），所以"下载失败"并不总是抛出来。
+    from pathlib import Path as _Path
+
     try:
-        path = ctm.models_path / info["model"]
-        if not path.exists():
-            log(f"CellTypist 模型 {info['model']} 不在本地，尝试下载…")
-            ctm.download_models(model=info["model"])
-            info["downloaded"] = True
-        else:
-            info["downloaded"] = False
+        models_dir = _Path(ctm.models_path)      # str -> Path，见上面的说明
     except Exception as exc:  # noqa: BLE001
-        info["status"] = "model_unavailable"
-        info["reason"] = (f"模型 {info['model']} 拿不到"
-                          f"（{type(exc).__name__}: {exc}）—— CI 可能无外网")
+        info["status"] = "failed"
+        info["reason"] = (f"celltypist.models_path 解析失败"
+                          f"（{type(exc).__name__}: {exc}）—— 这是 celltypist "
+                          f"API 与调用方不匹配，**不是网络问题**")
         log_warn(f"CellTypist 不可用：{info['reason']}")
         return None, info
+
+    info["models_dir"] = str(models_dir)
+    model_file = models_dir / info["model"]
+    if model_file.exists():
+        info["downloaded"] = False
+    else:
+        log(f"CellTypist 模型 {info['model']} 不在本地，尝试下载…")
+        try:
+            ctm.download_models(model=info["model"])
+            info["downloaded"] = True
+        except Exception as exc:  # noqa: BLE001
+            info["status"] = "model_unavailable"
+            info["reason"] = (f"模型 {info['model']} 下载失败"
+                              f"（{type(exc).__name__}: {exc}）—— 模型服务器 "
+                              f"celltypist.cog.sanger.ac.uk 不可达或超时")
+            log_warn(f"CellTypist 不可用：{info['reason']}")
+            return None, info
+        if not model_file.exists():
+            info["status"] = "model_unavailable"
+            info["reason"] = (f"download_models 未抛异常，但 {model_file} 仍不存在 —— "
+                              f"该名字可能不在 celltypist 的模型清单里"
+                              f"（模型清单见 https://celltypist.cog.sanger.ac.uk/models/models.json）")
+            log_warn(f"CellTypist 不可用：{info['reason']}")
+            return None, info
+    info["model_bytes"] = int(model_file.stat().st_size)
 
     try:
         # 用全基因集，不是 HVG 子集 —— 见上面的说明

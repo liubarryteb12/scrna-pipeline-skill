@@ -114,9 +114,27 @@ python scripts/main_analysis.py --config assets/config.my_data.yml
   `score_margin`（第一名与第二名的差）。实测 pbmc3k 里簇 2 和 6 的
   margin 是 **0.0** —— 因为 `T_cell` 和 `CD4_T` 的 marker 完全重叠，
   打分法分不开。`assignment_confident: false` 如实标出。
+- **第二条独立证据**：文档 §2.4 点名的 **CellTypist** 也在跑
+  （预训练免疫图谱模型，输入走 `adata.raw` 全基因集）。两者在**簇层面**
+  的一致率会落盘，不一致的簇值得人工看。它跑不成时如实记
+  `model_unavailable` / `package_missing` / `failed` 并写明原因 ——
+  **marker 打分仍是主结果，不会因为第二条证据缺失而消失。**
 - **轨迹**：没有 RNA 速率时拟时序**不能**说明方向性，只能说明相似度
   排序。`trajectory_status.json` 的 `limitations` 字段写明了这一点，
   以及根是怎么选的。
+
+### 4. 点名的具名工具：跑了哪些、没跑哪些、为什么
+
+| § | 工具 | 状态 |
+|---|---|---|
+| §2.4 | **CellTypist** | **跑了**（自动注释，与 marker 打分对照） |
+| §2.7 | **LIANA** | **跑了**（`rank_aggregate`，与自建共表达打分对照） |
+| §1.7/§1.8 | scTenifoldKnk / PerturbNet / RegVelo | 装不上（R 包 / `requires_python` 不支持 3.12 / 缺 spliced 层） |
+
+**"跑通了"不是结论。** 两个跑起来的工具都报与自建方法的**一致性**
+（簇层面一致率 / Spearman rho + top25 重叠），因为差异本身才是信息。
+实测 LIANA 与自建打分 rho ≈ 0.13 而 top25 重叠 24/25 ——
+**头部一致、中段排序差异大**，只报一个数会把这两件事混成一件。
 
 ## 换成自己的数据
 
