@@ -170,6 +170,50 @@ for (const f of files) {
   }
 }
 
+// ---- 3b. `PAL["xxx"]` / `PAL.get("xxx")` 的键必须真的存在 ---------------
+//
+// **为什么需要这道检查（2026-09-20 实测）：** 给 `svg_stat_distribution`
+// 加显著性参考线时写了 `PAL["up"]` —— 那是 **geo（R 侧）**的语义键，
+// 本仓库的 PAL 里只有 `highlight` / `primary` / `muted` / 定性色。
+// 本地静态检查全绿（`PAL` 这个**名字**确实 import 了），CI 跑到 svg
+// 步骤才 `KeyError: 'up'`、整步判红。
+//
+// `PAL` 键是**本仓库自己的字典**，本地完全查得到 —— 所以这类错误
+// 必须在本地挡住，不能留到云端。判据：从 common.py 里解析出 PAL 的
+// 字面量键集合，再扫所有脚本的 `PAL["k"]` / `PAL.get("k")` 用法。
+function palKeysFrom(src) {
+  const m = src.match(/^PAL\s*=\s*\{([\s\S]*?)^\}/m);
+  if (!m) return null;
+  return new Set([...m[1].matchAll(/^\s*"([A-Za-z0-9_]+)"\s*:/gm)].map((x) => x[1]));
+}
+
+const commonPath = join(REPO, "scripts", "lib", "common.py");
+const PAL_KEYS = palKeysFrom(readFileSync(commonPath, "utf8"));
+if (!PAL_KEYS || PAL_KEYS.size === 0) {
+  console.error("  无法从 scripts/lib/common.py 解析出 PAL 的键 —— 检查器本身失效了，不是通过");
+  failed++;
+} else {
+  for (const f of files) {
+    const rel = relative(REPO, f).replace(/\\/g, "/");
+    if (rel === "scripts/lib/common.py") continue;
+    // **必须在原始源码上扫，不能用 stripComments 的结果。**
+    // `stripComments` 会把所有字符串字面量换成 `""`，于是 `PAL["up"]`
+    // 变成 `PAL[""]` —— 检查器把要检查的东西本身擦掉了。
+    // （与 `check_r_syntax` 当年"stripLiterals 擦掉隐式拼接"同一个坑：
+    //  负向验证时它照样报"通过"。所以这里对原文做正则。）
+    const raw = readFileSync(f, "utf8");
+    for (const m of raw.matchAll(/PAL(?:\.get)?\[\s*"([A-Za-z0-9_]+)"\s*\]/g)) {
+      if (!PAL_KEYS.has(m[1])) {
+        const line = raw.slice(0, m.index).split("\n").length;
+        console.error(`  ${rel}:${line}  PAL 里没有键 "${m[1]}"`);
+        console.error(`      可用键：${[...PAL_KEYS].sort().join(", ")}`);
+        console.error(`      -> 这类 KeyError 本地就能查，不要留到 CI`);
+        failed++;
+      }
+    }
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} 项检查失败`);
   process.exit(1);
