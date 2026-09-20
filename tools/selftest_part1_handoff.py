@@ -150,12 +150,72 @@ def main() -> int:
                 log_info("**FAIL**：`module_label` 没有被记进 lost_fields —— "
                          "上游多出来的列被静默丢掉了")
                 ok = False
+            # **反过来也要断言：留下的不能出现在丢失清单里。**
+            # 第一版把"除 gene 外的所有列"都算成丢失，于是 `logfc`
+            # 被报成"丢了" —— 而它明明是唯一跨部分传过来的数值列。
+            # **把留下的说成丢掉的，方向和事实正好相反**，比不记更糟。
+            # 这条断言就是被那次云端日志逼出来的（CI 打出
+            # `丢失字段（2 个）：['logfc', 'module_label']`）。
+            _wrong = [x for x in lost if "logfc" in str(x).lower()
+                      and "列名" not in str(x)]
+            if _wrong:
+                log_info(f"**FAIL**：{_wrong} 被报成丢失，但它是**留下的** —— "
+                         "`after.kept_columns` 里明明写着 logfc")
+                ok = False
             # before/after 的维度必须是数，不是占位符
             b, a = e.get("before") or {}, e.get("after") or {}
             if b.get("n_cols") != 3 or a.get("n_genes") != len(genes):
                 log_info(f"**FAIL**：before/after 维度不对 —— "
                          f"before={b}, after={a}")
                 ok = False
+            if a.get("n_with_logfc") != len(genes):
+                log_info(f"**FAIL**：after.n_with_logfc={a.get('n_with_logfc')}，"
+                         f"应该是 {len(genes)}")
+                ok = False
+
+        # ---- 5. 第二例：列名别名 + 列序打乱 ---------------------------------
+        #
+        # 第一例的列名是"理想情况"。Part 1 真交接过来的表列名大小写不定
+        # （`logFC` / `log2FC` / `log_fc`），列序也不保证。**别名匹配坏了
+        # 不报错，只会让 `signature_alignment` 静默变成 NaN** ——
+        # 而 NaN 和"真的没有相关性"长得一样。
+        #
+        # 这一例还断言**改名本身被记进 note**：上游那列叫 `log2FC`，
+        # 下游叫 `logfc`，不说清楚下一个人会以为上游本来就叫 `logfc`。
+        _fx2 = data_dir / "part2_targets_selftest_alias.csv"
+        pd.DataFrame({
+            "symbol": genes,                       # gene 的别名列名
+            "n_sources": [3] * len(genes),         # 该丢的
+            "log2FC": [1.8, -0.9, 0.4, 0.0, -1.2, 0.7,
+                       1.1, -0.3, 0.6, -0.8, 0.2, -0.5],
+        }).to_csv(_fx2, index=False)
+        cfg_selftest["perturbation"]["targets_csv"] = _fx2.name
+        out2, src2 = vp.load_targets(cfg_selftest, reg)
+        log_info(f"别名例：source={src2}，{len(out2)} 个基因，"
+                 f"含 logFC 的 {int(out2['logfc'].notna().sum())} 个")
+        if not src2.startswith("part1_handoff:"):
+            log_info(f"**FAIL**：`symbol` 列没被认成基因列（source={src2}）—— "
+                     "Part 1 换个列名就静默回退了")
+            ok = False
+        if int(out2["logfc"].notna().sum()) != len(genes):
+            log_info("**FAIL**：`log2FC` 没被认成 logFC 列 —— "
+                     "下游 signature_alignment 会是 NaN，而且不报错")
+            ok = False
+        _m2 = read_manifest(cfg_selftest)
+        _e2 = (_m2.get("cross_language") or [{}])[-1]
+        _lost2 = _e2.get("lost_fields") or []
+        log_info(f"  别名例丢失字段：{_lost2}")
+        if not any("n_sources" in str(x) for x in _lost2):
+            log_info("**FAIL**：`n_sources` 没被记进丢失字段")
+            ok = False
+        if any("log2fc" in str(x).lower() and "列名" not in str(x)
+               for x in _lost2):
+            log_info("**FAIL**：`log2FC` 被报成丢失，但它是留下的那一列")
+            ok = False
+        if "log2FC" not in str(_e2.get("note") or ""):
+            log_info("**FAIL**：列名归一（`log2FC` → `logfc`）没有记进 note —— "
+                     "下游会以为上游本来就叫 `logfc`")
+            ok = False
 
     log_info("自检" + ("通过" if ok else "**失败**"))
     return 0 if ok else 1

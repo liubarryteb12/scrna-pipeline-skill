@@ -140,11 +140,22 @@ def load_targets(cfg: dict, reg: pd.DataFrame) -> tuple:
                 # §0.2 跨语言转换记录。**这是本仓库唯一一处真正的跨语言交接** ——
                 # 上游是 R（Part 1 的 `09_export_targets.R`），下游是 Python。
                 #
-                # 记的是"丢了什么"，不是"传了什么"：`gene` 留下，
-                # 其余列**全部**进 `lost_fields`。Part 1 那边同一件事也记了一条
-                # （`record_cross_language` 的 before/after 从 R 侧视角写），
-                # 两条合起来才能核对"两边说的是不是同一批字段"。
-                _lost = [c for c in df.columns if c != gcol]
+                # 记的是"丢了什么"，不是"传了什么"。
+                #
+                # **`lost` 里不能出现 `gene` 或 logFC 那一列** —— 它们是
+                # **留下的**。第一版写成"除 gene 外的所有列"，于是把
+                # `logfc` 也报成了"丢失" —— 而它明明是唯一跨部分传过来的
+                # 数值列。**把留下的说成丢掉的，方向和事实正好相反**，
+                # 比不记更糟。CI 里的 `tools/selftest_part1_handoff.py`
+                # 现在会断言这一点。
+                #
+                # 列名大小写不定（`logFC` / `log2FC` / `log_fc`），所以
+                # **改名**本身也是信息：记进 `note`，否则下游会以为
+                # 上游那一列本来就叫 `logfc`。
+                _kept = {gcol} | ({fcol} if fcol else set())
+                _lost = [c for c in df.columns if c not in _kept]
+                _rename = (f"`{fcol}` → `logfc`（列名别名归一）"
+                           if fcol and fcol != "logfc" else "")
                 if fcol is None:
                     _lost.append("logFC 列（上游有，但列名不在这批别名里 → "
                                  "signature_alignment 会是 NaN）")
@@ -162,7 +173,8 @@ def load_targets(cfg: dict, reg: pd.DataFrame) -> tuple:
                           "本仓库也不用 zellkonverter / anndata2ri）。"
                           "`logfc` 是**唯一**跨部分传过来的数值列；"
                           "Part 1 的模块归属、来源计数等没有交接，"
-                          "所以这边无法按来源分层看扰动结果。"))
+                          "所以这边无法按来源分层看扰动结果。"
+                          + (f" 列名归一：{_rename}。" if _rename else "")))
                 return out, f"part1_handoff:{p.name}"
         else:
             log_warn(f"配置指定的 Part 1 交接表不存在: {p} —— 回退到内部调控子")
