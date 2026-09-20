@@ -163,6 +163,16 @@ def run_01_qc(cfg: dict) -> dict:
     }
     fig, axes = plt.subplots(1, len(keys), figsize=(W_DOUBLE, mm(58)))
     axes = np.atleast_1d(axes)
+    # **5 个面板挤 183 mm，长标题会互压/被右缘裁掉**（实测第二轮）：
+    # 标题字号压到 7 并允许两行；像 "Haemoglobin fraction (%)" 这种长名
+    # 手动折行，避免撞上相邻面板。
+    QC_LABELS_SHORT = {
+        "n_genes_by_counts": "Genes\ndetected",
+        "total_counts": "Total\ncounts",
+        "pct_counts_mt": "Mitochondrial\n(%)",
+        "pct_counts_ribo": "Ribosomal\n(%)",
+        "pct_counts_hb": "Haemoglobin\n(%)",
+    }
     for ax, k in zip(axes, keys):
         v = adata.obs[k].astype(float).values
         # **退化面板（IQR=0，如 pbmc3k 的血红蛋白：绝大多数细胞恒为 0）**
@@ -172,11 +182,11 @@ def run_01_qc(cfg: dict) -> dict:
             rng = np.random.default_rng(cfg["analysis"]["seed"])
             ax.scatter(rng.uniform(-0.12, 0.12, len(v)), v, s=2, alpha=0.25,
                        color=PAL["primary"], rasterized=True)
-            ax.set_title(f"{QC_LABELS.get(k, k)}\n(no variance: "
-                         f"{int((v != 0).sum())}/{len(v)} cells non-zero)", fontsize=8)
+            ax.set_title(f"{QC_LABELS_SHORT.get(k, k)}\nno variance: "
+                         f"{int((v != 0).sum())}/{len(v)} cells", fontsize=7)
         else:
+            ax.set_title(QC_LABELS_SHORT.get(k, k), fontsize=7)
             ax.violinplot(v, showmedians=True)
-            ax.set_title(QC_LABELS.get(k, k), fontsize=8)
         ax.set_xticks([])
     fig.suptitle(f"QC metrics before filtering (n={n0})")
     save_fig(cfg, "02-01-01-unit1-qc-violin-before", fig)

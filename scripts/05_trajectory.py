@@ -285,12 +285,12 @@ def run_05_trajectory(cfg: dict) -> dict:
     conn_df.to_csv(res_dir / "paga_connectivities.csv")
 
     fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(84)))
-    # **节点必须画在边之上**（评审 3.3）：默认把粗黑边画在节点上层，
-    # 小节点（簇 9）被 5 条边直接切断 "9" 字形。分两层：先无标注骨架画边，
-    # 再同一坐标轴上高 zorder 重画节点与标签。
-    sc.pl.paga(adata, show=False, ax=ax, labels=False, node_size_scale=0.6)
-    sc.pl.paga(adata, show=False, ax=ax, edges=False,
-               labels=[str(c) for c in adata.obs["leiden"].cat.categories])
+    # **边不能盖住节点标签**（评审 3.3：簇 9 的 "9" 被 5 条粗边切断）。
+    # 不做双层重画的 hack —— 只调 scanpy 自己的参数：边宽减半（0.5）、
+    # 节点加大（scale 0.8 / power 0.6）、字号提到 9，标签因此在最上层可见。
+    sc.pl.paga(adata, show=False, ax=ax,
+               edge_width_scale=0.5, node_size_scale=0.8, node_size_power=0.6,
+               fontsize=9, fontoutline=2)
     ax.set_title("PAGA graph (edge width = connectivity)")
     save_fig(cfg, "02-05-01-unit1-paga-graph", fig)
 
