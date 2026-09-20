@@ -108,10 +108,16 @@ def load_config(path: str) -> dict:
     # **300 dpi 是投稿图的底线，不是"够用就行"。**
     # 原来默认 150：183 mm 宽的图在 150 dpi 下只有 1080 px，放大或印刷后
     # 字形和细线都发虚 —— 而"发虚"从图注上完全看不出来，文件大小也正常。
-    # 实测 PPI 那张图改成 300 后是 2161x2338（原来 1080x1169）。
-    # **改默认值而不是改调用点**：全仓库没有任何一处传过 `dpi`，
-    # 所以这里一处就等于修好所有 PNG（PDF 是矢量，dpi 只影响 PNG）。
-    # 姊妹项目 geo-normal-pipeline-skill 的 `save_pdf()` 是同一条改动。
+    #
+    # **注意这只是兜底，改它并不够。**
+    # `assets/config.pbmc3k.yml` 里显式写了 `figure_dpi`，而 `setdefault`
+    # 只在键缺失时才生效 —— 所以那份配置根本用不到这个默认值。
+    # **这是实测踩过的**：只改了这里，CI 跑绿，但从 artifact 里读 PNG 头
+    # 发现宽度仍是 907 px（= 6.05 in × 150），也就是**根本没生效**。
+    # 日志里看不出任何异常 —— 只有把 artifact 拿下来量像素才能发现。
+    # 现在两处都是 300。
+    # （姊妹项目 geo-normal-pipeline-skill 的 config 恰好没有这个键，
+    # 所以那边只改 `save_pdf()` 的函数默认值就够了 —— 那是巧合，不是通例。）
     ana.setdefault("figure_dpi", 300)
     return cfg
 

@@ -175,6 +175,18 @@ jobs:
       - name: 检查图幅在栏宽以内
         run: node tools/check_fig_sizes.mjs results/pbmc3k/figures
 
+      # 分辨率是否达到投稿底线（300 dpi）。
+      # **上两步都看不出这个**：150 dpi 的图照样"有墨"、照样在 183 mm 以内，
+      # 文件大小也正常 —— 只有放大或印刷时才发现字形发虚。
+      # 而它最常见的成因不是画图代码，是**配置把默认值覆盖掉了**：
+      # `ana.setdefault("figure_dpi", 300)` 只在键缺失时生效，而
+      # `assets/config.pbmc3k.yml` 里显式写了这个键 —— 实测就踩过：
+      # 只改了 `common.py`，CI 全绿，artifact 里的 PNG 仍是 907 px（150 dpi）。
+      # 判据：dpi = PNG 像素数 / (PDF 的 /MediaBox 点数 / 72)，
+      # 物理尺寸从 PDF 读、像素从 PNG 读，两边独立，算出来的是实测值。
+      - name: 检查图分辨率达到 300 dpi
+        run: node tools/check_fig_dpi.mjs results/pbmc3k/figures
+
       - name: 汇总产物
         if: always()
         run: |

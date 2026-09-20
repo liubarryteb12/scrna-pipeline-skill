@@ -120,7 +120,12 @@ perturbation:
 # ---- 分析选项 ---------------------------------------------------------------
 analysis:
   seed: 20260919           # 不可删：UMAP / leiden / scrublet 全部吃随机数
-  figure_dpi: 150
+  # **300 是投稿底线，别往下调。** 原来写 150：183 mm 宽的图只有 1080 px，
+  # 放大或印刷后字形和细线发虚 —— 而"发虚"从图注上看不出来，文件大小也正常。
+  # 实测通讯热图 6.05 in 宽在 150 dpi 下是 907 px、300 dpi 下是 1814 px。
+  # **这个键会覆盖 common.py 的默认值**（`setdefault` 只在键缺失时才生效），
+  # 所以只改 common.py 对这份配置没有任何作用 —— 两处都要对。
+  figure_dpi: 300
   # 报告 marker 时每个簇取前几个
   top_markers: 25
   # 细胞类型注释：marker 打分用哪套签名（assets/celltype_markers.yml）
