@@ -64,8 +64,9 @@ from scipy import sparse  # noqa: E402
 from scipy.stats import spearmanr  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_cross_language, record_step,
-                    save_fig, set_seed, write_json, W_ONE_HALF, W_SINGLE, mm,)
+                    log_warn, parse_args, record_cross_language,
+                    record_decision, record_step, save_fig, set_seed,
+                    write_json, W_ONE_HALF, W_SINGLE, mm,)
 
 # 候选基因没有外部靶基因表时，用调控子按簇特异性排序取前 N 个
 DEFAULT_TOP_N = 20
@@ -172,6 +173,27 @@ def load_targets(cfg: dict, reg: pd.DataFrame) -> tuple:
     out["logfc"] = np.nan
     log_info(f"候选靶基因来自内部调控子（按簇特异性取前 {len(out)} 个）—— "
              f"**没有 Part 1 签名，signature_alignment 会是 NaN**")
+    # §0.2：**这一轮没有发生跨语言交接，必须说出来。**
+    #
+    # 清单的 `cross_language` 这时是空数组，而**空数组和"忘了记"长得一模一样**
+    # （和 geo 的 `record_decision()` 定义了却没调用点是同一个病）。
+    # 默认配置 `targets_csv: null` 走的正是这个分支，所以这条尤其重要。
+    #
+    # 注意这里记的是**决策**（说明为什么没有），不是往 `cross_language` 里
+    # 塞一条假的转换记录 —— 后者会让"本轮交接了"变成假话。
+    record_decision(
+        cfg, "cross_language",
+        "§0.2 跨语言转换：这一轮有没有 Part 1 → Part 2 的 CSV 交接？",
+        ("**没有。** 配置里 `perturbation.targets_csv` 为空或文件不存在，"
+         "本轮走的是回退分支（内部调控子），`cross_language` 为空是"
+         "**本轮配置的结果**，不是遗漏"),
+        evidence=(f"`targets_csv={spec!r}`"
+                  + ("（已配置但文件不存在）" if spec else "（未配置）")
+                  + "。**交接代码路径本身是好的** —— 由 "
+                  "`tools/selftest_part1_handoff.py` 每轮 CI 单独跑到并断言"
+                  "（造一份假交接表，验证 `record_cross_language()` 真的"
+                  "写进了清单、且上游多出来的列进了 `lost_fields`）。"
+                  "所以这条不是「没实现」，是「本轮没配」"))
     return out, "internal_top_regulons"
 
 

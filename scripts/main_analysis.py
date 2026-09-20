@@ -305,6 +305,32 @@ def run_all(cfg: dict, only: list = None) -> int:
             "ok": True, "required": False,
             "detail": (", ".join(pend) if pend else "全部已确认"),
         })
+        # ---- §0.2 跨语言转换：**空数组必须被解释** --------------------------
+        #
+        # 本仓库唯一一处真正的跨语言交接是 08 读 Part 1 的 `part2_targets.csv`。
+        # 默认配置 `targets_csv: null` 走回退分支，所以 `cross_language` 是空的
+        # —— 而**空数组和"忘了记"长得一模一样**（geo 的 `record_decision()`
+        # 定义了却没调用点，就是这么藏了一整轮）。
+        #
+        # 判据不是"必须有记录"，而是"**空的话必须有解释**"：
+        # 要么 `cross_language` 非空，要么决策链里有一条说明为什么。
+        # 将来真加了跨语言步骤却忘了记，这条会立刻变红。
+        #
+        # **读全量清单而不是 `msum`** —— `manifest_summary()` 只给计数。
+        _full = read_json(res_dir / "run_manifest.json") or {}
+        _cl = msum.get("n_cross_language", 0)
+        _dec_nodes = {d.get("node") for d in (_full.get("decisions") or [])}
+        checks.append({
+            "item": "§0.2 跨语言交接已登记或有解释",
+            "ok": _cl > 0 or "cross_language" in _dec_nodes,
+            "required": False,
+            "detail": (f"{_cl} 条跨语言转换记录（交接表 + 丢失字段）"
+                       if _cl else
+                       ("0 条，**但决策链里已说明本轮没有交接**"
+                        if "cross_language" in _dec_nodes else
+                        "**0 条且没有任何解释** —— 读者无法区分"
+                        "『本轮没配』和『忘了记』")),
+        })
 
     # 可选步骤的"没做"要在报告里可见 —— 不能只是绿
     for sid, fname in (("pseudobulk_de", "pseudobulk_status.json"),
