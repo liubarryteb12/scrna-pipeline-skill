@@ -159,7 +159,7 @@ def run_01_qc(cfg: dict) -> dict:
         ax.set_title(k)
         ax.set_xticks([])
     fig.suptitle(f"QC metrics before filtering (n={n0})")
-    save_fig(cfg, "qc_violin_before", fig)
+    save_fig(cfg, "02-01-01-unit1-qc-violin-before", fig)
 
     # 阈值线：基因数 vs 线粒体比例 —— 双细胞和死细胞在这张图上是两个角
     fig, ax = plt.subplots(figsize=(W_SINGLE, mm(64)))
@@ -173,7 +173,7 @@ def run_01_qc(cfg: dict) -> dict:
     ax.axhline(q["max_genes"], color=PAL["highlight"], lw=1, ls="--")
     ax.set_xlabel("total_counts"); ax.set_ylabel("n_genes_by_counts")
     ax.set_title("QC thresholds (red = cut-offs)")
-    save_fig(cfg, "qc_scatter_thresholds", fig)
+    save_fig(cfg, "02-01-02-unit1-qc-scatter-thresholds", fig)
 
     # ---- 3. 过滤 ------------------------------------------------------------
     q = cfg["qc"]

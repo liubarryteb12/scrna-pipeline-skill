@@ -286,7 +286,7 @@ def run_05_trajectory(cfg: dict) -> dict:
     fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(84)))
     sc.pl.paga(adata, show=False, ax=ax)
     ax.set_title("PAGA graph (edge width = connectivity)")
-    save_fig(cfg, "paga_graph", fig)
+    save_fig(cfg, "02-05-01-unit1-paga-graph", fig)
 
     # ---- 2. CytoTRACE GCS：既是方法也是选根依据 ------------------------------
     gcs = compute_cytotrace_gcs(adata)
@@ -428,7 +428,7 @@ def run_05_trajectory(cfg: dict) -> dict:
                     fontsize=8, color="black")
     ax.set_title("Pseudotime agreement (Spearman, direction-corrected)")
     fig.colorbar(im, ax=ax, shrink=0.8)
-    save_fig(cfg, "trajectory_method_correlation", fig)
+    save_fig(cfg, "02-05-02-unit1-trajectory-method-correlation", fig)
 
     # 共识拟时序：各方法 z-score 后取均值（方向已统一）
     Z = np.column_stack([
@@ -525,7 +525,7 @@ def run_05_trajectory(cfg: dict) -> dict:
             axes[1].set_xlabel("pseudotime bin"); axes[1].set_ylabel("z-scored mean")
             axes[1].set_title("Module profiles")
             axes[1].legend(fontsize=7)
-            save_fig(cfg, "trajectory_modules", fig)
+            save_fig(cfg, "02-05-03-unit1-trajectory-modules", fig)
         except Exception as e:  # noqa: BLE001
             log_warn(f"基因模块分析失败: {type(e).__name__}: {e}")
 
@@ -585,7 +585,7 @@ def run_05_trajectory(cfg: dict) -> dict:
     axes[2].set_title("Leiden clusters")
     for ax in axes:
         ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
-    save_fig(cfg, "pseudotime_umap", fig)
+    save_fig(cfg, "02-05-04-unit1-pseudotime-umap", fig)
 
     per_cluster = (pd.DataFrame({"cluster": adata.obs["leiden"].astype(str).values,
                                  "consensus": consensus,
@@ -610,7 +610,7 @@ def run_05_trajectory(cfg: dict) -> dict:
     ax.set_xlabel("cluster (ordered by median consensus pseudotime)")
     ax.set_ylabel("consensus pseudotime (higher = later)")
     ax.set_title("Pseudotime distribution per cluster")
-    save_fig(cfg, "pseudotime_by_cluster", fig)
+    save_fig(cfg, "02-05-05-unit1-pseudotime-by-cluster", fig)
 
     # ---- 10. 每细胞拟时序落盘（供 07_grn 做 regulon×拟时序）-----------------
     cell_df = pd.DataFrame({"cell": adata.obs_names.astype(str),

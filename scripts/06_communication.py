@@ -389,7 +389,7 @@ def run_06_communication(cfg: dict) -> dict:
     # 标题对图上内容的描述是错的。
     ax.set_title(f"Top {len(mat)} ligand-receptor pairs by summed score")
     fig.colorbar(im, ax=ax, label="score")
-    save_fig(cfg, "communication_heatmap", fig)
+    save_fig(cfg, "02-06-01-unit1-communication-heatmap", fig)
     log_info(f"通讯热图: {len(mat)} 个配体受体对 x {mat.shape[1]} 个接收类型"
              f"（{len(res)} 个组合 -> {len(pair_score)} 个不同 pair，取前 {n_pairs}）")
 

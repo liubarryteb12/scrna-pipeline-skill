@@ -337,7 +337,7 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
     ax.set_xlabel("Leiden resolution"); ax.set_ylabel("number of clusters")
     ax.set_title("Cluster count vs resolution")
     ax.legend(fontsize=8)
-    save_fig(cfg, "cluster_resolution_scan", fig)
+    save_fig(cfg, "02-03-01-unit1-cluster-resolution-scan", fig)
 
     # ---- 3. 用配置的分辨率定稿 ----------------------------------------------
     res_used = float(rd["resolution"])
@@ -361,7 +361,7 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
     ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
     ax.set_title(f"Leiden clusters (n={n_clusters}, resolution={res_used})")
     ax.legend(fontsize=6, markerscale=2.5, loc="center left", bbox_to_anchor=(1.0, 0.5))
-    save_fig(cfg, "umap_clusters", fig)
+    save_fig(cfg, "02-03-02-unit1-umap-clusters", fig)
 
     # ---- 4. Marker 基因 -----------------------------------------------------
     sc.tl.rank_genes_groups(adata, "leiden", method="wilcoxon",
@@ -391,7 +391,7 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
         # 高度 96 mm 是实测值：80 mm 时簇标签顶出画布 +4.5%，88 mm 时 +2.9%
         fig.set_size_inches(W_DOUBLE, mm(96))
         fig.suptitle("Top markers per cluster")
-        save_fig(cfg, "markers_dotplot", fig)
+        save_fig(cfg, "02-03-03-unit1-markers-dotplot", fig)
 
     # ---- 5. 细胞类型打分 ----------------------------------------------------
     sig = load_signatures(cfg)
@@ -428,7 +428,7 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
         ax.set_xlabel("cell type signature"); ax.set_ylabel("cluster")
         ax.set_title("Mean signature score per cluster")
         fig.colorbar(im, ax=ax, label="score")
-        save_fig(cfg, "celltype_scores_heatmap", fig)
+        save_fig(cfg, "02-03-04-unit1-celltype-scores-heatmap", fig)
 
     # ---- 6. CellTypist 自动注释（文档 §2.4，与 marker 打分并行）------------
     ct_labels, ct_info = try_celltypist(adata, cfg)

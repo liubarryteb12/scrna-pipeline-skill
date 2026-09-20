@@ -146,7 +146,7 @@ integration:
 | `pseudotime_by_cluster.csv` | 每簇拟时序分布 |
 | `cell_communication.csv` | 配体-受体打分 + 置换 p 值 + BH |
 | `tf_regulons.csv` | 调控子 + 靶基因 + 簇特异性 |
-| `figures/` | 14 张图（PNG + PDF） |
+| `figures/` | 19 张图（PNG + PDF，图名格式见 AGENTS 规则 22） |
 
 ## 工程约定
 

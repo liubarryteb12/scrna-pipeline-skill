@@ -306,7 +306,7 @@ def run_07_grn(cfg: dict) -> dict:
                     ax.set_xlabel("consensus pseudotime bin (higher = later)")
                     ax.set_title("Regulon activity along pseudotime (z-scored)")
                     fig.colorbar(im, ax=ax, label="z-scored activity")
-                    save_fig(cfg, "tf_activity_vs_pseudotime", fig)
+                    save_fig(cfg, "02-07-01-unit1-tf-activity-vs-pseudotime", fig)
         except Exception as e:  # noqa: BLE001
             traj_status = {"status": "failed",
                            "reason": f"{type(e).__name__}: {e}"}
@@ -330,7 +330,7 @@ def run_07_grn(cfg: dict) -> dict:
         ax.set_yticklabels(sub.index, fontsize=7)
         ax.set_title("TF regulon activity by cluster (top by specificity)")
         fig.colorbar(im, ax=ax, label="mean AUCell-style score")
-        save_fig(cfg, "tf_activity_heatmap", fig)
+        save_fig(cfg, "02-07-02-unit1-tf-activity-heatmap", fig)
 
     # 特异性 vs 表达细胞比例：识别"只是细胞类型代理"的调控子
     fig, ax = plt.subplots(figsize=(W_SINGLE, mm(64)))
@@ -342,7 +342,7 @@ def run_07_grn(cfg: dict) -> dict:
     ax.set_xlabel("fraction of cells expressing TF")
     ax.set_ylabel("cluster specificity")
     ax.set_title("Regulon specificity vs TF detection")
-    save_fig(cfg, "tf_specificity_scatter", fig)
+    save_fig(cfg, "02-07-03-unit1-tf-specificity-scatter", fig)
 
     status = {
         "dataset_id": cfg["dataset_id"],

@@ -419,7 +419,7 @@ def run_08_virtual_perturbation(cfg: dict) -> dict:
     ax.set_title("Virtual knockout: predicted effect size\n"
                  "(one-hop linear propagation on a co-expression GRN)",
                  fontsize=9)
-    save_fig(cfg, "virtual_perturbation_effect", fig)
+    save_fig(cfg, "02-08-01-unit1-virtual-perturbation-effect", fig)
 
     n_align = int(df["ko_signature_alignment"].notna().sum())
     status = {

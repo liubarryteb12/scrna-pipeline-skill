@@ -106,14 +106,14 @@ REQUIRED_FILES = [
 
 # 必需的图（相对 figures_dir，不含扩展名）
 REQUIRED_FIGURES = [
-    ("qc_violin_before",          "过滤前 QC 分布"),
-    ("qc_scatter_thresholds",     "QC 阈值散点"),
-    ("hvg_selection",             "高变基因选择"),
-    ("pca_variance_ratio",        "PCA 方差解释"),
-    ("cluster_resolution_scan",   "分辨率扫描曲线"),
-    ("umap_clusters",             "UMAP 聚类图"),
-    ("markers_dotplot",           "marker 点图"),
-    ("celltype_scores_heatmap",   "细胞类型打分热图"),
+    ("02-01-01-unit1-qc-violin-before",          "过滤前 QC 分布"),
+    ("02-01-02-unit1-qc-scatter-thresholds",     "QC 阈值散点"),
+    ("02-02-01-unit1-hvg-selection",             "高变基因选择"),
+    ("02-02-02-unit1-pca-variance-ratio",        "PCA 方差解释"),
+    ("02-03-01-unit1-cluster-resolution-scan",   "分辨率扫描曲线"),
+    ("02-03-02-unit1-umap-clusters",             "UMAP 聚类图"),
+    ("02-03-03-unit1-markers-dotplot",           "marker 点图"),
+    ("02-03-04-unit1-celltype-scores-heatmap",   "细胞类型打分热图"),
 ]
 
 
@@ -398,8 +398,8 @@ def run_all(cfg: dict, only: list = None) -> int:
             "required": True,
             "detail": f"{len(tj.get('limitations') or [])} 条",
         })
-        for fn, desc in (("trajectory_method_correlation", "方法一致性矩阵"),
-                         ("trajectory_modules", "沿轨迹基因模块")):
+        for fn, desc in (("02-05-02-unit1-trajectory-method-correlation", "方法一致性矩阵"),
+                         ("02-05-03-unit1-trajectory-modules", "沿轨迹基因模块")):
             ok = has_file(fig_dir / f"{fn}.png")
             checks.append({"item": f"图 {desc} ({fn}.png)", "ok": ok,
                            "required": True,
@@ -532,8 +532,9 @@ def run_all(cfg: dict, only: list = None) -> int:
             "required": False,
             "detail": str(vp.get("method", ""))[:120],
         })
-        ok_fig = has_file(fig_dir / "virtual_perturbation_effect.png")
-        checks.append({"item": "图 虚拟敲除效应 (virtual_perturbation_effect.png)",
+        _vp_fig = "02-08-01-unit1-virtual-perturbation-effect.png"
+        ok_fig = has_file(fig_dir / _vp_fig)
+        checks.append({"item": f"图 虚拟敲除效应 ({_vp_fig})",
                        "ok": ok_fig, "required": False,
                        "detail": "存在" if ok_fig else "**缺失**"})
 
