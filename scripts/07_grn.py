@@ -315,7 +315,11 @@ def run_07_grn(cfg: dict) -> dict:
         log_info(f"regulon×拟时序：{traj_status['reason']}")
 
     # ---- 3. 出图 ------------------------------------------------------------
-    top_tfs = reg.head(int(grn.get("top_tfs", 10)) * 2)["tf"].tolist()
+    # **列必须按 TF 去重**（评审 3.8）：`reg.head(n)` 是行级 top，
+    # 同一 TF 的多行（不同簇/来源）会让 x 轴出现 TBX21/TBX21 这样的重复列，
+    # 评审实测最后 7 列里 6 列无法区分。先按 tf 去重再取前 N。
+    top_tfs = (reg.drop_duplicates(subset=["tf"])
+                  .head(int(grn.get("top_tfs", 10)) * 2)["tf"].tolist())
     if top_tfs:
         sub = act_mat[top_tfs]
         # 宽度夹在 [单栏半, 双栏]：类别少时不至于太空，类别多时也不会
@@ -333,12 +337,21 @@ def run_07_grn(cfg: dict) -> dict:
         save_fig(cfg, "02-07-02-unit1-tf-activity-heatmap", fig)
 
     # 特异性 vs 表达细胞比例：识别"只是细胞类型代理"的调控子
+    # **标签必须防撞**（评审 3.1）：top 8 的 TF 名原先全部 offset(3,3)，
+    # 点又挤在 x≈0–0.05 的竖列里，名字互压成一团。按 y 排序后上下交替
+    # 偏移 + 相同 y 的错开 x，纯绘图参数。
     fig, ax = plt.subplots(figsize=(W_SINGLE, mm(64)))
     ax.scatter(reg["frac_cells_expressing_tf"], reg["cluster_specificity"],
                s=22, color="#2C7FB8", alpha=0.75)
-    for r in reg.head(8).itertuples():
+    _lab = reg.head(8).sort_values("cluster_specificity", ascending=False)
+    _rank = range(len(_lab))
+    for _i, r in zip(_rank, _lab.itertuples()):
+        _dy = 5 if _i % 2 == 0 else -9          # 上下交替，避免相邻标签同高互压
+        _dx = 5 if _i % 4 < 2 else -5           # 偶尔放左边，避开 x 竖列
+        _ha = "left" if _dx > 0 else "right"
         ax.annotate(r.tf, (r.frac_cells_expressing_tf, r.cluster_specificity),
-                    fontsize=7, xytext=(3, 3), textcoords="offset points")
+                    fontsize=7, xytext=(_dx, _dy), textcoords="offset points",
+                    ha=_ha)
     ax.set_xlabel("fraction of cells expressing TF")
     ax.set_ylabel("cluster specificity")
     ax.set_title("Regulon specificity vs TF detection")

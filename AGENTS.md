@@ -522,4 +522,28 @@ scf.pp.diffusion(device="cpu")
 > R 侧 `save_pdf` 的调用写法）。阶段号表写在文件头的 `PART_BY_REPO`，
 > 仓库目录名认不出时它直接报错退出，不会静默放行。
 
+## 23. 出图三条补充约定（评审 3.1/3.6/3.8 实测）
+
+**23.1 退化分布必须显式处理。** 恒定值指标（如 pbmc3k 的 `pct_counts_hb`，
+几乎全部细胞为 0）画小提琴会塌成一根裸竖线 + 顶端横线，
+**看起来像渲染失败**。IQR=0 的面板改画 strip 散点，标题注明
+`(no variance: N/M cells non-zero)` —— 少数非零点反而可见。
+
+**23.2 跨图的同一分类变量必须同色同序。** cluster 在 `umap_clusters` 与
+`pseudotime_umap` 第 3 面板里用不同调色板（tab20 vs 默认循环）时，
+同一簇跨图变色、读者无法对照。簇色统一走**数值序逐簇 scatter +
+PAL_CYCLE**（与 `axes.prop_cycle` 同源），需要就加显式图例。
+
+**23.3 原始列名/变量名不能直接当图上标签。** `total_counts`、
+`pct_counts_mt` 是数据结构泄露。统一映射成人类可读英文
+（"Total counts per cell"、"Mitochondrial fraction (%)"），
+映射表写在用它的脚本里（`01_qc.py` 的 `QC_LABELS`），三仓共用语义。
+
+**23.4 行级 topN 做分类轴前先去重。** `reg.head(n)` 是行级排名，
+同一 TF 的多行会让热图 x 轴出现重复列（实测 TBX21/TBX21、IRF1/IRF1）。
+按 `drop_duplicates(subset=["tf"])` 去重再取 N。
+
+> 散点标注防撞（`tf_specificity_scatter`）用"按 y 排序 + 上下交替偏移"
+> 的纯绘图参数法；`adjustText` 不在依赖里，不要临时引入。
+
 

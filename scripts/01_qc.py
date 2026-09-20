@@ -152,11 +152,31 @@ def run_01_qc(cfg: dict) -> dict:
 
     keys = [k for k in ("n_genes_by_counts", "total_counts", "pct_counts_mt",
                         "pct_counts_ribo", "pct_counts_hb") if k in adata.obs.columns]
+    # **原始 obs 列名不能直接当面板标题**（评审 3.7）：`pct_counts_mt` 这类
+    # 名字是数据结构泄露，不是给读者看的标签。统一映射成人类可读英文。
+    QC_LABELS = {
+        "n_genes_by_counts": "Genes detected per cell",
+        "total_counts": "Total counts per cell",
+        "pct_counts_mt": "Mitochondrial fraction (%)",
+        "pct_counts_ribo": "Ribosomal fraction (%)",
+        "pct_counts_hb": "Haemoglobin fraction (%)",
+    }
     fig, axes = plt.subplots(1, len(keys), figsize=(W_DOUBLE, mm(58)))
     axes = np.atleast_1d(axes)
     for ax, k in zip(axes, keys):
-        ax.violinplot(adata.obs[k].astype(float).values, showmedians=True)
-        ax.set_title(k)
+        v = adata.obs[k].astype(float).values
+        # **退化面板（IQR=0，如 pbmc3k 的血红蛋白：绝大多数细胞恒为 0）**
+        # 小提琴会塌成一根裸竖线 + 顶端横线，看起来像渲染失败。
+        # 改画 strip 散点并注明 no variance —— 少数非零点反而因此可见。
+        if float(np.subtract(*np.percentile(v, [75, 25]))) == 0:
+            rng = np.random.default_rng(cfg["analysis"]["seed"])
+            ax.scatter(rng.uniform(-0.12, 0.12, len(v)), v, s=2, alpha=0.25,
+                       color=PAL["primary"], rasterized=True)
+            ax.set_title(f"{QC_LABELS.get(k, k)}\n(no variance: "
+                         f"{int((v != 0).sum())}/{len(v)} cells non-zero)", fontsize=8)
+        else:
+            ax.violinplot(v, showmedians=True)
+            ax.set_title(QC_LABELS.get(k, k), fontsize=8)
         ax.set_xticks([])
     fig.suptitle(f"QC metrics before filtering (n={n0})")
     save_fig(cfg, "02-01-01-unit1-qc-violin-before", fig)
@@ -167,11 +187,14 @@ def run_01_qc(cfg: dict) -> dict:
                      c=adata.obs["pct_counts_mt"] if "pct_counts_mt" in adata.obs else None,
                      s=3, cmap="viridis", alpha=0.6)
     if sc_ is not None:
-        fig.colorbar(sc_, ax=ax, label="pct_counts_mt")
+        fig.colorbar(sc_, ax=ax, label="Mitochondrial fraction (%)")
     q = cfg["qc"]
     ax.axhline(q["min_genes"], color=PAL["highlight"], lw=1, ls="--")
     ax.axhline(q["max_genes"], color=PAL["highlight"], lw=1, ls="--")
-    ax.set_xlabel("total_counts"); ax.set_ylabel("n_genes_by_counts")
+    # 轴标题同样走映射；刻度用 5k 步长整数，避免 10000/12500/15000 挤在一起
+    ax.set_xlabel(QC_LABELS["total_counts"])
+    ax.set_ylabel(QC_LABELS["n_genes_by_counts"])
+    ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(nbins=5, integer=True))
     ax.set_title("QC thresholds (red = cut-offs)")
     save_fig(cfg, "02-01-02-unit1-qc-scatter-thresholds", fig)
 

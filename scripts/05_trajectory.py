@@ -37,7 +37,8 @@ import scanpy as sc  # noqa: E402
 from scipy.stats import ks_2samp, spearmanr  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed, write_json, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm,)
+                    log_warn, parse_args, record_step, save_fig, set_seed, write_json,
+                    W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, PAL, PAL_CYCLE,)
 
 # 校正后的统一方向：**值越大越晚**
 N_MODULES = 6
@@ -284,7 +285,12 @@ def run_05_trajectory(cfg: dict) -> dict:
     conn_df.to_csv(res_dir / "paga_connectivities.csv")
 
     fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(84)))
-    sc.pl.paga(adata, show=False, ax=ax)
+    # **节点必须画在边之上**（评审 3.3）：默认把粗黑边画在节点上层，
+    # 小节点（簇 9）被 5 条边直接切断 "9" 字形。分两层：先无标注骨架画边，
+    # 再同一坐标轴上高 zorder 重画节点与标签。
+    sc.pl.paga(adata, show=False, ax=ax, labels=False, node_size_scale=0.6)
+    sc.pl.paga(adata, show=False, ax=ax, edges=False,
+               labels=[str(c) for c in adata.obs["leiden"].cat.categories])
     ax.set_title("PAGA graph (edge width = connectivity)")
     save_fig(cfg, "02-05-01-unit1-paga-graph", fig)
 
@@ -570,6 +576,9 @@ def run_05_trajectory(cfg: dict) -> dict:
         pd.DataFrame(branch_rows).to_csv(res_dir / "trajectory_segments.csv", index=False)
 
     # ---- 9. 图：拟时序 UMAP + 每簇分布 --------------------------------------
+    # **第 3 面板的簇色必须与 umap_clusters 同源**（评审 3.8：原先 tab20，
+    # 同一 cluster 在两张图里颜色不同，跨图无法对照）；且 10 个簇仅颜色
+    # 编码而无图例（评审 3.6）。逐簇按 PAL_CYCLE 上色 + 显式图例。
     fig, axes = plt.subplots(1, 3, figsize=(W_DOUBLE, mm(58)))
     xy = adata.obsm["X_umap"]
     s0 = axes[0].scatter(xy[:, 0], xy[:, 1], c=consensus, s=4, cmap="viridis")
@@ -579,10 +588,23 @@ def run_05_trajectory(cfg: dict) -> dict:
         s1 = axes[1].scatter(xy[:, 0], xy[:, 1], c=corrected["dpt"], s=4, cmap="viridis")
         axes[1].set_title("DPT pseudotime (direction-corrected)")
         fig.colorbar(s1, ax=axes[1], label="pseudotime")
-    s2 = axes[2].scatter(xy[:, 0], xy[:, 1],
-                         c=adata.obs["leiden"].astype(str).astype("category").cat.codes,
-                         s=4, cmap="tab20")
-    axes[2].set_title("Leiden clusters")
+    leiden_str = adata.obs["leiden"].astype(str).values
+    # **与 umap_clusters 完全同一排序与配色**：那边按数值序逐簇 scatter、
+    # 颜色吃 axes.prop_cycle（=PAL_CYCLE）。这里用别的排序或 tab20 都会让
+    # 同一簇跨图变色（评审 3.8 的原始问题），所以逐字对齐。
+    leiden_cats = sorted(set(leiden_str), key=lambda x: int(x) if x.isdigit() else x)
+    for ax_i in (axes[2],):
+        from matplotlib.lines import Line2D
+        for ci, cat in enumerate(leiden_cats):
+            m = leiden_str == str(cat)
+            ax_i.scatter(xy[m, 0], xy[m, 1], s=4,
+                         color=PAL_CYCLE[ci % len(PAL_CYCLE)])
+        ax_i.set_title("Leiden clusters")
+        handles = [Line2D([0], [0], marker="o", ls="", markersize=4,
+                          color=PAL_CYCLE[ci % len(PAL_CYCLE)], label=str(cat))
+                   for ci, cat in enumerate(leiden_cats)]
+        ax_i.legend(handles=handles, fontsize=5, ncol=2, loc="best",
+                    framealpha=0.7)
     for ax in axes:
         ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
     save_fig(cfg, "02-05-04-unit1-pseudotime-umap", fig)

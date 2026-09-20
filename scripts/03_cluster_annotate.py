@@ -390,7 +390,12 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
         # scanpy 自己按基因数定尺寸，这里拉回标准双栏宽。
         # 高度 96 mm 是实测值：80 mm 时簇标签顶出画布 +4.5%，88 mm 时 +2.9%
         fig.set_size_inches(W_DOUBLE, mm(96))
-        fig.suptitle("Top markers per cluster")
+        # **轴语义必须写在图上**（评审 3.6：y 轴无标题，行=cluster 只能从
+        # 标题推断）。scanpy dotplot 不给轴标签接口，用 suptitle 说明。
+        fig.suptitle("Top markers per cluster\n"
+                     "rows = Leiden clusters; dot size = fraction of cells "
+                     "expressing the gene; colour = mean expression "
+                     "(z-scored per gene)")
         save_fig(cfg, "02-03-03-unit1-markers-dotplot", fig)
 
     # ---- 5. 细胞类型打分 ----------------------------------------------------
