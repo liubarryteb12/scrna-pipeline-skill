@@ -1,5 +1,11 @@
 # 单细胞流水线的工程规则
 
+> **治理层（2026-09-20 起）**：本仓库是 `scientific_agent_skill` 工作区三仓库之一，
+> 受工作区治理层约束：一切产物只写工作区内；任务先登记在
+> `governance/02_TASKLIST.md`；推送前跑 `node governance/hooks/pre-push.mjs`；
+> checkpoint 台账见 `governance/04_CHECKPOINT_PLAN.md`；行为准则
+> `governance/01_SPEC_v1.0.md`。冲突按规范 §7.4 报告裁决。
+
 姊妹项目 `geo-normal-pipeline-skill/AGENTS.md` 的规则在这里同样适用。
 本文只写**单细胞特有的**部分。
 
