@@ -118,7 +118,7 @@ def run_07_grn(cfg: dict) -> dict:
     pos = {g: i for i, g in enumerate(cand_names)}
 
     # ---- 2. 推断调控子 ------------------------------------------------------
-    rows, activities = [], {}
+    rows, activities, edges = [], {}, []
     cluster = adata.obs["leiden"].astype(str).values
     clusters = sorted(set(cluster), key=lambda x: int(x) if x.isdigit() else x)
 
@@ -128,7 +128,11 @@ def run_07_grn(cfg: dict) -> dict:
         corr = (Xc.T @ Xc[:, j]) / Xc.shape[0]
         corr[j] = -np.inf          # 排除自己
         top = np.argsort(corr)[::-1][:N_TARGETS]
-        targets = [cand_names[k] for k in top if corr[k] > 0]
+        # **靶基因和权重必须成对取。** 分开写（一个列表取名字、另一个按
+        # 位置取 corr）在过滤 `corr > 0` 之后会错位 —— 而错位不报错，
+        # 只会给每个靶基因配上一个别人的相关系数。
+        pairs = [(cand_names[k], float(corr[k])) for k in top if corr[k] > 0]
+        targets = [p[0] for p in pairs]
         if len(targets) < 5:
             continue
 
@@ -149,6 +153,10 @@ def run_07_grn(cfg: dict) -> dict:
         # 簇特异性：最高簇与其余簇均值的差，除以整体标准差。
         # **这是用来识别"这个调控子是不是只是细胞类型的代理"的。**
         spec = float((vals.max() - np.median(vals)) / (vals.std() + 1e-9))
+        # 完整边表（带权重）。tf_regulons.csv 只存了 top 12 的字符串，
+        # 下游的虚拟扰动需要**全部**靶基因及其相关系数。
+        for tgt, w in pairs:
+            edges.append({"tf": tf, "target": tgt, "corr": round(w, 4)})
         rows.append({
             "tf": tf,
             "n_targets": len(targets),
@@ -172,6 +180,13 @@ def run_07_grn(cfg: dict) -> dict:
     reg.to_csv(res_dir / "tf_regulons.csv", index=False)
     log_info(f"推断出 {len(reg)} 个调控子；"
              f"最高簇特异性 {reg['cluster_specificity'].iloc[0]:.2f}（{reg['tf'].iloc[0]}）")
+
+    # 完整边表：下游虚拟扰动（§1.7/§1.8）要用全部靶基因与权重，
+    # 而 tf_regulons.csv 里的 top_targets 只有前 12 个、且没有权重。
+    edge_df = pd.DataFrame(edges)
+    edge_df.to_csv(res_dir / "tf_regulon_edges.csv", index=False)
+    log_info(f"调控子边表: {len(edge_df)} 条边，"
+             f"{edge_df['tf'].nunique()} 个 TF，{edge_df['target'].nunique()} 个靶基因")
 
     # 活性矩阵（簇 x TF）
     act_mat = pd.DataFrame(
@@ -337,6 +352,9 @@ def run_07_grn(cfg: dict) -> dict:
         "n_regulons": int(len(reg)),
         "n_targets_per_regulon": N_TARGETS,
         "n_genes_used_for_inference": len(cand),
+        "n_regulon_edges": int(len(edge_df)),
+        "n_regulon_target_genes": int(edge_df["target"].nunique()),
+        "regulon_edges_file": "tf_regulon_edges.csv",
         "top_regulons": df_to_records(reg.head(15)),
         "regulon_vs_pseudotime": traj_status,
         "method": ("共表达推断（Pearson 相关取 top 靶基因）+ AUCell 式调控子活性打分。"

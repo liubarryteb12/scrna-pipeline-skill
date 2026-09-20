@@ -102,6 +102,21 @@ grn:
   # 每个簇报告前几个 TF
   top_tfs: 10
 
+# ---- 虚拟敲除 / 过表达（文档 §1.7 / §1.8）-----------------------------------
+# **保留框架。** 规范把候选靶基因的产出留给 Part 1（R），跨部分只走 CSV
+# （§0.2）。所以 targets_csv 指向 Part 1 交接出来的基因表；没有它时回退到
+# 内部调控子（按簇特异性取前 top_n 个），此时 signature_alignment 为空。
+perturbation:
+  enabled: true
+  # Part 1 交接的候选靶基因 CSV，相对路径按 data_dir 解析。
+  # 需要一列 gene（或 target / symbol），可选一列 logFC（或 log2FC）。
+  # 该文件不存在时回退到内部调控子，并在状态里写明回退了。
+  targets_csv: null
+  # 回退时取前几个调控子
+  top_n: 20
+  # 过表达抬高多少个标准差
+  overexpress_sd: 1.0
+
 # ---- 分析选项 ---------------------------------------------------------------
 analysis:
   seed: 20260919           # 不可删：UMAP / leiden / scrublet 全部吃随机数

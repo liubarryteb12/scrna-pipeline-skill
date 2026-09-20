@@ -223,6 +223,10 @@ KEY_PACKAGES = [
     "palantir", "scfates", "cytotrace",
     # §2 点名的 R 包（本仓库无 rpy2 路径，正常就是 None）
     "monocle3", "slingshot", "cellchat", "soupx", "scdblfinder",
+    # §1.7/§1.8 虚拟扰动。**三个都装不上，但键必须留着** ——
+    # 记 None 是"查过了，装不上"，省略键是"没查"。
+    # 确切原因写在 virtual_perturbation_status.json 的 tools 字段里。
+    "scTenifoldKnk", "PerturbNet", "RegVelo",
 ]
 
 

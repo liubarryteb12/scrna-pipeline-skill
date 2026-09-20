@@ -41,6 +41,8 @@ STEPS = [
     ("trajectory",       "05_trajectory.py",        "run_05_trajectory",       False, "轨迹推断"),
     ("communication",    "06_communication.py",     "run_06_communication",    False, "细胞通讯"),
     ("grn",              "07_grn.py",               "run_07_grn",              False, "转录因子调控"),
+    ("virtual_perturbation", "08_virtual_perturbation.py",
+     "run_08_virtual_perturbation", False, "虚拟敲除/过表达（§1.7/§1.8 保留框架）"),
 ]
 
 # 每步会写的状态文件。**跑之前先删掉** —— 否则步骤崩溃时旧文件还在，
@@ -55,6 +57,7 @@ STEP_STATUS_FILES = {
     "trajectory": "trajectory_status.json",
     "communication": "communication_status.json",
     "grn": "grn_status.json",
+    "virtual_perturbation": "virtual_perturbation_status.json",
 }
 
 # 文档 §2「本部分人工复核节点」。**默认 pending，不是 confirmed** ——
@@ -67,6 +70,10 @@ HUMAN_REVIEW_NODES = [
     ("pseudobulk_design",    "拟bulk 差异分析设计",               False),
     ("trajectory_direction", "拟时序轨迹方向确认（marker 验证）",  True),
     ("trajectory_branches",  "拟时序分支点的生物学解释",           True),
+    # §1.7/§1.8 的人工复核节点：**虚拟扰动的靶基因在生物学上是否讲得通**。
+    # 这是整个虚拟扰动框架里唯一能挡住"算出来一个数就当真"的机制 ——
+    # 一阶网络模型必然会给出一份排名，排名本身不含任何合理性判据。
+    ("virtual_perturbation_targets", "虚拟扰动靶基因的生物学合理性", False),
 ]
 
 # 需要登记哈希的输入（相对 data_dir）。(文件名, 中文说明, 是否必需)
@@ -93,6 +100,7 @@ REQUIRED_FILES = [
     ("trajectory_status.json",     "轨迹状态",            False),
     ("communication_status.json",  "通讯状态",            False),
     ("grn_status.json",            "GRN 状态",            False),
+    ("virtual_perturbation_status.json", "虚拟扰动状态",    False),
 ]
 
 # 必需的图（相对 figures_dir，不含扩展名）
@@ -142,6 +150,12 @@ def run_all(cfg: dict, only: list = None) -> int:
         "cluster": cfg.get("cluster", {}),
         "integration": cfg.get("integration", {}),
         "trajectory": cfg.get("trajectory", {}),
+        # **这三段原先漏了。** §0.3 要求"全部参数含 seed"入清单 ——
+        # 漏掉的可选步骤参数意味着那几步的结果无法被复现，
+        # 而清单看起来是完整的（缺的是键，不是值）。
+        "communication": cfg.get("communication", {}),
+        "grn": cfg.get("grn", {}),
+        "perturbation": cfg.get("perturbation", {}),
     })
     for node, label, req in HUMAN_REVIEW_NODES:
         record_human_review(cfg, node, required=req, status="pending",
@@ -269,7 +283,8 @@ def run_all(cfg: dict, only: list = None) -> int:
     for sid, fname in (("pseudobulk_de", "pseudobulk_status.json"),
                        ("trajectory", "trajectory_status.json"),
                        ("communication", "communication_status.json"),
-                       ("grn", "grn_status.json")):
+                       ("grn", "grn_status.json"),
+                       ("virtual_perturbation", "virtual_perturbation_status.json")):
         d = read_json(res_dir / fname)
         if not d:
             continue
@@ -384,6 +399,56 @@ def run_all(cfg: dict, only: list = None) -> int:
                        if li_cmp.get("compared") else
                        f"**未对比**：{li_cmp.get('reason')}"),
         })
+
+    # ---- §1.7 / §1.8 虚拟扰动（保留框架）------------------------------------
+    #
+    # 这一节的**重点是"没做什么"**。规范点名的三个工具在本环境全都装不了，
+    # 而"装不了"和"没装"是两件事 —— 前者有确切原因，后者是疏忽。
+    # 所以逐个列出原因，并且把"用的是自建一阶近似"这件事写在最显眼处。
+    vp = read_json(res_dir / "virtual_perturbation_status.json") or {}
+    vp_tools = vp.get("tools") or {}
+    if vp_tools:
+        unavail = {k: v.get("reason") for k, v in vp_tools.items()
+                   if not v.get("available")}
+        checks.append({
+            "item": f"§1.7/§1.8 点名工具不可用的原因已逐个记录（{len(unavail)}/{len(vp_tools)} 个不可用）",
+            # 判据是"每个不可用的都有原因"，不是"全都不可用" ——
+            # 将来某个工具能装了，这条应该自动变成 PASS 而不是 FAIL。
+            "ok": all(bool(r) for r in unavail.values()) if unavail else True,
+            "required": False,
+            "detail": ("；".join(f"{k}：{str(r)[:70]}" for k, r in unavail.items())
+                       if unavail else "三个工具都可用"),
+        })
+    if vp.get("status") == "ok":
+        checks.append({
+            "item": "虚拟扰动的候选来源已写明（Part 1 交接 vs 内部回退）",
+            "ok": bool(vp.get("target_source")), "required": False,
+            "detail": (f"{vp.get('target_source')}，"
+                       f"{vp.get('n_candidates')} 个候选 x "
+                       f"{vp.get('n_cell_types')} 个细胞类型"
+                       + ("（**内部回退：没有 Part 1 签名，"
+                          "signature_alignment 为空是预期的**）"
+                          if str(vp.get("target_source", "")).startswith("internal")
+                          else "")),
+        })
+        checks.append({
+            "item": "虚拟扰动的方法学限定已写明（>=5 条）",
+            "ok": len(vp.get("limitations") or []) >= 5, "required": False,
+            "detail": f"{len(vp.get('limitations') or [])} 条",
+        })
+        checks.append({
+            "item": "虚拟扰动明确声明不是 scTenifoldKnk / PerturbNet",
+            # 这一条是防"报了个数就被当成因果预测"的。方法串里必须出现
+            # 这两个否定，否则读者会以为跑的是规范点名的工具。
+            "ok": all(t in str(vp.get("method", ""))
+                      for t in ("scTenifoldKnk", "PerturbNet")),
+            "required": False,
+            "detail": str(vp.get("method", ""))[:120],
+        })
+        ok_fig = has_file(fig_dir / "virtual_perturbation_effect.png")
+        checks.append({"item": "图 虚拟敲除效应 (virtual_perturbation_effect.png)",
+                       "ok": ok_fig, "required": False,
+                       "detail": "存在" if ok_fig else "**缺失**"})
 
     n_fail = 0
     for c in checks:
