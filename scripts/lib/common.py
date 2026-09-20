@@ -230,6 +230,164 @@ KEY_PACKAGES = [
 ]
 
 
+# ---- 文档点名、但本仓库用不了的工具（§2.1–§2.8）-----------------------------
+#
+# 与空间侧（`spatial-pipeline-skill/scripts/lib/common.py`）**同一套结构**，
+# 四类 kind 同名同义。判据全部是实测的 PyPI metadata，不是推测。
+#
+# ## 为什么单细胞侧更需要这张表
+#
+# §2 点名的工具里 R 包特别多（SCTransform / scran / DESeq2 / edgeR /
+# Monocle3 / Slingshot / CellChat / SoupX），而本仓库**没有 rpy2 路径** ——
+# 规范说"Python (+R via rpy2)"，但 CI 里没装 R，所以这些一个都跑不了。
+#
+# 产物里却看不出来：`02_integrate.py` 有归一化、`04_pseudobulk_de.py` 有
+# 差异表、`05_trajectory.py` 有四条轨迹 —— **每一步都有东西，
+# 所以"点名的方法一个都没用上"这件事必须自己说出来。**
+#
+# ## `name_taken` —— 单细胞侧也有，而且更荒谬
+#
+#   pip install edgeR     -> "Redirect Microsoft Edge to your preferred browser"
+#   pip install slingshot -> ElasticSearch 索引迁移
+#
+# `edgeR` 是 §2.5 点名的差异分析工具，`slingshot` 是 §2.6 点名的轨迹工具。
+# 这两个名字**绝对不能进 requirements.txt**：装上了不会报错，
+# 只会让 `import edgeR` 拿到一个浏览器重定向库。
+#
+# 判断依据是 summary / author / project_urls，不是"名字存不存在" ——
+# `SingleR` 就是反例（见下）。
+NAMED_TOOLS = {
+    # ---- §2.1 原始矩阵校正 --------------------------------------------------
+    "SoupX": dict(
+        kind="r_package", section="§2.1",
+        reason=("R 包（CRAN/GitHub），PyPI 上无同名包；本仓库 CI 不装 R + rpy2。"
+                "它还需要空液滴（empty droplet）信息"),
+    ),
+    "CellBender": dict(
+        kind="deps", section="§2.1",
+        reason=("PyPI 有真包（0.4.0），但依赖 `torch` + `pyro-ppl>=1.8.4` —— "
+                "GPU 导向的深度生成模型；GitHub 托管 runner 无 GPU，"
+                "CPU 训练时间不现实"),
+    ),
+    # ---- §2.2 归一化 --------------------------------------------------------
+    "SCTransform": dict(
+        kind="r_package", section="§2.2",
+        reason="R 包（Seurat 生态），PyPI 上无同名包；本仓库用 normalize_total + log1p",
+    ),
+    "scran": dict(
+        kind="r_package", section="§2.2",
+        reason="Bioconductor R 包，PyPI 上无同名包",
+    ),
+    # ---- §2.4 细胞类型注释 --------------------------------------------------
+    "SingleR": dict(
+        kind="needs_reference", section="§2.4",
+        reason=("**这个不是顶名的**：PyPI 上的 `SingleR` 0.5.0 是 BiocPy/singler，"
+                "R 那个算法的官方 Python 绑定（作者 Aaron Lun）。"
+                "但它需要**带标签的参考数据集**（R 侧的 celldex / ImmGen / HPCA），"
+                "本流水线没有 —— 而 CellTypist 自带可下载的预训练模型。"
+                "所以第二条证据用 CellTypist，不是 SingleR"),
+    ),
+    # ---- §2.5 拟bulk 差异分析 -----------------------------------------------
+    "DESeq2": dict(
+        kind="r_package", section="§2.5",
+        reason="Bioconductor R 包，PyPI 上无同名包；规范给的 rpy2 路径本仓库没有",
+    ),
+    "edgeR": dict(
+        kind="name_taken", section="§2.5",
+        reason=("**PyPI 上的 `edgeR` 是「Redirect Microsoft Edge to your preferred "
+                "browser」（作者 Daniel Agans，github.com/phwelo/edger）—— "
+                "和 Bioconductor 的 edgeR 毫无关系。** 真 edgeR 是 R 包。"
+                "这个名字进了 requirements.txt 就会装进来一个浏览器重定向工具"),
+    ),
+    # ---- §2.6 轨迹 ----------------------------------------------------------
+    "Monocle3": dict(
+        kind="r_package", section="§2.6",
+        reason="R 包（GitHub cole-trapnell-lab/monocle3），PyPI 上无同名包",
+    ),
+    "Slingshot": dict(
+        kind="name_taken", section="§2.6",
+        reason=("**PyPI 上的 `slingshot` 是「Index Migration for ElasticSearch」"
+                "（作者 Thierry Jossermoz）—— 与 Bioconductor 的 Slingshot 无关。** "
+                "真 Slingshot 是 R 包；本仓库用它的 Python 移植 scFates 代替"),
+    ),
+    "CytoTRACE2": dict(
+        kind="not_on_pypi", section="§2.6",
+        reason=("PyPI 上 `CytoTRACE` / `cytotrace` / `CytoTRACE2` 都查不到。"
+                "本仓库**自行实现**了 CytoTRACE 的核心统计量（GCS，"
+                "基因计数特征），产物里写明「这是自行实现，不是 CytoTRACE 包」"),
+    ),
+    "scVelo": dict(
+        kind="needs_layers", section="§2.6",
+        reason=("PyPI 有真包（0.3.4），依赖也不重 —— 但它需要 RNA velocity 的 "
+                "**spliced / unspliced 层**，而 10x 的 filtered_feature_bc_matrix "
+                "只有 counts，没有这两层。硬跑会把未剪接信息当 0"),
+    ),
+    # ---- §2.7 细胞通讯 ------------------------------------------------------
+    "CellChat": dict(
+        kind="r_package", section="§2.7",
+        reason="R 包（GitHub JinmiaoChenLab/CellChat），PyPI 上无同名包；主用 LIANA",
+    ),
+    # ---- §2.8 基因调控网络 --------------------------------------------------
+    "pySCENIC": dict(
+        kind="needs_resources", section="§2.8",
+        reason=("PyPI 有真包（pyscenic 0.12.1，依赖是 numba/dask/ctxcore 这些，"
+                "装得上）。**卡住的不是 pip，是资源**：SCENIC 需要 cisTarget 的 "
+                "motif 注释数据库（feather，GB 级）+ TF 列表，CI 上下载不现实。"
+                "所以本仓库跑的是共表达推断，产物里显式写明「不是 SCENIC」"),
+    ),
+}
+
+
+def probe_named_tools(log=None, only=None) -> dict:
+    """把 NAMED_TOOLS 整理成可写进状态 JSON 的登记表。
+
+    与空间侧同名同义。**不尝试 import** —— 这一节的结论是"没装/装不了"。
+    用 `importlib.util.find_spec` 复核一次，发现"登记说过不了、环境里却能
+    import"时 WARN（说明登记过期了）。
+    """
+    import importlib.util
+
+    import_name = {
+        "CellBender": "cellbender", "scran": "scran", "SingleR": "singler",
+        "DESeq2": "DESeq2", "edgeR": "edgeR", "scVelo": "scvelo",
+        "pySCENIC": "pyscenic", "SoupX": "SoupX", "SCTransform": "sctransform",
+        "Monocle3": "monocle3", "Slingshot": "slingshot",
+        "CytoTRACE2": "cytotrace", "CellChat": "cellchat",
+    }
+    out = {}
+    for tool, meta in NAMED_TOOLS.items():
+        if only is not None and tool not in only:
+            continue
+        mod = import_name.get(tool)
+        avail = False
+        if mod:
+            try:
+                avail = importlib.util.find_spec(mod) is not None
+            except (ImportError, ValueError):
+                avail = False
+        if avail and log:
+            log_warn(f"工具 {tool} 登记为不可用，但环境里能 import —— 登记需要更新")
+        out[tool] = {
+            "available": bool(avail),
+            "kind": meta["kind"],
+            "section": meta["section"],
+            "reason": meta["reason"],
+        }
+    return out
+
+
+def named_tools_note() -> str:
+    """一句话说明本仓库为什么 §2 点名的方法多数没用上。"""
+    return ("文档 §2.1–§2.8 点名的工具里，R 包（SoupX / SCTransform / scran / "
+            "DESeq2 / edgeR / Monocle3 / Slingshot / CellChat）一个都用不了 —— "
+            "本仓库 CI 没有 R + rpy2；CellBender / scVelo / pySCENIC 有 PyPI 真包，"
+            "但分别卡在 GPU、缺 spliced/unspliced 层、需要 GB 级 motif 数据库；"
+            "**`edgeR` 与 `slingshot` 在 PyPI 上是同名无关包**（浏览器重定向 / "
+            "ElasticSearch 迁移）。逐条理由见各状态文件的 named_tools 字段。"
+            "**这是缺口，不是「已覆盖」。**")
+
+
+
 def manifest_path(cfg: dict) -> Path:
     return Path(cfg["output"]["results_dir"]) / MANIFEST_NAME
 

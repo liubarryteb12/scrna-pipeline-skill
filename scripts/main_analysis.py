@@ -27,9 +27,10 @@ sys.path.insert(0, str(REPO / "scripts" / "lib"))
 
 from common import (capture_versions, init_manifest, load_config,  # noqa: E402
                     log_error, log_info, log_warn, manifest_path,
-                    manifest_summary, parse_args, read_json, read_state,
-                    record_human_review, record_input, record_params,
-                    record_step, set_orchestrated, write_json)
+                    manifest_summary, named_tools_note, parse_args,
+                    probe_named_tools, read_json, read_state,
+                    record_decision, record_human_review, record_input,
+                    record_params, record_step, set_orchestrated, write_json)
 
 # (步骤 id, 模块文件, 函数名, 是否必需, 中文名)
 STEPS = [
@@ -160,6 +161,32 @@ def run_all(cfg: dict, only: list = None) -> int:
     for node, label, req in HUMAN_REVIEW_NODES:
         record_human_review(cfg, node, required=req, status="pending",
                             note=f"{label} —— 需人工确认，本轮自动化未确认")
+
+    # ---- §2 点名工具的缺口登记 ------------------------------------------
+    #
+    # **为什么放在清单里，而不是各步骤的 status 文件里：**
+    # "R 包一个都跑不了"是本仓库**整轮运行**的属性（CI 没有 R + rpy2），
+    # 不是某一步的属性。放进清单只写一次，不会出现"6 个状态文件里
+    # 有 5 个写了、1 个漏了"这种半对半错的状态。
+    #
+    # 它必须存在，因为产物**看不出来**：02 有归一化、04 有差异表、
+    # 05 有四条轨迹、07 有调控子 —— 每一步都有东西，
+    # 所以"点名的方法一个都没用上"这件事得自己说出来。
+    named = probe_named_tools(log=log_warn)
+    record_decision(
+        cfg, "named_tools",
+        "文档 §2.1–§2.8 点名的工具，哪些真的用上了？",
+        (f"{sum(1 for i in named.values() if i['available'])}/{len(named)} 个可用；"
+         "本仓库实际使用的是内置/替代实现"),
+        evidence=named_tools_note(),
+    )
+    record_params(cfg, {"named_tools": named})
+    log_info("")
+    log_info("§2 点名工具的使用情况（**多数没用上，这是缺口不是已覆盖**）：")
+    for tool, info in named.items():
+        mark = "可用" if info["available"] else "未使用"
+        log_info(f"  [{mark}] {info['section']} {tool}（{info['kind']}）"
+                 f"—— {info['reason'][:66]}")
     log_info(f"运行清单：{manifest_path(cfg)}")
 
     failed_required = []
@@ -449,6 +476,54 @@ def run_all(cfg: dict, only: list = None) -> int:
         checks.append({"item": "图 虚拟敲除效应 (virtual_perturbation_effect.png)",
                        "ok": ok_fig, "required": False,
                        "detail": "存在" if ok_fig else "**缺失**"})
+
+    # ---- §2 点名工具的缺口登记 -------------------------------------------
+    #
+    # **判据是"理由写了没有"，不是"工具跑了没有"。**
+    # 将来某个工具能装了（比如 CI 换成带 R 的镜像），这条应该依然 PASS，
+    # 而不是因为 `available=False` 就变红 —— 那会把"如实记录"惩罚成失败。
+    #
+    # 必须存在的原因是产物**看不出来**：每一步都有东西产出，
+    # 而 §2 点名的 R 包（SCTransform / scran / DESeq2 / Monocle3 /
+    # Slingshot / CellChat / SoupX）一个都跑不了。
+    msum = read_json(res_dir / "run_manifest.json") if has_file(
+        res_dir / "run_manifest.json") else {}
+    named = (msum.get("params") or {}).get("named_tools")
+    if not isinstance(named, dict) or not named:
+        checks.append({
+            "item": "§2 点名工具的缺口已登记（清单 named_tools）",
+            "ok": False, "required": False,
+            "detail": "清单里没有 named_tools —— 读者会以为 §2 点名的方法都用上了",
+        })
+    else:
+        no_reason = [t for t, i in named.items() if not (i or {}).get("reason")]
+        no_kind = [t for t, i in named.items() if not (i or {}).get("kind")]
+        checks.append({
+            "item": "§2 点名工具的缺口已登记（清单 named_tools）",
+            "ok": not no_reason and not no_kind,
+            "required": False,
+            "detail": (f"{len(named)} 个点名工具已登记，"
+                       f"{sum(1 for i in named.values() if i.get('available'))} 个当前可用"
+                       if not no_reason and not no_kind else
+                       f"无理由 {no_reason}；无分类 {no_kind}"),
+        })
+        # 顶名的包必须被标成 name_taken —— 这是最危险的一类
+        squat = [t for t, i in named.items() if (i or {}).get("kind") == "name_taken"]
+        checks.append({
+            "item": "PyPI 同名无关包已标为 name_taken（edgeR / Slingshot）",
+            "ok": set(squat) >= {"edgeR", "Slingshot"},
+            "required": False,
+            "detail": f"已标注: {sorted(squat)}" if squat else "**一个都没标**",
+        })
+        # 决策链也要留痕（§0.4）
+        dec = msum.get("decisions") or []
+        checks.append({
+            "item": "点名工具的使用情况进了决策链（§0.4）",
+            "ok": any((d or {}).get("node") == "named_tools" for d in dec),
+            "required": False,
+            "detail": f"decisions 里 {len(dec)} 条，named_tools "
+                      f"{'在' if any((d or {}).get('node') == 'named_tools' for d in dec) else '**不在**'}",
+        })
 
     n_fail = 0
     for c in checks:
