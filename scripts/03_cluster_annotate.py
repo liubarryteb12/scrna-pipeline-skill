@@ -450,6 +450,54 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
     adata.write_h5ad(out)
     log_info(f"已写出 {out}")
 
+    # ---- §0.2 跨部分交接的**产出侧**：这一份 h5ad 就是 Part 3 的参考 -------
+    #
+    # Part 3（空间转录组）的 `deconvolution.reference: h5ad` 要的就是
+    # **这一份文件**：带细胞类型标签的单细胞 h5ad。契约有三条：
+    #
+    #   1. `layers['counts']` 必须是**原始计数** —— Part 3 用它的
+    #      类型均值当参考谱，而 NNLS 解的是线性混合，log 值会破坏线性；
+    #   2. `obs` 里要有细胞类型列（本仓库写的是 `celltype`），
+    #      Part 3 通过 `celltype_key` 指名要哪一列；
+    #   3. 基因集是**交集**：Part 3 只用两边共同基因，所以参考若是
+    #      HVG 子集，参考谱覆盖的基因就跟着变少。
+    #
+    # **前两条不满足时 Part 3 会静默算错或报 KeyError，第三条会被静默
+    # 接受。** 所以这里把契约状态**主动记下来**（而不是等 Part 3 去发现），
+    # 验收也据此检查 —— 交接的两端都要能被核对。
+    _ct_col = "celltype" if "celltype" in adata.obs.columns else None
+    _has_counts = "counts" in adata.layers
+    _n_hvg = int(adata.n_vars)
+    part3_ref = {
+        "path": str(out),
+        "contract": {
+            "layers['counts']": _has_counts,
+            "celltype_column": _ct_col,
+        },
+        "n_cells": int(adata.n_obs),
+        "n_genes": _n_hvg,
+        "counts_layer_source": ("02_integrate 存的原始计数（HVG 子集）"
+                                if _has_counts else None),
+        "how_part3_uses_it": (
+            "Part 3 的 `05_deconvolution.py` 在 `reference: h5ad` 下读"
+            "`layers['counts']` + `celltype_key`，按类型求均值得到参考谱 S，"
+            "再用 NNLS 解每个 spot 的组成；它会把这次交接记进"
+            "`run_manifest.json` 的 `cross_language`（含丢失字段）"),
+        "limitations": ([
+            "**基因集是 HVG 子集** —— 本文件来自 `integrated.h5ad`"
+            f"（{_n_hvg} 个高变基因），不是全基因集。Part 3 的参考谱"
+            "因此只覆盖两边的共同基因，共同基因太少时 Part 3 会直接报错",
+        ] if _n_hvg < 10000 else []) + ([
+            "**没有 counts 层** —— Part 3 会退回用 `.X`，而 `.X` 是 log 后的值，"
+            "解出的比例没有意义（Part 3 会 WARN 并记进 lost_fields）",
+        ] if not _has_counts else []) + ([
+            "**obs 里没有细胞类型列** —— Part 3 配 `celltype_key` 时会 KeyError",
+        ] if _ct_col is None else []),
+    }
+    if not _has_counts or _ct_col is None:
+        log_warn(f"Part 3 参考契约不完整：counts 层={_has_counts}，"
+                 f"细胞类型列={_ct_col} —— 见 cluster_status.json 的 part3_reference")
+
     status = {
         "dataset_id": cfg["dataset_id"],
         "n_cells": int(adata.n_obs),
@@ -463,6 +511,8 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
         "cluster_sizes": {str(k): int(v) for k, v in
                           adata.obs["leiden"].value_counts().sort_index().items()},
         "annotation": annot_record,
+        # §0.2 的产出侧契约（Part 2 → Part 3）
+        "part3_reference": part3_ref,
         "status": "ok",
     }
     write_json(res_dir / "cluster_status.json", status)

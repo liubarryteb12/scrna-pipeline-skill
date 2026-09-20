@@ -260,6 +260,31 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 不是 bug。回退不报错、只是把"Part 1 的疾病签名"换成了"本步自己的调控子"，
 下游解读完全变了，所以 `target_source` 是必填字段。
 
+### 本仓库还有第二条交接：Part 2 → Part 3 的参考 h5ad
+
+上面那条是 **Part 1 → Part 2**（进）。还有一条**出**的：
+Part 3（空间转录组）的 `deconvolution.reference: h5ad` 要的就是本仓库
+`03_cluster_annotate.py` 写出的 **`clustered.h5ad`** ——
+带细胞类型标签的单细胞参考。
+
+**契约有三条，前两条不满足会让 Part 3 静默算错或 KeyError：**
+
+| # | 要求 | 不满足时 Part 3 的表现 |
+|---|---|---|
+| 1 | `layers['counts']` 是**原始计数** | 退回用 `.X`（log 值）求参考谱 → **解出的比例没有意义，而它看起来仍像一组比例** |
+| 2 | `obs` 里有细胞类型列（本仓库是 `celltype`）| 配 `celltype_key` 时 KeyError |
+| 3 | 基因集是**交集** | 静默接受 —— 参考若是 HVG 子集，参考谱覆盖的基因就变少 |
+
+**第 3 条最容易被忽略，而且它是本仓库的实际情况**：`clustered.h5ad` 来自
+`integrated.h5ad`，那是**2000 个高变基因的子集**，不是全基因集。
+Part 3 因此只在共同基因上建参考谱。
+
+**交接的两端都要能被核对。** 所以产出侧把契约**主动记进**
+`cluster_status.json` 的 `part3_reference`（含 `contract` 与 `limitations`），
+验收项 `§0.2 Part 3 参考导出的契约` 据此检查 ——
+只检查消费侧（Part 3 记没记）的话，产出侧悄悄丢掉 counts 层
+**不会被任何人发现**。
+
 ### 候选基因的完整边表要落盘
 
 `07_grn.py` 的 `tf_regulons.csv` 里 `top_targets` 只有前 12 个靶基因、

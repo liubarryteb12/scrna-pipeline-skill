@@ -415,6 +415,35 @@ def run_all(cfg: dict, only: list = None) -> int:
     ann = cj.get("annotation") or {}
     ct = ann.get("celltypist") or {}
     ct_cmp = ann.get("celltypist_vs_marker") or {}
+
+    # ---- §0.2 交接的**产出侧**：Part 3 拿 `clustered.h5ad` 当参考 ----------
+    #
+    # Part 3 的 `deconvolution.reference: h5ad` 要的就是这一份文件。
+    # **交接的两端都要能被核对** —— 只检查消费侧（Part 3 记没记）的话，
+    # 产出侧悄悄丢掉 counts 层不会被任何人发现，而 Part 3 会静默退回
+    # 用 `.X`（log 值）去求参考谱，解出的比例没有意义。
+    #
+    # 所以这里检查产出侧的契约：**必须有 counts 层**（NNLS 要计数），
+    # **必须有细胞类型列**（Part 3 的 `celltype_key` 要指名一列）。
+    # 两条都不阻断 job（Part 3 可以不用这份文件），但缺了要红字显示。
+    _p3 = cj.get("part3_reference") or {}
+    _p3c = _p3.get("contract") or {}
+    _p3_missing = [k for k, v in (("layers['counts']", _p3c.get("layers['counts']")),
+                                  ("obs 细胞类型列", _p3c.get("celltype_column")))
+                   if not v]
+    checks.append({
+        "item": "§0.2 Part 3 参考导出的契约（counts 层 + 细胞类型列）",
+        "ok": bool(_p3) and not _p3_missing, "required": False,
+        "detail": (f"契约完整：counts 层 + `{_p3c.get('celltype_column')}` 列，"
+                   f"{_p3.get('n_cells')} 细胞 x {_p3.get('n_genes')} 基因"
+                   f"（Part 3 配 `reference: h5ad` 即可直接用）"
+                   if _p3 and not _p3_missing else
+                   (f"**契约缺**：{_p3_missing} —— Part 3 拿这份文件当参考时"
+                    f"会静默算错（退回 log 值）或 KeyError"
+                    if _p3 else
+                    "**没有 part3_reference 记录** —— cluster_status.json 是"
+                    "上一轮的旧文件，或这一步没跑完")),
+    })
     checks.append({
         "item": "CellTypist 自动注释（§2.4）",
         "ok": ct.get("status") == "ok", "required": False,
