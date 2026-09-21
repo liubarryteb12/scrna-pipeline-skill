@@ -575,40 +575,49 @@ def run_05_trajectory(cfg: dict) -> dict:
                                 "median_pseudotime": round(float(r["median"]), 4)})
         pd.DataFrame(branch_rows).to_csv(res_dir / "trajectory_segments.csv", index=False)
 
-    # ---- 9. 图：拟时序 UMAP + 每簇分布 --------------------------------------
-    # **第 3 面板的簇色必须与 umap_clusters 同源**（评审 3.8：原先 tab20，
-    # 同一 cluster 在两张图里颜色不同，跨图无法对照）；且 10 个簇仅颜色
-    # 编码而无图例（评审 3.6）。逐簇按 PAL_CYCLE 上色 + 显式图例。
-    fig, axes = plt.subplots(1, 3, figsize=(W_DOUBLE, mm(58)))
+    # ---- 9. 图：拟时序三联 -> **单图原则拆分（D-006）** ----------------------
+    # 拆成三张独立单图（S2 拟时序方法对照链）：
+    #   unit1 = 共识拟时序（方法主视图）
+    #   unit2 = DPT 交叉验证（两种独立方法方向一致是可信度证据）
+    #   unit3 = 细胞类型着色（**裁决 2**：原第 3 面板是"再换一套簇色"，
+    #            与 umap_clusters 重复、无新语义；换 celltype 后组叙事变为
+    #            "拟时序 -> 交叉验证 -> 拟时序与细胞类型的关系"）
     xy = adata.obsm["X_umap"]
-    s0 = axes[0].scatter(xy[:, 0], xy[:, 1], c=consensus, s=4, cmap="viridis")
-    axes[0].set_title(f"Consensus pseudotime (root = cluster {root_cluster})")
-    fig.colorbar(s0, ax=axes[0], label="pseudotime (higher = later)")
+    fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(58)))
+    s0 = ax.scatter(xy[:, 0], xy[:, 1], c=consensus, s=4, cmap="viridis")
+    ax.set_title(f"Consensus pseudotime (root = cluster {root_cluster})")
+    fig.colorbar(s0, ax=ax, label="pseudotime (higher = later)")
+    ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
+    save_fig(cfg, "02-05-04-unit1-pseudotime-consensus", fig)
     if "dpt" in corrected:
-        s1 = axes[1].scatter(xy[:, 0], xy[:, 1], c=corrected["dpt"], s=4, cmap="viridis")
-        axes[1].set_title("DPT pseudotime (direction-corrected)")
-        fig.colorbar(s1, ax=axes[1], label="pseudotime")
-    leiden_str = adata.obs["leiden"].astype(str).values
-    # **与 umap_clusters 完全同一排序与配色**：那边按数值序逐簇 scatter、
-    # 颜色吃 axes.prop_cycle（=PAL_CYCLE）。这里用别的排序或 tab20 都会让
-    # 同一簇跨图变色（评审 3.8 的原始问题），所以逐字对齐。
-    leiden_cats = sorted(set(leiden_str), key=lambda x: int(x) if x.isdigit() else x)
-    for ax_i in (axes[2],):
-        from matplotlib.lines import Line2D
-        for ci, cat in enumerate(leiden_cats):
-            m = leiden_str == str(cat)
-            ax_i.scatter(xy[m, 0], xy[m, 1], s=4,
-                         color=PAL_CYCLE[ci % len(PAL_CYCLE)])
-        ax_i.set_title("Leiden clusters")
-        handles = [Line2D([0], [0], marker="o", ls="", markersize=4,
-                          color=PAL_CYCLE[ci % len(PAL_CYCLE)], label=str(cat))
-                   for ci, cat in enumerate(leiden_cats)]
-        ax_i.legend(handles=handles, fontsize=5, ncol=2, loc="best",
-                    framealpha=0.7)
-    for ax in axes:
+        fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(58)))
+        s1 = ax.scatter(xy[:, 0], xy[:, 1], c=corrected["dpt"], s=4, cmap="viridis")
+        ax.set_title("DPT pseudotime (direction-corrected)")
+        fig.colorbar(s1, ax=ax, label="pseudotime")
         ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
-    save_fig(cfg, "02-05-04-unit1-pseudotime-umap", fig)
-
+        save_fig(cfg, "02-05-04-unit2-pseudotime-dpt", fig)
+    # unit3：按 celltype（若存在）或 leiden 着色。与 umap_clusters 的
+    # 配色纪律一致（PAL_CYCLE、数值序）；图例显式。
+    celltype_key = "celltype" if "celltype" in adata.obs.columns else "leiden"
+    cat_vals = adata.obs[celltype_key].astype(str).values
+    cats = sorted(set(cat_vals), key=lambda x: (not x.isdigit(), int(x) if x.isdigit() else x))
+    fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(58)))
+    from matplotlib.lines import Line2D
+    for ci, cat in enumerate(cats):
+        m = cat_vals == str(cat)
+        ax.scatter(xy[m, 0], xy[m, 1], s=4,
+                   color=PAL_CYCLE[ci % len(PAL_CYCLE)])
+    handles = [Line2D([0], [0], marker="o", ls="", markersize=4,
+                      color=PAL_CYCLE[ci % len(PAL_CYCLE)], label=str(cat))
+               for ci, cat in enumerate(cats)]
+    ax.legend(handles=handles, fontsize=5, ncol=2, loc="best",
+              framealpha=0.7)
+    ax.set_title(f"{celltype_key} on the same UMAP (pseudotime context)")
+    ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
+    if celltype_key != "celltype":
+        log_warn("celltype 列缺失 —— 02-05-04-unit3 跳过（图名账目不含 leiden 回退）")
+    else:
+        save_fig(cfg, "02-05-04-unit3-celltype-on-umap", fig)
     per_cluster = (pd.DataFrame({"cluster": adata.obs["leiden"].astype(str).values,
                                  "consensus": consensus,
                                  "dpt": corrected.get("dpt", np.full(len(consensus), np.nan))})

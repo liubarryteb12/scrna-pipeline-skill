@@ -161,35 +161,34 @@ def run_01_qc(cfg: dict) -> dict:
         "pct_counts_ribo": "Ribosomal fraction (%)",
         "pct_counts_hb": "Haemoglobin fraction (%)",
     }
-    fig, axes = plt.subplots(1, len(keys), figsize=(W_DOUBLE, mm(58)))
-    axes = np.atleast_1d(axes)
-    # **5 个面板挤 183 mm，长标题会互压/被右缘裁掉**（实测第二轮）：
-    # 标题字号压到 7 并允许两行；像 "Haemoglobin fraction (%)" 这种长名
-    # 手动折行，避免撞上相邻面板。
-    QC_LABELS_SHORT = {
-        "n_genes_by_counts": "Genes\ndetected",
-        "total_counts": "Total\ncounts",
-        "pct_counts_mt": "Mitochondrial\n(%)",
-        "pct_counts_ribo": "Ribosomal\n(%)",
-        "pct_counts_hb": "Haemoglobin\n(%)",
+    # **单图原则拆分（D-006）**：五联小提琴拆为 5 张独立单图（S1 过滤前
+    # QC 流程链）。每个指标一张、独立达标图幅（W_SINGLE）与分辨率门禁；
+    # 组内"联合决定过滤阈值"的叙事由 figure_groups 的 S1 组表达。
+    # 指标的映射/退化处理逻辑与拆分前一致（QC_LABELS 人类可读、
+    # IQR=0 画 strip 散点并注明 no variance）。
+    UNIT_NAMES = {
+        "n_genes_by_counts": "02-01-01-unit1-genes-detected",
+        "total_counts": "02-01-01-unit2-total-counts",
+        "pct_counts_mt": "02-01-01-unit3-mito-fraction",
+        "pct_counts_ribo": "02-01-01-unit4-ribo-fraction",
+        "pct_counts_hb": "02-01-01-unit5-hb-fraction",
     }
-    for ax, k in zip(axes, keys):
+    for _ui, k in enumerate(keys, start=1):
         v = adata.obs[k].astype(float).values
-        # **退化面板（IQR=0，如 pbmc3k 的血红蛋白：绝大多数细胞恒为 0）**
-        # 小提琴会塌成一根裸竖线 + 顶端横线，看起来像渲染失败。
-        # 改画 strip 散点并注明 no variance —— 少数非零点反而因此可见。
+        label = QC_LABELS.get(k, k)
+        fig, ax = plt.subplots(figsize=(W_SINGLE, mm(58)))
         if float(np.subtract(*np.percentile(v, [75, 25]))) == 0:
             rng = np.random.default_rng(cfg["analysis"]["seed"])
             ax.scatter(rng.uniform(-0.12, 0.12, len(v)), v, s=2, alpha=0.25,
                        color=PAL["primary"], rasterized=True)
-            ax.set_title(f"{QC_LABELS_SHORT.get(k, k)}\nno variance: "
-                         f"{int((v != 0).sum())}/{len(v)} cells", fontsize=7)
+            ax.set_title(f"{label}\nno variance: "
+                         f"{int((v != 0).sum())}/{len(v)} cells", fontsize=8)
         else:
-            ax.set_title(QC_LABELS_SHORT.get(k, k), fontsize=7)
             ax.violinplot(v, showmedians=True)
+            ax.set_title(label, fontsize=8)
         ax.set_xticks([])
-    fig.suptitle(f"QC metrics before filtering (n={n0})")
-    save_fig(cfg, "02-01-01-unit1-qc-violin-before", fig)
+        # 图名来自 UNIT_NAMES 查表（字面量，过命名门禁）
+        save_fig(cfg, UNIT_NAMES.get(k, "02-01-01-unit1-genes-detected"), fig)
 
     # 阈值线：基因数 vs 线粒体比例 —— 双细胞和死细胞在这张图上是两个角
     fig, ax = plt.subplots(figsize=(W_SINGLE, mm(64)))

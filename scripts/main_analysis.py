@@ -106,7 +106,7 @@ REQUIRED_FILES = [
 
 # 必需的图（相对 figures_dir，不含扩展名）
 REQUIRED_FIGURES = [
-    ("02-01-01-unit1-qc-violin-before",          "过滤前 QC 分布"),
+    ("02-01-01-unit1-genes-detected",     "过滤前 QC: genes detected"),     ("02-01-01-unit2-total-counts",      "过滤前 QC: total counts"),     ("02-01-01-unit3-mito-fraction",     "过滤前 QC: mito fraction"),     ("02-01-01-unit4-ribo-fraction",     "过滤前 QC: ribo fraction"),     ("02-01-01-unit5-hb-fraction",       "过滤前 QC: hb fraction"),
     ("02-01-02-unit1-qc-scatter-thresholds",     "QC 阈值散点"),
     ("02-02-01-unit1-hvg-selection",             "高变基因选择"),
     ("02-02-02-unit1-pca-variance-ratio",        "PCA 方差解释"),
