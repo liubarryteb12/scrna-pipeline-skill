@@ -589,36 +589,52 @@ def run_05_trajectory(cfg: dict) -> dict:
     fig.colorbar(s0, ax=ax, label="pseudotime (higher = later)")
     ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
     save_fig(cfg, "02-05-04-unit1-pseudotime-consensus", fig)
-    # **主曲线 + root 标记**（差距清单 #17，文献范式）：
-    # 只有颜色渐变时读者看不出"轨迹从哪来到哪去"。用簇质心按拟时序中位
-    # 排成的折线作主路径、root 簇用白圈黑边显式标出、箭头给方向。
-    # 主路径是**示意**（簇级连通的视觉引导），不是拟合出来的曲线 ——
-    # 副标题写明，避免被读成推断结果。
+    # **PAGA 连通骨架 + root 标记**（差距清单 #17，文献范式）：
+    # 只有颜色渐变时读者看不出"轨迹从哪来到哪去"。叠加**有统计依据的
+    # PAGA 连通边**（宽度正比于 connectivity），边按拟时序方向加箭头，
+    # root 簇用白圈标出。
+    # **不用"簇质心按拟时序排序直连"** —— 实测在分散嵌入（PBMC）上
+    # 会画出横跨全图的假折线（三角形 + 长横线），看起来像推断出的轨迹，
+    # 而实际只是排序连线的假象：**误导性的图不如不出**（坑 0.1）。
     fig_curve, ax_c = plt.subplots(figsize=(W_ONE_HALF, mm(58)))
     ax_c.scatter(xy[:, 0], xy[:, 1], c=consensus, s=4, cmap="viridis")
     try:
         cl = adata.obs["leiden"].astype(str).values
+        cats_sorted = sorted(set(cl), key=lambda x: int(x) if x.isdigit() else x)
         cents = np.array([[xy[cl == c, 0].mean(), xy[cl == c, 1].mean()]
-                          for c in sorted(set(cl), key=lambda x: int(x) if x.isdigit() else x)])
-        med = np.array([np.median(consensus[cl == c])
-                        for c in sorted(set(cl), key=lambda x: int(x) if x.isdigit() else x)])
-        ordc = np.argsort(med)
-        path = cents[ordc]
-        ax_c.plot(path[:, 0], path[:, 1], "-", color=PAL["black"],
-                  linewidth=1.0, alpha=0.75, zorder=5)
-        ax_c.annotate("", xy=path[-1], xytext=path[-2],
-                      arrowprops=dict(arrowstyle="->", color=PAL["black"], lw=1.2))
-        rc = np.where(np.array(sorted(set(cl), key=lambda x: int(x) if x.isdigit() else x)) == root_cluster)[0]
-        if len(rc) > 0:
-            ax_c.scatter(cents[rc[0], 0], cents[rc[0], 1], s=90,
-                         facecolors="none", edgecolors=PAL["black"], linewidths=1.4, zorder=6)
-            ax_c.text(cents[rc[0], 0], cents[rc[0], 1], " root", fontsize=7,
-                      color=PAL["black"], va="center")
-        subtitle_curve = ("cluster centroids joined in pseudotime order (schematic guide, not a fitted curve); open circle = root cluster " + str(root_cluster))
+                          for c in cats_sorted])
+        med = np.array([np.median(consensus[cl == c]) for c in cats_sorted])
+        # PAGA connectivity：只画非平凡边（阈值过滤统计噪声）
+        conn_m = np.asarray(conn)
+        n_edges = 0
+        for a in range(len(cats_sorted)):
+            for b in range(a + 1, len(cats_sorted)):
+                w = float(conn_m[a, b])
+                if w < 0.05:
+                    continue
+                n_edges += 1
+                src, dst = (a, b) if med[a] <= med[b] else (b, a)
+                ax_c.annotate("",
+                              xy=tuple(cents[dst]), xytext=tuple(cents[src]),
+                              arrowprops=dict(arrowstyle="->", color=PAL["black"],
+                                              lw=0.5 + 2.0 * w, alpha=0.65,
+                                              shrinkA=6, shrinkB=6),
+                              zorder=4)
+        ri = cats_sorted.index(root_cluster) if root_cluster in cats_sorted else -1
+        if ri >= 0:
+            ax_c.scatter(cents[ri, 0], cents[ri, 1], s=110,
+                         facecolors="none", edgecolors=PAL["black"],
+                         linewidths=1.4, zorder=6)
+            ax_c.text(cents[ri, 0], cents[ri, 1], " root " + str(root_cluster),
+                      fontsize=7, color=PAL["black"], va="center", zorder=7)
+        subtitle_curve = ("PAGA connectivity skeleton (" + str(n_edges)
+                          + " edges, width proportional to connectivity > 0.05); "
+                          + "arrows point along increasing pseudotime; open circle = root cluster "
+                          + str(root_cluster))
     except Exception as e:  # noqa: BLE001
-        log_warn(f"主曲线叠加失败: {type(e).__name__}: {e}")
-        subtitle_curve = "centroid path unavailable"
-    ax_c.set_title("Consensus pseudotime with principal path")
+        log_warn(f"PAGA 骨架叠加失败: {type(e).__name__}: {e}")
+        subtitle_curve = "PAGA skeleton unavailable"
+    ax_c.set_title("Consensus pseudotime with PAGA skeleton")
     ax_c.set_xlabel("UMAP1"); ax_c.set_ylabel("UMAP2")
     fig_curve.colorbar(s0, ax=ax_c, label="pseudotime (higher = later)")
     save_fig(cfg, "02-05-04-unit4-pseudotime-principal-path", fig_curve)
