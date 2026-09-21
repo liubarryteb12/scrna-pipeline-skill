@@ -40,7 +40,7 @@ from scipy import sparse  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, record_step, save_fig, set_seed, write_json,
-                    W_DOUBLE, W_ONE_HALF, W_SINGLE, mm,)
+                    W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, PAL,)
 
 # 每个调控子保留多少个共表达靶基因
 N_TARGETS = 30
@@ -297,7 +297,7 @@ def run_07_grn(cfg: dict) -> dict:
                     sd[sd == 0] = 1.0
                     matz = np.nan_to_num((mat - mu) / sd)
 
-                    fig, ax = plt.subplots(figsize=(W_ONE_HALF, max(mm(56), 0.26 * len(show) + 1.6)))
+                    fig, ax = plt.subplots(figsize=(W_ONE_HALF, W_SINGLE, max(mm(56), 0.26 * len(show) + 1.6)))
                     im = ax.imshow(matz, aspect="auto", cmap="RdBu_r", vmin=-2, vmax=2)
                     ax.set_yticks(range(len(show)))
                     ax.set_yticklabels(show, fontsize=7)
@@ -307,6 +307,28 @@ def run_07_grn(cfg: dict) -> dict:
                     ax.set_title("Regulon activity along pseudotime (z-scored)")
                     fig.colorbar(im, ax=ax, label="z-scored activity")
                     save_fig(cfg, "02-07-01-unit1-tf-activity-vs-pseudotime", fig)
+                    DYNAMIC_FIG_BASES = {"01": 4}
+                    TF_FIG_BASE = "-".join(["02", "07", "01", "unit"])
+                    # **单 TF 置信带面板**（差距清单 #18，文献范式）：
+                    # 热图看得到"哪些 TF 相关"，看不到单个 TF 的趋势形状
+                    # 与不确定性。每个 top TF 一张小面板：均值线 + ±1SD ribbon。
+                    xs = np.arange(nb)
+                    for ui, tf in enumerate(show[:4], start=1):
+                        v = activities[tf]
+                        mu_b = np.array([float(np.nanmean(v[bins == b])) if np.sum(bins == b) else np.nan
+                                         for b in range(nb)])
+                        sd_b = np.array([float(np.nanstd(v[bins == b])) if np.sum(bins == b) else np.nan
+                                         for b in range(nb)])
+                        fig_t, ax_t = plt.subplots(figsize=(W_SINGLE, mm(46)))
+                        ax_t.plot(xs, mu_b, "-o", ms=2.5, lw=1.0, color=PAL["primary"])
+                        ax_t.fill_between(xs, mu_b - sd_b, mu_b + sd_b,
+                                          color=PAL["primary"], alpha=0.18,
+                                          label="±1 SD")
+                        ax_t.set_xlabel("pseudotime bin (higher = later)")
+                        ax_t.set_ylabel("regulon activity")
+                        ax_t.set_title(f"{tf} activity along pseudotime (mean ± 1 SD per bin)")
+                        ax_t.legend(fontsize=6)
+                        save_fig(cfg, TF_FIG_BASE + str(ui + 1) + "-tf-" + tf.lower() + "-trend", fig_t)
         except Exception as e:  # noqa: BLE001
             traj_status = {"status": "failed",
                            "reason": f"{type(e).__name__}: {e}"}
@@ -324,7 +346,7 @@ def run_07_grn(cfg: dict) -> dict:
         sub = act_mat[top_tfs]
         # 宽度夹在 [单栏半, 双栏]：类别少时不至于太空，类别多时也不会
         # 画出装不进一页的图
-        fig, ax = plt.subplots(figsize=(min(W_DOUBLE, max(W_ONE_HALF, 0.42 * len(top_tfs) + 2.4)),
+        fig, ax = plt.subplots(figsize=(min(W_DOUBLE, max(W_ONE_HALF, W_SINGLE, 0.42 * len(top_tfs) + 2.4)),
                                         max(3.4, 0.34 * len(sub) + 1.8)))
         im = ax.imshow(sub.values, aspect="auto", cmap="RdBu_r",
                        vmin=-np.abs(sub.values).max(), vmax=np.abs(sub.values).max())

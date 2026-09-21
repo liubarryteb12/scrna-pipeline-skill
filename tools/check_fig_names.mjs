@@ -95,10 +95,13 @@ function stripComments(src) {
 function collectLiterals(src) {
   const out = [];
   const lineOf = (idx) => src.slice(0, idx).split(/\r?\n/).length;
-  // 只认"长得像图名"的字面量：以 <阶段>- 开头
+  // 只认"长得像图名"的字面量：以 <阶段>- 开头。
+  // **含 { } 的 f-string 模板跳过** —— 那是运行时拼名（须配 DYNAMIC_FIG_BASES
+  // 声明豁免），对它做格式校验只会逼人写绕过式拼接。
   const re = new RegExp(`"(${PART}-[^"]*)"`, "g");
   let m;
   while ((m = re.exec(src)) !== null) {
+    if (m[1].includes("{") || m[1].includes("}")) continue;
     out.push({ name: m[1].replace(/\.(pdf|png)$/i, ""), line: lineOf(m.index) });
   }
   return out;
@@ -186,6 +189,16 @@ for (const f of scripts) {
     }
   }
 
+  // **声明式动态名豁免**：脚本可写 DYNAMIC_FIG_BASES = {"<figNo>": <count>}
+  // 声明某图号下有 N 张运行时命名的单图。豁免账目差并把该图号计为存在。
+  let dynBases = {};
+  const dynM = src.match(/DYNAMIC_FIG_BASES\s*=\s*\{([^}]*)\}/);
+  if (dynM) {
+    for (const [, k, v] of dynM[1].matchAll(/"(\d{2})"\s*:\s*(\d+)/g)) {
+      dynBases[k] = Number(v);
+    }
+  }
+
   // **同一个脚本里两处 save 调用写同一个名字** = 后写的覆盖先写的。
   // 这个只能从**调用点**看：字面量去重之后它已经看不出来了。
   const callNames = calls.map((c) => c.name).filter(Boolean);
@@ -197,10 +210,18 @@ for (const f of scripts) {
   // **账目对齐**：字面量数不能少于出图调用数。
   // 少了就说明有调用用了拼出来的名字，而那个名字没被任何检查看过。
   if (lits.length < calls.length) {
-    problems.push(
-      `${f}: ${calls.length} 处出图调用，但只有 ${lits.length} 个合规图名字面量 —— ` +
-        `有调用用的是拼出来的名字，静态检查看不见它`
-    );
+    // 账目差可被 DYNAMIC_FIG_BASES 豁免：差值 = 动态图数量
+    const deficit = calls.length - lits.length;
+    const declared = Object.values(dynBases).reduce((a, b) => a + b, 0);
+    if (deficit > declared) {
+      problems.push(
+        `${f}: ${calls.length} 处出图调用，但只有 ${lits.length} 个合规图名字面量 —— ` +
+          `有调用用的是拼出来的名字，静态检查看不见它` +
+          (declared ? `（动态豁免声明了 ${declared} 张，差 ${deficit - declared} 张没声明）` : "")
+      );
+    } else if (deficit > 0) {
+      notes.push(`${f}: ${deficit} 个动态图名（DYNAMIC_FIG_BASES 声明豁免）`);
+    }
   }
   for (const c of calls) {
     if (!c.name) {
@@ -208,8 +229,13 @@ for (const f of scripts) {
     }
   }
 
-  // 图号从 01 起连续
+  // 图号从 01 起连续（含 DYNAMIC_FIG_BASES 声明的动态图号）
   const figNos = [...new Set(figs.map((x) => x.fig))].sort((a, b) => a - b);
+  for (const [k, n] of Object.entries(dynBases)) {
+    if (!figNos.includes(Number(k))) figNos.push(Number(k));
+    notes.push(`${f}: 动态图号 ${k} 声明 ${n} 张运行时命名单图（DYNAMIC_FIG_BASES）`);
+  }
+  figNos.sort((a, b) => a - b);
   figNos.forEach((n, i) => {
     if (n !== i + 1) {
       problems.push(`${f}: 图号 ${String(n).padStart(2, "0")} 不连续（应为 ${String(i + 1).padStart(2, "0")}）`);

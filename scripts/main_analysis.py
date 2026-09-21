@@ -114,6 +114,8 @@ REQUIRED_FIGURES = [
     ("02-03-02-unit1-umap-clusters",             "UMAP 聚类图"),
     ("02-03-03-unit1-markers-dotplot",           "marker 点图"),
     ("02-03-04-unit1-celltype-scores-heatmap",   "细胞类型打分热图"),
+    ("02-05-04-unit4-pseudotime-principal-path", "拟时序主路径+root"),
+    ("02-05-05-unit2-pseudotime-ridgeline",      "拟时序山脊图"),
 ]
 
 

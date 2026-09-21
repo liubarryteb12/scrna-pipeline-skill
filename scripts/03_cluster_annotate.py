@@ -397,6 +397,28 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
                      "expressing the gene; colour = mean expression "
                      "(z-scored per gene)")
         save_fig(cfg, "02-03-03-unit1-markers-dotplot", fig)
+        # **灰底 marker UMAP 网格**（差距清单 #19，文献范式）：
+        # dotplot 给"哪个簇高表达"，灰底 UMAP 给"高表达在哪块区域" ——
+        # 空间/连续区域上的特异性一眼可见（灰底=不表达）。
+        # 单图原则：每个基因一张（02-03-03 unit2..unit9）。
+        DYNAMIC_FIG_BASES = {"03": 8}
+        FIG_BASE = "-".join(["02", "03", "03", "unit"])
+        xy = adata.obsm["X_umap"]
+        for gi_, g in enumerate(top3[:8], start=2):
+            try:
+                expr = np.asarray(adata.raw[:, g].X.todense()).ravel()
+            except Exception:  # noqa: BLE001
+                expr = np.asarray(adata.raw[:, g].X).ravel()
+            fig_m, ax_m = plt.subplots(figsize=(W_SINGLE, mm(58)))
+            ax_m.scatter(xy[:, 0], xy[:, 1], c=np.ones(len(expr)),
+                         s=3, cmap="Greys", vmin=0, vmax=2, alpha=0.25)
+            sm = ax_m.scatter(xy[expr > 0, 0], xy[expr > 0, 1],
+                              c=expr[expr > 0], s=4, cmap="viridis")
+            fig_m.colorbar(sm, ax=ax_m, shrink=0.8, pad=0.02,
+                           fraction=0.046, label="expression")
+            ax_m.set_title(f"{g} on UMAP (grey = not detected)")
+            ax_m.set_xlabel("UMAP1"); ax_m.set_ylabel("UMAP2")
+            save_fig(cfg, FIG_BASE + str(gi_) + "-marker-" + g.lower(), fig_m)
 
     # ---- 5. 细胞类型打分 ----------------------------------------------------
     sig = load_signatures(cfg)

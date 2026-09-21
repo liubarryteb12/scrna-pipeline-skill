@@ -589,6 +589,39 @@ def run_05_trajectory(cfg: dict) -> dict:
     fig.colorbar(s0, ax=ax, label="pseudotime (higher = later)")
     ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
     save_fig(cfg, "02-05-04-unit1-pseudotime-consensus", fig)
+    # **主曲线 + root 标记**（差距清单 #17，文献范式）：
+    # 只有颜色渐变时读者看不出"轨迹从哪来到哪去"。用簇质心按拟时序中位
+    # 排成的折线作主路径、root 簇用白圈黑边显式标出、箭头给方向。
+    # 主路径是**示意**（簇级连通的视觉引导），不是拟合出来的曲线 ——
+    # 副标题写明，避免被读成推断结果。
+    fig_curve, ax_c = plt.subplots(figsize=(W_ONE_HALF, mm(58)))
+    ax_c.scatter(xy[:, 0], xy[:, 1], c=consensus, s=4, cmap="viridis")
+    try:
+        cl = adata.obs["leiden"].astype(str).values
+        cents = np.array([[xy[cl == c, 0].mean(), xy[cl == c, 1].mean()]
+                          for c in sorted(set(cl), key=lambda x: int(x) if x.isdigit() else x)])
+        med = np.array([np.median(consensus[cl == c])
+                        for c in sorted(set(cl), key=lambda x: int(x) if x.isdigit() else x)])
+        ordc = np.argsort(med)
+        path = cents[ordc]
+        ax_c.plot(path[:, 0], path[:, 1], "-", color=PAL["black"],
+                  linewidth=1.0, alpha=0.75, zorder=5)
+        ax_c.annotate("", xy=path[-1], xytext=path[-2],
+                      arrowprops=dict(arrowstyle="->", color=PAL["black"], lw=1.2))
+        rc = np.where(np.array(sorted(set(cl), key=lambda x: int(x) if x.isdigit() else x)) == root_cluster)[0]
+        if len(rc) > 0:
+            ax_c.scatter(cents[rc[0], 0], cents[rc[0], 1], s=90,
+                         facecolors="none", edgecolors=PAL["black"], linewidths=1.4, zorder=6)
+            ax_c.text(cents[rc[0], 0], cents[rc[0], 1], " root", fontsize=7,
+                      color=PAL["black"], va="center")
+        subtitle_curve = ("cluster centroids joined in pseudotime order (schematic guide, not a fitted curve); open circle = root cluster " + str(root_cluster))
+    except Exception as e:  # noqa: BLE001
+        log_warn(f"主曲线叠加失败: {type(e).__name__}: {e}")
+        subtitle_curve = "centroid path unavailable"
+    ax_c.set_title("Consensus pseudotime with principal path")
+    ax_c.set_xlabel("UMAP1"); ax_c.set_ylabel("UMAP2")
+    fig_curve.colorbar(s0, ax=ax_c, label="pseudotime (higher = later)")
+    save_fig(cfg, "02-05-04-unit4-pseudotime-principal-path", fig_curve)
     if "dpt" in corrected:
         fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(58)))
         s1 = ax.scatter(xy[:, 0], xy[:, 1], c=corrected["dpt"], s=4, cmap="viridis")
@@ -641,7 +674,47 @@ def run_05_trajectory(cfg: dict) -> dict:
     ax.set_xlabel("cluster (ordered by median consensus pseudotime)")
     ax.set_ylabel("consensus pseudotime (higher = later)")
     ax.set_title("Pseudotime distribution per cluster")
+    # **ns 必须写出来**（差距清单 #22）：只标显著的星号会把"大多数簇
+    # 彼此无差异"这件事藏起来。全局 Kruskal-Wallis 检验，不显著就写 ns。
+    try:
+        from scipy.stats import kruskal
+        groups_ok = [d[np.isfinite(d)] for d in data if np.sum(np.isfinite(d)) >= 5]
+        if len(groups_ok) >= 2:
+            H, p_kr = kruskal(*groups_ok)
+            mark = "p < 0.001" if p_kr < 1e-3 else (
+                f"p = {p_kr:.3g}" if p_kr < 0.05 else f"ns (p = {p_kr:.3g})")
+            ax.set_title(f"Pseudotime distribution per cluster (Kruskal-Wallis: {mark})")
+    except Exception as e:  # noqa: BLE001
+        log_warn(f"Kruskal 检验失败: {type(e).__name__}: {e}")
     save_fig(cfg, "02-05-05-unit1-pseudotime-by-cluster", fig)
+    # **山脊图（ridgeline）**（差距清单 #20，文献范式）：箱线只给分位数，
+    # 山脊图给每个簇的**分布形状**（双峰=该簇跨两个状态）。
+    # 手写 KDE + 垂直错开（不引 ggridges/seaborn 新依赖）。
+    try:
+        from scipy.stats import gaussian_kde
+        fig_r, ax_r = plt.subplots(figsize=(W_ONE_HALF, mm(72)))
+        grid = np.linspace(float(np.nanmin(consensus)),
+                           float(np.nanmax(consensus)), 200)
+        for ri, c in enumerate(order):
+            v = consensus[adata.obs["leiden"].astype(str).values == c]
+            v = v[np.isfinite(v)]
+            if len(v) < 10:
+                continue
+            kde = gaussian_kde(v)
+            dens = kde(grid)
+            # 每条曲线缩放到固定高度后按簇错开
+            dens = dens / float(np.nanmax(dens)) * 0.8
+            ax_r.fill_between(grid, ri + dens, ri, color=PAL["primary"],
+                             alpha=0.45)
+            ax_r.plot(grid, ri + dens, "-", lw=0.7, color=PAL["primary"])
+        ax_r.set_yticks(range(len(order)))
+        ax_r.set_yticklabels(order, fontsize=6)
+        ax_r.set_xlabel("consensus pseudotime (higher = later)")
+        ax_r.set_ylabel("cluster")
+        ax_r.set_title("Pseudotime density per cluster (ridgeline) - KDE per cluster, offset vertically")
+        save_fig(cfg, "02-05-05-unit2-pseudotime-ridgeline", fig_r)
+    except Exception as e:  # noqa: BLE001
+        log_warn(f"山脊图失败: {type(e).__name__}: {e}")
 
     # ---- 10. 每细胞拟时序落盘（供 07_grn 做 regulon×拟时序）-----------------
     cell_df = pd.DataFrame({"cell": adata.obs_names.astype(str),
