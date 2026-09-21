@@ -610,7 +610,7 @@ def run_05_trajectory(cfg: dict) -> dict:
         for a in range(len(cats_sorted)):
             for b in range(a + 1, len(cats_sorted)):
                 w = float(conn_m[a, b])
-                if w < 0.05:
+                if w < 0.15:  # 只画强连通边（PBMC 的 PAGA 普遍偏高，低阈值会画出跨簇长边）
                     continue
                 n_edges += 1
                 src, dst = (a, b) if med[a] <= med[b] else (b, a)
@@ -625,10 +625,10 @@ def run_05_trajectory(cfg: dict) -> dict:
             ax_c.scatter(cents[ri, 0], cents[ri, 1], s=110,
                          facecolors="none", edgecolors=PAL["black"],
                          linewidths=1.4, zorder=6)
-            ax_c.text(cents[ri, 0], cents[ri, 1], " root " + str(root_cluster),
-                      fontsize=7, color=PAL["black"], va="center", zorder=7)
+            ax_c.text(cents[ri, 0], cents[ri, 1] + 0.8, " root " + str(root_cluster),
+                      fontsize=7, color=PAL["black"], va="bottom", ha="center", zorder=7)
         subtitle_curve = ("PAGA connectivity skeleton (" + str(n_edges)
-                          + " edges, width proportional to connectivity > 0.05); "
+                          + " strong edges only, width proportional to connectivity > 0.15); "
                           + "arrows point along increasing pseudotime; open circle = root cluster "
                           + str(root_cluster))
     except Exception as e:  # noqa: BLE001
