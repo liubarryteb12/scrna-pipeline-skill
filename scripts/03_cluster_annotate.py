@@ -360,7 +360,7 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
                 bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.75))
     ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
     ax.set_title(f"Leiden clusters (n={n_clusters}, resolution={res_used})")
-    ax.legend(fontsize=6, markerscale=2.5, loc="center left", bbox_to_anchor=(1.0, 0.5))
+    ax.legend(fontsize=6, markerscale=2.5, loc="outside upper right")
     save_fig(cfg, "02-03-02-unit1-umap-clusters", fig)
 
     # ---- 4. Marker 基因 -----------------------------------------------------

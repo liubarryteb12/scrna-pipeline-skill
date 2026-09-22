@@ -195,7 +195,7 @@ def run_02_integrate(cfg: dict) -> dict:
             ax.set_title(f"{rep} by {batch_key}")
             ax.set_xlabel("dim 1"); ax.set_ylabel("dim 2")
             if len(set(cats)) <= 12:
-                ax.legend(fontsize=6, markerscale=3, loc="upper right")
+                ax.legend(fontsize=6, markerscale=3, loc="outside upper right")
         fig.suptitle("Batch mixing before/after integration")
         save_fig(cfg, "02-02-03-unit1-batch-mixing", fig)
 
