@@ -659,7 +659,7 @@ def run_05_trajectory(cfg: dict) -> dict:
     handles = [Line2D([0], [0], marker="o", ls="", markersize=4,
                       color=PAL_CYCLE[ci % len(PAL_CYCLE)], label=str(cat))
                for ci, cat in enumerate(cats)]
-    ax.legend(handles=handles, fontsize=4.5, ncol=2, loc="outside upper right",
+    fig.legend(handles=handles, fontsize=4.5, ncol=2, loc="outside upper right",
               framealpha=0.7)
     ax.set_title(f"{celltype_key} on the same UMAP (pseudotime context)")
     ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
