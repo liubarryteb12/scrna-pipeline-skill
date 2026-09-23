@@ -336,7 +336,7 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
                label=f"used: {rd['resolution']}")
     ax.set_xlabel("Leiden resolution"); ax.set_ylabel("number of clusters")
     ax.set_title("Cluster count vs resolution")
-    fig.legend(fontsize=8, loc="outside right center")
+    fig.legend(fontsize=8, ncol=1, loc="outside right center")
     save_fig(cfg, "02-03-01-unit1-cluster-resolution-scan", fig)
 
     # ---- 3. 用配置的分辨率定稿 ----------------------------------------------
@@ -360,7 +360,7 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
                 bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.75))
     ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
     ax.set_title(f"Leiden clusters (n={n_clusters}, resolution={res_used})")
-    fig.legend(fontsize=6, markerscale=2.5, loc="outside right center")
+    fig.legend(fontsize=6, markerscale=2.5, ncol=1, loc="outside right center")
     save_fig(cfg, "02-03-02-unit1-umap-clusters", fig)
 
     # ---- 4. Marker 基因 -----------------------------------------------------
