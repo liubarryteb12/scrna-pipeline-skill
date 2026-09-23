@@ -284,7 +284,7 @@ def run_05_trajectory(cfg: dict) -> dict:
     conn_df = pd.DataFrame(conn, index=cats, columns=cats)
     conn_df.to_csv(res_dir / "paga_connectivities.csv")
 
-    fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(84)))
+    fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(66)))   # 84->66：原空白图幅过大（评审 v2）
     # **边不能盖住节点标签**（评审 3.3：簇 9 的 "9" 被 5 条粗边切断）。
     # 不做双层重画的 hack —— 只调 scanpy 自己的参数：边宽减半（0.5）、
     # 节点加大（scale 0.8 / power 0.6）、字号提到 9，标签因此在最上层可见。
@@ -659,7 +659,7 @@ def run_05_trajectory(cfg: dict) -> dict:
     handles = [Line2D([0], [0], marker="o", ls="", markersize=4,
                       color=PAL_CYCLE[ci % len(PAL_CYCLE)], label=str(cat))
                for ci, cat in enumerate(cats)]
-    fig.legend(handles=handles, fontsize=4.5, ncol=2, loc="outside upper right",
+    fig.legend(handles=handles, fontsize=4.5, ncol=1, loc="outside right center",
               framealpha=0.7)
     ax.set_title(f"{celltype_key} on the same UMAP (pseudotime context)")
     ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
