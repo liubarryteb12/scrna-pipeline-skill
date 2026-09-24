@@ -554,3 +554,31 @@ PAL_CYCLE**（与 `axes.prop_cycle` 同源），需要就加显式图例。
 > 的纯绘图参数法；`adjustText` 不在依赖里，不要临时引入。
 
 
+## 24. 图例一律图框外右侧、纵向排列（用户约定 v2，2026-09-23）
+
+姊妹项目 `spatial-pipeline-skill/AGENTS.md` 规则 26 与
+`geo-normal-pipeline-skill/AGENTS.md` 规则 31 是同一条约定；
+本仓库此前**漏写了这条规则**（代码其实已经合规）——
+补门禁时才发现文档缺口，所以补在这里。
+
+**图例不能画在图框（panel）里面，也不能放在顶部** —— 框内会压住数据点，
+顶部会把主图压扁变形（实测校准图 / UMAP / 去卷积条形图被压得很扁）。
+
+- **matplotlib**：`fig.legend(loc="outside right center", ncol=1)`。
+  `loc="outside ..."` **只对 `fig.legend()` 有效**，传给 `ax.legend()` 会报
+  `ValueError: 'outside' option ... only works for figure legends`
+  （实测 spatial run 35749568552 因此崩了整个 job）。
+  所有 axes 级图例必须改成 `fig.legend(...)`。
+- **`ncol=1` 强制纵向单列** —— 多图例时默认可能横排，必须显式指定。
+- constrained layout 会自动为框外图例让出空间；**改完要亲读**确认没被裁掉
+  （`savefig.bbox: standard` 下溢出是静默裁，见规则 13 同类问题）。
+
+**门禁**：`node tools/check_legend_convention.mjs`
+（三仓同一份，静态扫源码；CI 在"静态检查（不装依赖）"那一步跑）。
+
+> **为什么需要门禁而不是靠记：** `check_py_syntax.mjs` 只查未定义名字，
+> 看不见图例位置。一张图例压在数据点上的图，在
+> "文件存在 / 有墨迹 / 图名合规 / 配色合规 / 图幅合规"眼里**全都是合格的** ——
+> 这正是工作区治理层错误台账（`governance/15_ERROR_LEDGER.md`，**不在本仓库内**）E-06「门禁本身有盲区」的又一例。
+
+

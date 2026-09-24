@@ -115,6 +115,10 @@ jobs:
         run: |
           node tools/check_py_syntax.mjs
           node tools/check_artifact_paths.mjs
+          # 图例必须在图框外右侧、纵向排列（规则 26，用户约定 v2）。
+          # 既有检查器全都看不见图例位置 —— 图例压在数据点上的图，
+          # 在"文件存在 / 有墨迹 / 图名合规 / 配色合规 / 图幅合规"眼里都是合格的。
+          node tools/check_legend_convention.mjs
 
       - name: 缓存 pip
         uses: actions/cache@v4

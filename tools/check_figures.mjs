@@ -13,6 +13,24 @@
  * 判定：非背景像素占比 < MIN_INK 判为空白。
  * 阈值不能设太高 —— 一个只有坐标轴的图也有少量墨迹，那正是要抓的。
  *
+ * ── 双向检查（S2-3，2026-09-24 新增）────────────────────────────
+ *
+ * 原来只有下限（挡"白图"），挡不住另一个方向：**墨迹铺满、糊成一片**
+ * 同样读不出信息（色标压死、背景填满、热图全黑），而它在下限眼里完美。
+ *
+ * 两个方向都用**实测标定**，不是拍脑袋：
+ *   对图库 161 张实测（geo 53 / scrna 33 / spatial 75）：
+ *     min 2.39% / p05 4.26% / 中位 24.12% / p95 64.79% / **max 87.71%**
+ *   最密的那张是 `03-03-03-unit3-he-reference`（H&E 组织学照片），
+ *   本来就该铺满 —— 所以上限必须留出余量，不能按"中位数"卡。
+ *
+ * 分档：
+ *   FAIL  < MIN_INK(0.2%)   或  > INK_FAIL_MAX(96%)  —— 空白 / 糊死，结构性缺陷
+ *   WARN  < INK_WARN_MIN(2%) 或 > INK_WARN_MAX(92%)  —— 提示，不判红
+ *
+ * 实测标定下当前 161 张**零误判**（最低 2.39% / 最高 87.71%，
+ * 距 FAIL 两侧各留 ≥2.3pp 与 ≥8pp 余量）。
+ *
  * 用法: node tools/check_figures.mjs <目录> [更多目录...]
  */
 
@@ -22,6 +40,10 @@ import { inflateSync } from "node:zlib";
 
 // 非背景像素占比低于此值判为空白
 const MIN_INK = 0.002;
+// 双向检查的提示/判红档（见文件头标定说明）
+const INK_WARN_MIN = 0.02;
+const INK_WARN_MAX = 0.92;
+const INK_FAIL_MAX = 0.96;
 
 function decodePng(buf) {
   if (buf.readUInt32BE(0) !== 0x89504e47) throw new Error("不是 PNG");
@@ -101,7 +123,11 @@ function inkFraction(png) {
       if (d > 30) ink++;
     }
   }
-  return ink / total;
+  // 背景亮度一起返回：全黑图会让"四角取背景"把黑当成背景、算出 0% 墨迹，
+  // 于是**糊死被误报成空白**。判据是相对量，必须再报一个绝对量才分得清
+  // （与 AGENTS 里"检查器要挡住自己的盲区"同一条）。
+  const bgLuma = (bg[0] + bg[1] + bg[2]) / 3;
+  return { frac: ink / total, bgLuma };
 }
 
 const dirs = process.argv.slice(2);
@@ -111,6 +137,7 @@ if (dirs.length === 0) {
 }
 
 let n = 0, blank = 0;
+const warnings = [];
 for (const dir of dirs) {
   if (!existsSync(dir)) continue;
   for (const e of readdirSync(dir, { withFileTypes: true })) {
@@ -120,20 +147,41 @@ for (const dir of dirs) {
     const size = statSync(p).size;
     try {
       const png = decodePng(readFileSync(p));
-      const frac = inkFraction(png);
+      const { frac, bgLuma } = inkFraction(png);
+      // 暗背景（亮度 < 128）说明图不是白底 —— 此时"四角取背景"的墨迹占比
+      // 不可解释，直接判红让人去看，而不是给出一个可能反过来的结论。
+      const darkBg = bgLuma < 128;
       if (frac < MIN_INK) {
-        console.error(`  [空白] ${p}  ${png.width}x${png.height}  ` +
-                      `墨迹占比 ${(frac * 100).toFixed(4)}%  (${size} B)`);
+        console.error(`  [${darkBg ? "糊死" : "空白"}] ${p}  ${png.width}x${png.height}  ` +
+                      `墨迹占比 ${(frac * 100).toFixed(4)}%  背景亮度 ${bgLuma.toFixed(0)}  (${size} B)` +
+                      (darkBg ? "  ← 整幅暗底，等同糊死" : ""));
+        blank++;
+      } else if (frac > INK_FAIL_MAX) {
+        console.error(`  [糊死] ${p}  ${png.width}x${png.height}  ` +
+                      `墨迹占比 ${(frac * 100).toFixed(2)}% > ${(INK_FAIL_MAX * 100).toFixed(0)}%  ` +
+                      `(色标压死 / 背景填满，图读不出信息)`);
         blank++;
       } else {
         console.log(`  [OK]   ${e.name}  ${png.width}x${png.height}  ` +
                     `墨迹 ${(frac * 100).toFixed(2)}%`);
+        // 双向提示：超出常见范围但不判红
+        if (frac < INK_WARN_MIN || frac > INK_WARN_MAX) {
+          warnings.push(`${e.name}  ${(frac * 100).toFixed(2)}%`);
+        }
       }
     } catch (err) {
       console.error(`  [错误] ${p}: ${err.message}`);
       blank++;
     }
   }
+}
+
+if (warnings.length > 0) {
+  console.log(`\n[WARN] ${warnings.length} 张图墨迹占比超出常见范围 ` +
+              `[${(INK_WARN_MIN * 100).toFixed(0)}%, ${(INK_WARN_MAX * 100).toFixed(0)}%] —— 仅提示：`);
+  for (const w of warnings) console.log(`    ${w}`);
+  console.log("  偏疏多为散点/森林图（本来就少），偏密多为热图/组织学照片（本来就满）。");
+  console.log("  只要不是「空白」或「糊死」，具体疏密由人工终审判断。");
 }
 
 if (n === 0) {
@@ -144,4 +192,4 @@ if (blank > 0) {
   console.error(`\n${blank}/${n} 张图有问题`);
   process.exit(1);
 }
-console.log(`\n${n} 张图全部非空白`);
+console.log(`\n${n} 张图全部非空白、非糊死`);
