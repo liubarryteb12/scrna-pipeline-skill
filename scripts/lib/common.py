@@ -878,12 +878,21 @@ def place_labels(ax, xs, ys, texts, fontsize=7, pad_px=2.0,
     :returns: `[(x, y), ...]` 实际放置的**数据坐标**
     """
     import itertools
-    import matplotlib.transforms as mtransforms
 
     fig = ax.figure
+    # **必须先把 figure 的 dpi 对齐到"实际保存用的 dpi"再量包围盒。**
+    #
+    # 实测（2026-09-24）：本函数在创建 figure 时的默认 dpi（100）下量尺寸并
+    # 排布，而 `save_fig()` 用 `dpi=300` 重新渲染 —— 文本的**字号是点、与 dpi
+    # 无关，但包围盒是像素**，于是 300 dpi 下每个标签都放大 3 倍、而按点给的
+    # 偏移没跟着放大，布局全散。实测 dpi=100 时 0 重叠、dpi=300 时
+    # **28 对重叠 + 8 个越界** —— 正是 CI 图上"仍重叠"的原因。
+    #
+    # 所以：先设 dpi（与 `save_fig` 一致），再 draw、再量、再排。
+    target_dpi = 300.0
+    fig.set_dpi(target_dpi)
     fig.canvas.draw()  # 需要 renderer 才能量文本包围盒
     renderer = fig.canvas.get_renderer()
-    inv = ax.transData.inverted()
 
     # 候选方向：8 个方位，由近及远多圈外扩。
     # **优先向右/左上** —— 这类散点的点在左侧挤成竖列（x≈0），右侧是空的。
@@ -897,22 +906,33 @@ def place_labels(ax, xs, ys, texts, fontsize=7, pad_px=2.0,
     # 所以加一条包含判据：标签包围盒必须完全落在 axes 内。
     ax_bb = ax.get_window_extent(renderer=renderer)
 
+    def _mk(text, x, y, off_pt, dx, dy, arrow=False):
+        """建一个标签。`off_pt` 是**以点为单位的偏移** —— 不是像素。"""
+        kw = {}
+        if arrow:
+            kw["arrowprops"] = dict(arrowstyle="-", lw=0.4,
+                                    color=PAL.get("muted", "#999999"))
+        return ax.annotate(
+            text, (x, y), xytext=off_pt, textcoords="offset points",
+            fontsize=fontsize,
+            ha="left" if dx > 0 else ("right" if dx < 0 else "center"),
+            va="bottom" if dy > 0 else ("top" if dy < 0 else "center"),
+            color=PAL.get("ink", "#1A1A1A"), **kw)
+
     for x, y, text in zip(xs, ys, texts):
-        px, py = ax.transData.transform((x, y))
         chosen = None
-        best_outside = None   # 实在放不进时的次优（离轴内最近的一个）
+        best_outside = None   # 实在放不进时的次优（溢出最少的一个）
         for ring in itertools.count(1):
             if ring * len(dirs) > max_iters:
                 break
-            step = 6.0 + (ring - 1) * 7.0  # 像素：每圈外扩
+            step_pt = 4.0 + (ring - 1) * 5.0   # 点（1/72 英寸），与 DPI 无关
             for dx, dy in dirs:
-                cx, cy = px + dx * step, py + dy * step
-                t = ax.annotate(
-                    text, (x, y), xytext=(cx, cy), textcoords="offset pixels",
-                    fontsize=fontsize,
-                    ha="left" if dx > 0 else ("right" if dx < 0 else "center"),
-                    va="bottom" if dy > 0 else ("top" if dy < 0 else "center"),
-                    color=PAL.get("ink", "#1A1A1A"))
+                # **`textcoords="offset points"` 要的是偏移量，不是绝对坐标。**
+                # 实测踩过：这里原先传的是 `transData.transform()` 出来的
+                # **像素绝对坐标**，于是标签被推到画布外几万像素处 ——
+                # 包含判据全部拒绝，最后统统落进兜底分支挤在一起。
+                off = (dx * step_pt, dy * step_pt)
+                t = _mk(text, x, y, off, dx, dy)
                 raw = t.get_window_extent(renderer=renderer)
                 bb = raw.expanded(1 + pad_px / max(raw.width, 1),
                                   1 + pad_px / max(raw.height, 1))
@@ -924,31 +944,24 @@ def place_labels(ax, xs, ys, texts, fontsize=7, pad_px=2.0,
                 if not inside:
                     t.remove()
                     if best_outside is None:
-                        # 记录"溢出最少"的那个（后面兜底用）
                         over = (max(0, ax_bb.x0 - bb.x0) + max(0, bb.x1 - ax_bb.x1) +
                                 max(0, ax_bb.y0 - bb.y0) + max(0, bb.y1 - ax_bb.y1))
-                        best_outside = (over, cx, cy, dx, dy)
+                        best_outside = (over, off, dx, dy)
                     continue
                 placed_boxes.append(bb)
-                chosen = inv.transform((cx, cy))
-                used.append(chosen)
+                chosen = off
+                used.append(off)
                 break
             if chosen is not None:
                 break
         if chosen is None:
             # **放不进就带引导线放最近处**，不静默丢弃、也不推到画布外。
             if best_outside is not None:
-                _, cx, cy, dx, dy = best_outside
-                ha = "left" if dx > 0 else ("right" if dx < 0 else "center")
-                va = "bottom" if dy > 0 else ("top" if dy < 0 else "center")
+                _, off, dx, dy = best_outside
             else:
-                cx, cy, ha, va = px + 30, py, "left", "center"
-            ax.annotate(text, (x, y), xytext=(cx, cy), textcoords="offset pixels",
-                        fontsize=fontsize, ha=ha, va=va,
-                        color=PAL.get("ink", "#1A1A1A"),
-                        arrowprops=dict(arrowstyle="-", lw=0.4,
-                                        color=PAL.get("muted", "#999999")))
-            used.append(inv.transform((cx, cy)))
+                off, dx, dy = (18.0, 0.0), 1, 0
+            _mk(text, x, y, off, dx, dy, arrow=True)
+            used.append(off)
     return used
 
 
