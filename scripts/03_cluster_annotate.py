@@ -35,7 +35,7 @@ import scanpy as sc  # noqa: E402
 import yaml  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed, write_json, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, PAL,)
+                    log_warn, parse_args, record_step, save_fig, set_seed, write_json, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, verticalize_dotplot_size_legend, PAL,)
 
 
 def load_signatures(cfg: dict) -> dict:
@@ -387,6 +387,11 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
         sc.pl.dotplot(adata, top3, groupby="leiden", use_raw=True, show=False,
                       standard_scale="var")
         fig = plt.gcf()
+        # **点大小图例必须转成纵排**（约定 v2）。scanpy 的 `DotPlot` 没有控制
+        # 图例方向的参数，内部把示例点画在 x 轴上（横排）—— 用户 2026-09-24
+        # 反馈的"图例横着排布、示例横向"就是这里。后处理成纵排（示例点面积
+        # 从原 scatter 读回，不重算，避免与上游分叉）。
+        verticalize_dotplot_size_legend(fig, title="Fraction of cells in group (%)")
         # scanpy 自己按基因数定尺寸，这里拉回标准双栏宽。
         # 高度 96 mm 是实测值：80 mm 时簇标签顶出画布 +4.5%，88 mm 时 +2.9%
         fig.set_size_inches(W_DOUBLE, mm(96))

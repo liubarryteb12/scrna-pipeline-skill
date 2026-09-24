@@ -517,21 +517,36 @@ def run_05_trajectory(cfg: dict) -> dict:
                                               index=False)
             log_info(f"基因模块：{len(modules_rows)} 个（k-means on 分箱平滑曲线）")
 
-            fig, axes = plt.subplots(1, 2, figsize=(W_DOUBLE, mm(64)))
-            im = axes[0].imshow(profz[np.argsort(lab)], aspect="auto",
-                                cmap="RdBu_r", vmin=-2, vmax=2)
-            axes[0].set_xlabel("pseudotime bin"); axes[0].set_ylabel("gene (grouped by module)")
-            axes[0].set_title(f"Genes along pseudotime, {N_MODULES} modules")
-            fig.colorbar(im, ax=axes[0], label="z-scored mean expression")
+            # **单图原则拆分（D-006）**：原来是 `subplots(1, 2)` 一张图两个面板
+            # （用户 2026-09-24 反馈"是双图，不符合单图准则"）。拆成两张单图，
+            # 各自独立达标图幅与图例；共享色标 0->p99 的口径写进各图标题。
+            # 组级叙事靠"同一图号 02-05-03 的 unit1/unit2"保留关联。
+            #
+            # unit1：基因 x 拟时序分箱的热图（看哪些基因在哪个阶段高）
+            fig1, ax1 = plt.subplots(figsize=(W_ONE_HALF, mm(70)))
+            im = ax1.imshow(profz[np.argsort(lab)], aspect="auto",
+                            cmap="RdBu_r", vmin=-2, vmax=2)
+            ax1.set_xlabel("pseudotime bin")
+            ax1.set_ylabel("gene (grouped by module)")
+            ax1.set_title(f"Genes along pseudotime, {N_MODULES} modules\n"
+                          "colour = z-scored mean expression (shared scale -2..2)")
+            fig1.colorbar(im, ax=ax1, label="z-scored mean expression")
+            save_fig(cfg, "02-05-03-unit1-trajectory-modules-heatmap", fig1)
+
+            # unit2：各模块的平均表达曲线（看每个模块随拟时序的走向）
+            # **图例必须 fig.legend + ncol=1**（约定 v2）：原 `axes.legend()`
+            # 是框内图例，会压住曲线（用户反馈"图例空间布局有问题"）。
+            fig2, ax2 = plt.subplots(figsize=(W_ONE_HALF, mm(70)))
             for m in range(N_MODULES):
                 sel_m = np.flatnonzero(lab == m)
                 if len(sel_m) == 0:
                     continue
-                axes[1].plot(np.nanmean(profz[sel_m], axis=0), label=f"M{m} (n={len(sel_m)})")
-            axes[1].set_xlabel("pseudotime bin"); axes[1].set_ylabel("z-scored mean")
-            axes[1].set_title("Module profiles")
-            axes[1].legend(fontsize=7)
-            save_fig(cfg, "02-05-03-unit1-trajectory-modules", fig)
+                ax2.plot(np.nanmean(profz[sel_m], axis=0), label=f"M{m} (n={len(sel_m)})")
+            ax2.set_xlabel("pseudotime bin")
+            ax2.set_ylabel("z-scored mean")
+            ax2.set_title("Module profiles along pseudotime")
+            fig2.legend(fontsize=7, ncol=1, loc="outside right center")
+            save_fig(cfg, "02-05-03-unit2-trajectory-module-profiles", fig2)
         except Exception as e:  # noqa: BLE001
             log_warn(f"基因模块分析失败: {type(e).__name__}: {e}")
 

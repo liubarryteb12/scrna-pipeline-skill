@@ -400,8 +400,12 @@ def run_all(cfg: dict, only: list = None) -> int:
             "required": True,
             "detail": f"{len(tj.get('limitations') or [])} 条",
         })
+        # **02-05-03 已按单图原则拆成两张**（原双面板违反 D-006）：
+        # unit1 = 热图、unit2 = 模块曲线。两张都要在，缺一张即判红。
+        # 改名时**必须同步这里** —— 否则验收会查一个不存在的文件而静默变 false。
         for fn, desc in (("02-05-02-unit1-trajectory-method-correlation", "方法一致性矩阵"),
-                         ("02-05-03-unit1-trajectory-modules", "沿轨迹基因模块")):
+                         ("02-05-03-unit1-trajectory-modules-heatmap", "沿轨迹基因模块热图"),
+                         ("02-05-03-unit2-trajectory-module-profiles", "各模块拟时序曲线")):
             ok = has_file(fig_dir / f"{fn}.png")
             checks.append({"item": f"图 {desc} ({fn}.png)", "ok": ok,
                            "required": True,

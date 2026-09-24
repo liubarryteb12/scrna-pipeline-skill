@@ -769,12 +769,156 @@ def _content_overflow(fig) -> dict:
         return {}
 
 
+def verticalize_dotplot_size_legend(fig, title=None):
+    """
+    把 `sc.pl.dotplot` 的**点大小图例从横排转成纵排**（约定 v2）。
+
+    **为什么必须后处理。** scanpy 的 `DotPlot` 没有控制图例方向的参数
+    （`legend()` 只收 `width` / `show_size_legend` / `colorbar_title`），
+    而 `_plot_size_legend()` 内部把示例点画在 **x 轴**上
+    （`scatter(arange(len(size))+0.5, repeat(0,...))`）—— 就是横排。
+    实测两个仓库的 dotplot 都是"老问题图例横着排布、示例横向"
+    （用户 2026-09-24 对 02-03-03 / 03-03-02 的反馈）。
+
+    做法：找到那个大小图例 axes（特征是**只有 x 刻度标签、没有 y 刻度**，
+    且含一个 PathCollection），把它清空后**按原尺寸竖着重画一遍**，
+    刻度标签保留原值。这样示例点的相对大小不变，只是排布方向变了。
+
+    **不伪造数据**：示例点的面积直接从原 scatter 的 `get_sizes()` 读回，
+    不重新推算（重算要复制 scanpy 的 step 规则，容易与上游分叉）。
+
+    :param fig: dotplot 所在的 figure
+    :param title: 可选的新标题（原 `colorbar_title` 语义）
+    :returns: 是否成功转换（False = 没找到符合特征的 axes，图保持原样）
+    """
+    import numpy as np
+
+    for ax in fig.axes:
+        # 大小图例的判据：有 x 刻度标签、**没有** y 刻度标签、含散点
+        if ax.get_yticklabels() and any(t.get_text() for t in ax.get_yticklabels()):
+            continue
+        colls = [c for c in ax.collections if hasattr(c, "get_sizes")]
+        if not colls:
+            continue
+        labels = [t.get_text() for t in ax.get_xticklabels()]
+        if not labels or not all(labels):
+            continue
+        # 只认"看起来像百分比数字"的刻度，避免误伤其它图
+        try:
+            [float(s) for s in labels]
+        except ValueError:
+            continue
+
+        sizes = colls[0].get_sizes()
+        if len(sizes) != len(labels):
+            continue
+
+        ax.clear()
+        # 竖排：从下往上依次变大（与横排的左小右大语义一致）
+        ys = np.arange(len(sizes))
+        ax.scatter(np.zeros(len(sizes)), ys, s=sizes,
+                   color="gray", edgecolor="black", linewidth=0.5, zorder=100)
+        ax.set_yticks(ys)
+        ax.set_yticklabels(labels, fontsize="small")
+        ax.set_xticks([])
+        ax.tick_params(axis="x", bottom=False, labelbottom=False)
+        ax.tick_params(axis="y", left=False, labelleft=True)
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+        if title:
+            ax.set_title(title, fontsize="small")
+        return True
+    return False
+
+
+def place_labels(ax, xs, ys, texts, fontsize=7, pad_px=2.0,
+                 max_iters=400, seed=0):
+    """
+    在散点图上放**互不重叠**的文字标签（纯几何，不引第三方依赖）。
+
+    **为什么需要它。** `adjustText` 不在本仓库依赖里（规则：不要临时引入），
+    而"固定偏移 + 上下交替"这类纯参数法在**点挤成一条竖列**时必然失效 ——
+    实测 `02-07-03-unit1-tf-specificity-scatter`：8 个 TF 的 x 都在 0–0.05，
+    上下交替只把标签分成两层，同层内仍然互压（用户反馈"基因标签有重叠"）。
+
+    做法：把每个标签候选位置按"离锚点由近及远"排序（右、左、上、下、
+    四个对角共 8 个方向 × 多圈），**贪心**选第一个与已放标签不重叠的位置；
+    都放不下就继续外扩。重叠判据用 matplotlib 的文本包围盒（渲染后实测，
+    不是估算字宽）。
+
+    **保证**：只要画布还有空间，返回的标签两两不重叠；实在放不下的会被
+    推远（有引导线时仍可读）。返回实际使用的位置列表，便于日志记录。
+
+    :param ax: 目标 axes（需已完成 scatter 且坐标范围已定）
+    :param xs: 锚点 x（数据坐标）
+    :param ys: 锚点 y（数据坐标）
+    :param texts: 标签文字，与 xs/ys 等长
+    :param fontsize: 标签字号（pt）
+    :param pad_px: 标签之间要求的最小间隙（像素）
+    :param max_iters: 每个标签最多尝试的候选位置数
+    :param seed: 保留参数（本函数确定性，不用随机；留给调用方对齐口径）
+    :returns: `[(x, y), ...]` 实际放置的**数据坐标**
+    """
+    import itertools
+    import matplotlib.transforms as mtransforms
+
+    fig = ax.figure
+    fig.canvas.draw()  # 需要 renderer 才能量文本包围盒
+    renderer = fig.canvas.get_renderer()
+    inv = ax.transData.inverted()
+
+    # 候选方向：8 个方位，由近及远多圈外扩
+    dirs = [(1, 0), (-1, 0), (0, 1), (0, -1),
+            (1, 1), (1, -1), (-1, 1), (-1, -1)]
+    placed_boxes = []
+    used = []
+
+    for x, y, text in zip(xs, ys, texts):
+        # 锚点像素位置
+        px, py = ax.transData.transform((x, y))
+        chosen = None
+        for ring in itertools.count(1):
+            if ring * len(dirs) > max_iters:
+                break
+            step = 6.0 + (ring - 1) * 7.0  # 像素：每圈外扩
+            for dx, dy in dirs:
+                cx, cy = px + dx * step, py + dy * step
+                t = ax.annotate(
+                    text, (x, y), xytext=(cx, cy), textcoords="offset pixels",
+                    fontsize=fontsize,
+                    ha="left" if dx > 0 else ("right" if dx < 0 else "center"),
+                    va="bottom" if dy > 0 else ("top" if dy < 0 else "center"),
+                    color=PAL.get("ink", "#1A1A1A"))
+                bb = t.get_window_extent(renderer=renderer).expanded(
+                    1 + pad_px / max(t.get_window_extent(renderer=renderer).width, 1),
+                    1 + pad_px / max(t.get_window_extent(renderer=renderer).height, 1))
+                if any(bb.overlaps(o) for o in placed_boxes):
+                    t.remove()
+                    continue
+                placed_boxes.append(bb)
+                chosen = inv.transform((cx, cy))
+                used.append(chosen)
+                break
+            if chosen is not None:
+                break
+        if chosen is None:
+            # 极端拥挤：放远一点并保留（有引导线仍可读），不静默丢弃
+            cx, cy = px + 60, py + 60
+            ax.annotate(text, (x, y), xytext=(cx, cy), textcoords="offset pixels",
+                        fontsize=fontsize, ha="left", va="bottom",
+                        color=PAL.get("ink", "#1A1A1A"),
+                        arrowprops=dict(arrowstyle="-", lw=0.4,
+                                        color=PAL.get("muted", "#999999")))
+            used.append(inv.transform((cx, cy)))
+    return used
+
+
 def save_fig(cfg: dict, name: str, fig=None, tight: bool = False) -> list:
     """
     保存一张图为 PNG + PDF，并返回写出的路径。
 
     **PDF 与 PNG 都要出。** PDF 是矢量、可再编辑、字体以 Type 42 内嵌；
-    PNG 用于快速查看与像素级非空白检查（check_figures 解 PNG）。
+    PNG 用于快速像素级非空白检查（check_figures 解 PNG）。
 
     **`bbox_inches` 默认不再是 "tight"。** 参考规范
     （scientific-visualization）明确写着 tight 会改变输出的物理尺寸 ——

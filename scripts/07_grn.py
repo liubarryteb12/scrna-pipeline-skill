@@ -39,8 +39,8 @@ import yaml  # noqa: E402
 from scipy import sparse  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed, write_json,
-                    W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, PAL,)
+                    log_warn, parse_args, place_labels, record_step, save_fig,
+                    set_seed, write_json, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, PAL,)
 
 # 每个调控子保留多少个共表达靶基因
 N_TARGETS = 30
@@ -359,24 +359,28 @@ def run_07_grn(cfg: dict) -> dict:
         save_fig(cfg, "02-07-02-unit1-tf-activity-heatmap", fig)
 
     # 特异性 vs 表达细胞比例：识别"只是细胞类型代理"的调控子
-    # **标签必须防撞**（评审 3.1）：top 8 的 TF 名原先全部 offset(3,3)，
-    # 点又挤在 x≈0–0.05 的竖列里，名字互压成一团。按 y 排序后上下交替
-    # 偏移 + 相同 y 的错开 x，纯绘图参数。
-    fig, ax = plt.subplots(figsize=(W_SINGLE, mm(64)))
+    #
+    # **标签必须真正防撞。** 原先用"上下交替 + 偶尔左右"的纯参数法 ——
+    # 实测失效：top 8 的 TF 的 x 全挤在 0–0.05 的竖列里，交替只把标签分成
+    # 两层，**同层内仍然互压**（用户 2026-09-24 反馈"基因标签有重叠"）。
+    # 改用 `place_labels()`：贪心选第一个与已放标签不重叠的方位，
+    # 重叠判据用**渲染后的真实包围盒**（不是估算字宽），几何上保证不重叠。
+    #
+    # 同时修颜色：原写死 `#2C7FB8`（规则 13 禁止就地写色值字面量，
+    # 且它不在 PAL 里 —— 与 PAL["primary"] #0072B2 色相只差约 3°，
+    # 属于"同一图上两个蓝"）。改走 PAL。
+    fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(70)))
     ax.scatter(reg["frac_cells_expressing_tf"], reg["cluster_specificity"],
-               s=22, color="#2C7FB8", alpha=0.75)
+               s=22, color=PAL["primary"], alpha=0.75)
     _lab = reg.head(8).sort_values("cluster_specificity", ascending=False)
-    _rank = range(len(_lab))
-    for _i, r in zip(_rank, _lab.itertuples()):
-        _dy = 5 if _i % 2 == 0 else -9          # 上下交替，避免相邻标签同高互压
-        _dx = 5 if _i % 4 < 2 else -5           # 偶尔放左边，避开 x 竖列
-        _ha = "left" if _dx > 0 else "right"
-        ax.annotate(r.tf, (r.frac_cells_expressing_tf, r.cluster_specificity),
-                    fontsize=7, xytext=(_dx, _dy), textcoords="offset points",
-                    ha=_ha)
+    place_labels(ax,
+                 _lab["frac_cells_expressing_tf"].to_numpy(),
+                 _lab["cluster_specificity"].to_numpy(),
+                 _lab["tf"].tolist(), fontsize=7)
     ax.set_xlabel("fraction of cells expressing TF")
     ax.set_ylabel("cluster specificity")
-    ax.set_title("Regulon specificity vs TF detection")
+    ax.set_title("Regulon specificity vs TF detection\n"
+                 "labels = top 8 by cluster specificity (auto-placed, non-overlapping)")
     save_fig(cfg, "02-07-03-unit1-tf-specificity-scatter", fig)
 
     status = {
