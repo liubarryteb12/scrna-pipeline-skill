@@ -769,31 +769,60 @@ def _content_overflow(fig) -> dict:
         return {}
 
 
-def verticalize_dotplot_size_legend(fig, title=None):
+def fix_dotplot_legends(fig, size_title=None, cbar_title=None):
     """
-    把 `sc.pl.dotplot` 的**点大小图例从横排转成纵排**（约定 v2）。
+    把 `sc.pl.dotplot` 的**整条图例列**整理成约定 v2 的样子：
+    点大小图例竖排、色标竖排、两者上下排列互不重叠。
 
-    **为什么必须后处理。** scanpy 的 `DotPlot` 没有控制图例方向的参数
-    （`legend()` 只收 `width` / `show_size_legend` / `colorbar_title`），
-    而 `_plot_size_legend()` 内部把示例点画在 **x 轴**上
-    （`scatter(arange(len(size))+0.5, repeat(0,...))`）—— 就是横排。
-    实测两个仓库的 dotplot 都是"老问题图例横着排布、示例横向"
-    （用户 2026-09-24 对 02-03-03 / 03-03-02 的反馈）。
+    **为什么必须后处理。** scanpy 的 `DotPlot` 没有暴露图例方向参数
+    （`legend()` 只收 `width` / `show_size_legend` / `colorbar_title`）：
 
-    做法：找到那个大小图例 axes（特征是**只有 x 刻度标签、没有 y 刻度**，
-    且含一个 PathCollection），把它清空后**按原尺寸竖着重画一遍**，
-    刻度标签保留原值。这样示例点的相对大小不变，只是排布方向变了。
+    * `_plot_size_legend()` 把示例点画在 **x 轴**上 —— 横排；
+    * `_plot_colorbar()` 把色标**硬编码** `orientation="horizontal"` —— 横排。
 
-    **不伪造数据**：示例点的面积直接从原 scatter 的 `get_sizes()` 读回，
-    不重新推算（重算要复制 scanpy 的 step 规则，容易与上游分叉）。
+    两个都要转竖排（用户约定 v2"纵向单列节约图幅"），而且**必须一起做**：
+    只转一个，另一个还横着占着原来的宽度，两块会互相挤压或重叠
+    （实测只转 size 图例时，colorbar 与它文字交叠 4 处）。
+
+    **三处实测毛病，分别对应三个动作：**
+
+    1. **size 图例的刻度标签被换行堆成两列**（`100/80/60` 挤在一起）——
+       scanpy 给这块 axes 的宽度是按"横排一行点"算的，竖排后标签要单独占
+       左侧一列，原宽度不够。→ 加宽 axes，并给刻度标签留出明确宽度。
+    2. **colorbar 横向**。→ 找到 Colorbar 对象，竖向重建。
+    3. **两块图例重叠**。→ 上下重新分区：size 在上、colorbar 在下，
+       各自 `set_position` 不相交。
 
     :param fig: dotplot 所在的 figure
-    :param title: 可选的新标题（原 `colorbar_title` 语义）
-    :returns: 是否成功转换（False = 没找到符合特征的 axes，图保持原样）
+    :param size_title: 点大小图例标题（不传则保留原样）
+    :param cbar_title: 色标标题（不传则保留原样）
+    :returns: `dict(size=bool, colorbar=bool)` —— 各自是否成功转换
     """
     import numpy as np
+    from matplotlib.axes import Axes
+    from matplotlib.colorbar import Colorbar
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
 
+    done = {"size": False, "colorbar": False}
+
+    # ---- 0. 定图例列的 x 位置 -------------------------------------------
+    # **必须放在主图右侧、画布内**。主图（含 y 轴标签的那个）右缘一般在
+    # x≈0.70（左边留给行标签）；图例列取主图右缘 + 一点间距。
+    # 实测踩过：直接写 `1.0 - 宽度` 会把两块图例**推出画布右缘**——
+    # size 刻度标签 6 个被裁、与色标文字重叠 5 处。
+    main_ax = None
     for ax in fig.axes:
+        if any(t.get_text() for t in ax.get_xticklabels()) \
+                and ax.get_position().width > 0.4:
+            main_ax = ax
+            break
+    leg_x = 0.80 if main_ax is None else min(0.94, main_ax.get_position().x1 + 0.055)
+
+    # ---- 1. 点大小图例：横排 -> 纵排 ------------------------------------
+    for ax in fig.axes:
+        if done["size"]:
+            break
         # 大小图例的判据：有 x 刻度标签、**没有** y 刻度标签、含散点
         if ax.get_yticklabels() and any(t.get_text() for t in ax.get_yticklabels()):
             continue
@@ -808,34 +837,27 @@ def verticalize_dotplot_size_legend(fig, title=None):
             [float(s) for s in labels]
         except ValueError:
             continue
-
         sizes = colls[0].get_sizes()
         if len(sizes) != len(labels):
             continue
 
-        # **先把 legend axes 撑高**：scanpy 给这块区域的高度是按"横排一行点"
-        # 分配的，竖排 5 个点 + 5 个刻度标签塞不进原高度 —— 实测标签被裁成
-        # `10/20/30/40` 的残影（run 35974091761）。
-        # 做法：把这个 axes 的物理高度按点数放大，并把它的下边界上移，
-        # 让它占住 legend 区里原本空着的上方空间（那里是 top_spacer）。
-        pos = ax.get_position()
         n = len(sizes)
-        # 每个点至少需要约 0.022 图高（含标签），上限不超过 0.55（别盖住主图）
-        need_h = min(max(pos.height, 0.022 * n + 0.05), 0.55)
-        ax.set_position([pos.x0, pos.y1 - need_h, pos.width, need_h])
+        pos = ax.get_position()
+        # **竖排后这块 axes 要"又高又窄"**：高度按点数给，宽度给刻度标签留
+        # 足够列宽 —— 原宽度是按横排算的，标签会换行堆叠（实测 `100/80/60`
+        # 挤成两列）。x 位置用上面算好的 `leg_x`（主图右侧、画布内）。
+        need_h = min(max(0.030 * n + 0.06, 0.20), 0.50)
+        need_w = 0.055
+        ax.set_position([leg_x, pos.y1 - need_h, need_w, need_h])
 
         ax.clear()
-        # 竖排：从下往上依次变大（与横排的左小右大语义一致）
         ys = np.arange(n)
-        # **点贴近轴的左缘**：`set_yticklabels` 把标签画在轴**左侧**，
-        # 原写法把点画在轴中央（x=0），于是"标签 ……… 点"中间留一大片空白。
-        # 点移到左缘附近后，标签紧贴其左，一行读作"标签 — 点"。
-        # （不能把标签放右侧：图例列本来就在最右，右侧没有空间，会被裁。）
-        ax.scatter(np.full(n, 0.12), ys, s=sizes,
-                   color="gray", edgecolor="black", linewidth=0.5, zorder=100)
-        # 给上下留半个间距，否则首尾的点和标签贴边被裁
+        # 点贴近轴右缘、刻度标签在其左 —— 一行读作"标签 — 点"。
+        # （标签不能放右侧：图例列在最右，再往右就出画布。）
+        ax.scatter(np.full(n, 0.62), ys, s=sizes, color="gray",
+                   edgecolor="black", linewidth=0.5, zorder=100)
         ax.set_xlim(0.0, 1.0)
-        ax.set_ylim(-0.6, n - 0.4)
+        ax.set_ylim(-0.8, n - 0.2)
         ax.set_yticks(ys)
         ax.set_yticklabels(labels, fontsize="small")
         ax.set_xticks([])
@@ -843,10 +865,92 @@ def verticalize_dotplot_size_legend(fig, title=None):
         ax.tick_params(axis="y", left=False, labelleft=True, pad=1)
         for sp in ax.spines.values():
             sp.set_visible(False)
-        if title:
-            ax.set_title(title, fontsize="small", pad=3, loc="left")
-        return True
-    return False
+        if size_title:
+            ax.set_title(size_title, fontsize="small", pad=4, loc="left")
+        done["size"] = True
+
+    # ---- 2. 色标：横向 -> 纵向 -------------------------------------------
+    # **先 draw 一次**（scanpy 是绘制时才把色标挂上去的，不 draw 找不到）。
+    #
+    # **色标轴的判据是"含 QuadMesh"，不是"含 Colorbar 对象"。** 实测踩过：
+    # `Colorbar` 实例**不在** `ax.get_children()` 里（它挂在 figure 上），
+    # 轴里能看到的只有色标本体的 `QuadMesh` 和边框 `_ColorbarSpine`。
+    # 按类名找 Colorbar 永远返回 False —— helper 空转、图保持横向。
+    fig.canvas.draw()
+    src_cbar = None
+    for ax in fig.axes:
+        kinds = {type(c).__name__ for c in ax.get_children()}
+        if "QuadMesh" in kinds and any(n.startswith("_ColorbarSpine") for n in kinds):
+            src_cbar = ax
+            break
+
+    if src_cbar is not None:
+        cax = src_cbar
+        # 色标的 norm/cmap 要从**产生它的 mappable** 取。轴的 children 里只有
+        # QuadMesh 本身，而 QuadMesh 带着创建时的 norm/cmap —— 从它读回。
+        qm = next(c for c in cax.get_children() if type(c).__name__ == "QuadMesh")
+        norm = getattr(qm, "norm", None) or Normalize()
+        cmap = getattr(qm, "cmap", None) or plt.get_cmap("Reds")
+        # 横向色标的刻度在 x 轴上；竖向要挂到 y 轴
+        tick_vals = [t for t in cax.get_xticks()]
+        old_title = cbar_title
+        if old_title is None:
+            old_title = cax.get_title()
+
+        cax.clear()
+        spos = cax.get_position()
+        # **竖向色标要"窄而高"**，放在 size 图例正下方、同一列（`leg_x`）
+        cax.set_position([leg_x + 0.012, spos.y0, 0.030, min(0.16, spos.y0)])
+        sm = ScalarMappable(norm=norm, cmap=cmap)
+        cb_new = Colorbar(cax, mappable=sm, orientation="vertical")
+        # **刻度必须重新算，不能照抄横向时的 x 刻度。** 两个原因：
+        # ① 横向时 x 轴的数值范围是 norm 的全程，竖向 y 轴也一样，但
+        #    `get_xticks()` 返回的是"当时渲染出的位置"，直接 set_ticks 会
+        #    和竖轴的实际范围错位；
+        # ② 实测照抄会出现**镜像 + 叠字**（从上往下 1.0→0.0，且两位小数
+        #    挤在一起）。正确做法：按竖轴范围取 3 个等距点，`set_yticks`。
+        lo, hi = norm.vmin, norm.vmax
+        new_ticks = list(np.linspace(lo, hi, 3)) if np.isfinite([lo, hi]).all() else []
+        if new_ticks:
+            cb_new.set_ticks(new_ticks)
+            cb_new.ax.set_yticklabels([f"{v:.1f}" for v in new_ticks],
+                                      fontsize="small")
+        cax.tick_params(labelsize="small")
+        if old_title:
+            cax.set_title(old_title, fontsize="small", pad=4, loc="left")
+        done["colorbar"] = True
+
+    # ---- 3. 收口：两块上下排列，不相交 ------------------------------------
+    # set_position 之后 constrained layout 会在下一帧重排，这里强制立即执行
+    # 一次并做最终夹紧，保证两块不交叠（用户明确要求"变了后也不能重叠"）。
+    # 判据同上：色标轴看 QuadMesh，size 图例轴看"y 刻度是数字"。
+    fig.canvas.draw()
+    size_ax = cbar_ax = None
+    for ax in fig.axes:
+        kinds = {type(c).__name__ for c in ax.get_children()}
+        labs = [t for t in ax.get_yticklabels() if t.get_text()]
+        if "QuadMesh" in kinds:
+            cbar_ax = ax
+        elif labs:
+            try:
+                [float(t.get_text()) for t in labs]
+                size_ax = ax
+            except ValueError:
+                pass
+    if size_ax is not None and cbar_ax is not None:
+        sp, cp = size_ax.get_position(), cbar_ax.get_position()
+        top = max(sp.y1, cp.y1)
+        gap = 0.02
+        h_size, h_cbar = sp.height, cp.height
+        if h_size + h_cbar + gap > top:
+            scale = (top - gap) / (h_size + h_cbar)
+            h_size *= scale
+            h_cbar *= scale
+        size_ax.set_position([sp.x0, top - h_size, sp.width, h_size])
+        cbar_ax.set_position([cp.x0, top - h_size - gap - h_cbar, cp.width, h_cbar])
+        fig.canvas.draw()
+
+    return done
 
 
 def place_labels(ax, xs, ys, texts, fontsize=7, pad_px=2.0,

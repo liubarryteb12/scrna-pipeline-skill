@@ -35,7 +35,7 @@ import scanpy as sc  # noqa: E402
 import yaml  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed, write_json, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, verticalize_dotplot_size_legend, PAL,)
+                    log_warn, parse_args, record_step, save_fig, set_seed, write_json, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, fix_dotplot_legends, PAL,)
 
 
 def load_signatures(cfg: dict) -> dict:
@@ -387,20 +387,25 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
         sc.pl.dotplot(adata, top3, groupby="leiden", use_raw=True, show=False,
                       standard_scale="var")
         fig = plt.gcf()
-        # **点大小图例必须转成纵排**（约定 v2）。scanpy 的 `DotPlot` 没有控制
-        # 图例方向的参数，内部把示例点画在 x 轴上（横排）—— 用户 2026-09-24
-        # 反馈的"图例横着排布、示例横向"就是这里。后处理成纵排（示例点面积
-        # 从原 scatter 读回，不重算，避免与上游分叉）。
-        verticalize_dotplot_size_legend(fig, title="Fraction of cells in group (%)")
         # scanpy 自己按基因数定尺寸，这里拉回标准双栏宽。
         # 高度 96 mm 是实测值：80 mm 时簇标签顶出画布 +4.5%，88 mm 时 +2.9%
         fig.set_size_inches(W_DOUBLE, mm(96))
-        # **轴语义必须写在图上**（评审 3.6：y 轴无标题，行=cluster 只能从
-        # 标题推断）。scanpy dotplot 不给轴标签接口，用 suptitle 说明。
+        # **图例列整列整理**（约定 v2 + 用户 2026-09-24 第三轮反馈）：
+        # ① 点大小图例横排 -> 纵排；② **色标也横排 -> 纵排**（scanpy 的
+        # `_plot_colorbar` 硬编码 orientation="horizontal"，无参数可改）；
+        # ③ 两块上下排列且强制不相交 —— 用户明确要求"变了后也不能重叠"。
+        # 必须在 set_size_inches 之后调用（position 换算依赖最终画幅）。
+        fix_dotplot_legends(fig,
+                            size_title="Fraction of cells in group (%)",
+                            cbar_title="Mean expression in group")
+        # **轴语义必须写在图上**（评审 3.6），但 **suptitle 必须自己折行** ——
+        # constrained layout 不折行长标题（规则 13），实测原 190 字符长句
+        # 两侧各被裁 140px（"rows =" 只剩 "= "）。按 183mm/9pt 拆成 3 行短句。
         fig.suptitle("Top markers per cluster\n"
                      "rows = Leiden clusters; dot size = fraction of cells "
-                     "expressing the gene; colour = mean expression "
-                     "(z-scored per gene)")
+                     "expressing the gene\n"
+                     "colour = mean expression (z-scored per gene, "
+                     "standard_scale = var)")
         save_fig(cfg, "02-03-03-unit1-markers-dotplot", fig)
         # **灰底 marker UMAP 网格**（差距清单 #19，文献范式）：
         # dotplot 给"哪个簇高表达"，灰底 UMAP 给"高表达在哪块区域" ——
