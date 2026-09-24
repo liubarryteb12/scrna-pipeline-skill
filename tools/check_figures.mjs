@@ -34,7 +34,7 @@
  * 用法: node tools/check_figures.mjs <目录> [更多目录...]
  */
 
-import { readdirSync, readFileSync, existsSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, existsSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { inflateSync } from "node:zlib";
 
@@ -182,6 +182,40 @@ if (warnings.length > 0) {
   for (const w of warnings) console.log(`    ${w}`);
   console.log("  偏疏多为散点/森林图（本来就少），偏密多为热图/组织学照片（本来就满）。");
   console.log("  只要不是「空白」或「糊死」，具体疏密由人工终审判断。");
+}
+
+// ---- WARN 落盘（2026-09-24 审计 P1-9：WARN 必须有稳定消费入口，否则等于噪声）----
+// 与 geo 仓 check_fig_sizes.mjs 同款约定：写 warn_report.json，
+// ① 人工亲读图**之前**先看（selfcheck 汇总提示）；② 随 artifact 上传，跨轮对比
+// "WARN 集合是否稳定"——稳定 = 已知审美取舍，新出现 = 回归信号。
+// **注意本文件与 spatial 仓的 check_figures.mjs 必须逐字相同**（既有约定）。
+if (warnings.length > 0) {
+  const report = {
+    generatedAt: new Date().toISOString(),
+    tool: "check_figures.mjs",
+    gates: { inkFailBlank: INK_FAIL_MIN, inkFailSaturated: INK_FAIL_MAX,
+            inkWarnBand: [INK_WARN_MIN, INK_WARN_MAX] },
+    summary: { total: n, blank: blank, warn: warnings.length },
+    items: warnings.map((w) => {
+      const m = w.match(/^(\S+)\s+([\d.]+)%$/);
+      const frac = m ? Number(m[2]) / 100 : null;
+      return {
+        figure: m ? m[1] : w,
+        kind: "ink-fraction-warn",
+        value: frac,
+        band: [INK_WARN_MIN, INK_WARN_MAX],
+        hint: frac !== null && frac < INK_WARN_MIN
+          ? "墨迹偏疏——多为散点/森林图（本来就少），人工确认是否真空白"
+          : "墨迹偏密——多为热图/组织学照片（本来就满），人工确认是否糊死",
+      };
+    }),
+  };
+  try {
+    writeFileSync(join(dir, "warn_report.json"), JSON.stringify(report, null, 2), "utf8");
+    console.log(`\n[WARN 报告] 已写出 ${join(dir, "warn_report.json")}（${warnings.length} 条）`);
+  } catch (e) {
+    console.log(`\n[WARN 报告] 写出失败（不阻断）：${e.message}`);
+  }
 }
 
 if (n === 0) {
