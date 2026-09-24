@@ -769,6 +769,82 @@ def _content_overflow(fig) -> dict:
         return {}
 
 
+
+def plot_marker_dotplot(ax, frac, zmat, *, cmap="RdBu_r",
+                        size_max=340, size_min=12, dot_edge=0.3):
+    """
+    手工画 marker dotplot：颜色 = 按基因做 z-score（跨簇可比偏离方向），
+    点大小 = 表达该基因的细胞比例。
+
+    **为什么不再用 `sc.pl.dotplot(..., standard_scale="var")`。**
+    读 scanpy 源码（`_prepare_dot_data`）确认：`standard_scale="var"` 是
+    **逐基因 min-max 归一化到 0–1**（减最小值、除最大值），**不是 z-score**。
+    而副标题写"z-scored" —— 两者矛盾（用户 2026-09-24 指出的核心问题）。
+    两个口径的科学含义不同：
+
+    ================  ===============================================
+    口径              含义
+    ================  ===============================================
+    min-max（旧）     0 = 该基因在所有簇里的最低表达，1 = 最高
+                      —— 只有"相对排名"，没有偏离方向
+    z-score（本版）   0 = 平均水平，正 = 高于均值，负 = 低于均值
+                      —— 跨簇可比"哪个簇偏离更大"，且 0 有锚点含义
+    ================  ===============================================
+
+    自带的三个额外好处（都是用户逐条点名的）：
+      * 标签不再被裁 —— 布局由本函数控制，不与 scanpy 的 grid 抢空间；
+      * 色标对称 —— RdBu_r 以 0 为中点，正负偏离等权可见；
+      * 图例间距 —— 点大小图例单独画、间距显式给定，不再粘连。
+
+    :param ax: 目标 axes
+    :param frac: DataFrame，index=分组（行），columns=基因（列），值 0..1
+    :param zmat: DataFrame，同形状，值 = 按基因 z-score 后的值
+    :param cmap: 色标（默认 RdBu_r：红=高表达，蓝=低表达，白=0）
+    :param size_max: 100% 表达时点的面积（pt^2）
+    :param size_min: 0% 表达时点的面积（仍画一个极小点，表示"测到但几乎不表达"）
+    :param dot_edge: 点描边宽度
+    :returns: (ScalarMappable, size_handles) —— 供调用方画共享色标与大小图例
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    genes = list(zmat.columns)
+    groups = list(zmat.index)
+    ng, ngrp = len(genes), len(groups)
+
+    # **z 轴对称归一**：正负偏离等权，0 永远是白色 —— 这就是"色标含负值"
+    # 且"白色 = 平均水平（不是 0 表达）"的来源。上限取全部 |z| 的 95 分位
+    # 再放宽到 >=1.5，避免个别极端基因把色标撑得两极分化。
+    vmax = max(1.5, float(np.nanpercentile(np.abs(zmat.to_numpy()), 95)))
+    norm = Normalize(vmin=-vmax, vmax=vmax)
+    cmap_obj = plt.get_cmap(cmap)
+
+    xs = np.arange(ng)
+    ys = np.arange(ngrp)
+    for gi in range(ng):
+        for ri in range(ngrp):
+            f = float(frac.iloc[ri, gi])
+            z = float(zmat.iloc[ri, gi])
+            s = size_min + f * (size_max - size_min)
+            ax.scatter(xs[gi], ys[ri], s=s,
+                       color=cmap_obj(norm(z)),
+                       edgecolor="black", linewidth=dot_edge, zorder=3)
+
+    ax.set_xticks(xs)
+    ax.set_xticklabels(genes, rotation=90, fontsize=7)
+    ax.set_yticks(ys)
+    ax.set_yticklabels(groups, fontsize=8)
+    ax.set_xlim(-0.7, ng - 0.3)
+    ax.set_ylim(ngrp - 0.5, -0.5)
+    ax.tick_params(length=2, pad=2)
+
+    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap_obj)
+    # 大小图例句柄：按 20/40/60/80/100% 取点，间距由调用方画在独立轴上
+    size_handles = [(f, size_min + f * (size_max - size_min)) for f in
+                    (0.2, 0.4, 0.6, 0.8, 1.0)]
+    return sm, size_handles
+
 def fix_dotplot_legends(fig, size_title=None, cbar_title=None):
     """
     把 `sc.pl.dotplot` 的**整条图例列**整理成约定 v2 的样子：

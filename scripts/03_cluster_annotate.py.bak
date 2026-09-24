@@ -35,7 +35,7 @@ import scanpy as sc  # noqa: E402
 import yaml  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed, write_json, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, plot_marker_dotplot, PAL,)
+                    log_warn, parse_args, record_step, save_fig, set_seed, write_json, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, fix_dotplot_legends, PAL,)
 
 
 def load_signatures(cfg: dict) -> dict:
@@ -384,69 +384,28 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
     # 期刊的一页。
     top3 = [g for g in top3 if g in adata.raw.var_names][:24]
     if top3:
-        # **手工画 dotplot，不用 `sc.pl.dotplot`。** 用户 2026-09-24 第四轮
-        # 指出四个问题，前两个是根因级的：
-        # ① **标度矛盾** —— 副标题写 z-score，但 scanpy 的
-        #    `standard_scale="var"` 实际是**逐基因 min-max 归一化到 0-1**
-        #    （读 `_prepare_dot_data` 源码确认），图例 0-1 与"z-score"矛盾。
-        #    z-score 均值应为 0、有正有负，不可能全为正。
-        #    → 改为**真 z-score**（按基因跨簇标准化），RdBu_r 对称色标：
-        #      0 = 簇间平均水平、红 = 高于均值、蓝 = 低于均值。
-        # ② **基因名被裁成 C100A8** —— 数据里是 S100A8（markers_all.csv 可查），
-        #    左缘裁切把 S 的左半吃掉了。→ 自绘布局，标签区显式留宽。
-        # ③ 副标题截断、Y 轴没标 Cluster → 自绘布局 + 显式 ylabel。
-        # ④ 图例圆点粘连 → 大小图例单独轴、间距显式给定。
-        # 用 **log 化的全基因集**（adata.raw，AGENTS 规则 2）：marker 多为低表达
-        raw = adata.raw.to_adata() if adata.raw is not None else adata
-        sub = raw[:, top3]
-        X = np.asarray(sub.X.todense()) if hasattr(sub.X, "todense") else np.asarray(sub.X)
-        groups = adata.obs["leiden"].astype(str).values
-        ug = sorted(set(groups), key=lambda v: int(v))
-        # frac = 表达细胞比例（>0 计表达，与 scanpy 默认 expression_cutoff 一致）
-        frac = np.zeros((len(ug), len(top3)))
-        mean_expr = np.zeros((len(ug), len(top3)))
-        for ri in range(len(ug)):
-            blk = X[groups == ug[ri]]
-            frac[ri] = (blk > 0).mean(axis=0)
-            mean_expr[ri] = blk.mean(axis=0)
-        # **按基因做 z-score**（均值 0、方差 1）；常数列（全同值）记 0
-        sd = mean_expr.std(axis=0, ddof=0)
-        sd[sd == 0] = 1.0
-        zmat = (mean_expr - mean_expr.mean(axis=0)) / sd
-
-        frac_df = pd.DataFrame(frac, index=ug, columns=top3)
-        z_df = pd.DataFrame(zmat, index=ug, columns=top3)
-
-        # 布局：主图 + 右侧一条窄列放两个图例（大小在上、色标在下）
-        fig = plt.figure(figsize=(W_DOUBLE, mm(133)))
-        gspec = fig.add_gridspec(1, 2, width_ratios=[5.2, 1.0], wspace=0.06)
-        ax = fig.add_subplot(gspec[0, 0])
-        sm, size_handles = plot_marker_dotplot(ax, frac_df, z_df)
-        ax.set_xlabel("gene")
-        ax.set_ylabel("Leiden cluster")
-        fig.suptitle("Top markers per cluster", fontsize=11)
-        ax.set_title(
-            "rows = Leiden clusters (identities: celltype_annotation.csv)"
-            "\ndot size = fraction of cells expressing the gene",
-            fontsize=8, pad=8, loc="left")
-
-        lax = fig.add_subplot(gspec[0, 1])
-        lax.set_xlim(0, 1); lax.set_ylim(0, 1)
-        lax.axis("off")
-        # 大小图例：纵排、间距 0.11 —— 显式给，不再粘连
-        lax.set_title("Dot size (%)", fontsize=7.5,
-                      pad=6, loc="left")
-        for k, (f_, s_) in enumerate(size_handles):
-            yy = 0.80 - k * 0.11
-            lax.scatter([0.34], [yy], s=s_, color="gray",
-                        edgecolor="black", linewidth=0.3)
-            lax.text(0.52, yy, f"{int(f_ * 100)}", va="center", fontsize=7.5)
-        # 色标：纵排、放在大小图例下方
-        cax = fig.add_axes([0.900, 0.18, 0.020, 0.22])
-        cb = fig.colorbar(sm, cax=cax, orientation="vertical")
-        cb.set_label("mean expression\nz-scored per gene", fontsize=7)
-        cb.ax.tick_params(labelsize=7, left=False, right=True, labelleft=False, labelright=True)
-
+        sc.pl.dotplot(adata, top3, groupby="leiden", use_raw=True, show=False,
+                      standard_scale="var")
+        fig = plt.gcf()
+        # scanpy 自己按基因数定尺寸，这里拉回标准双栏宽。
+        # 高度 96 mm 是实测值：80 mm 时簇标签顶出画布 +4.5%，88 mm 时 +2.9%
+        fig.set_size_inches(W_DOUBLE, mm(96))
+        # **图例列整列整理**（约定 v2 + 用户 2026-09-24 第三轮反馈）：
+        # ① 点大小图例横排 -> 纵排；② **色标也横排 -> 纵排**（scanpy 的
+        # `_plot_colorbar` 硬编码 orientation="horizontal"，无参数可改）；
+        # ③ 两块上下排列且强制不相交 —— 用户明确要求"变了后也不能重叠"。
+        # 必须在 set_size_inches 之后调用（position 换算依赖最终画幅）。
+        fix_dotplot_legends(fig,
+                            size_title="Fraction of cells in group (%)",
+                            cbar_title="Mean expression in group")
+        # **轴语义必须写在图上**（评审 3.6），但 **suptitle 必须自己折行** ——
+        # constrained layout 不折行长标题（规则 13），实测原 190 字符长句
+        # 两侧各被裁 140px（"rows =" 只剩 "= "）。按 183mm/9pt 拆成 3 行短句。
+        fig.suptitle("Top markers per cluster\n"
+                     "rows = Leiden clusters; dot size = fraction of cells "
+                     "expressing the gene\n"
+                     "colour = mean expression (z-scored per gene, "
+                     "standard_scale = var)")
         save_fig(cfg, "02-03-03-unit1-markers-dotplot", fig)
         # **灰底 marker UMAP 网格**（差距清单 #19，文献范式）：
         # dotplot 给"哪个簇高表达"，灰底 UMAP 给"高表达在哪块区域" ——
