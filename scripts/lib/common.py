@@ -813,20 +813,38 @@ def verticalize_dotplot_size_legend(fig, title=None):
         if len(sizes) != len(labels):
             continue
 
+        # **先把 legend axes 撑高**：scanpy 给这块区域的高度是按"横排一行点"
+        # 分配的，竖排 5 个点 + 5 个刻度标签塞不进原高度 —— 实测标签被裁成
+        # `10/20/30/40` 的残影（run 35974091761）。
+        # 做法：把这个 axes 的物理高度按点数放大，并把它的下边界上移，
+        # 让它占住 legend 区里原本空着的上方空间（那里是 top_spacer）。
+        pos = ax.get_position()
+        n = len(sizes)
+        # 每个点至少需要约 0.022 图高（含标签），上限不超过 0.55（别盖住主图）
+        need_h = min(max(pos.height, 0.022 * n + 0.05), 0.55)
+        ax.set_position([pos.x0, pos.y1 - need_h, pos.width, need_h])
+
         ax.clear()
         # 竖排：从下往上依次变大（与横排的左小右大语义一致）
-        ys = np.arange(len(sizes))
-        ax.scatter(np.zeros(len(sizes)), ys, s=sizes,
+        ys = np.arange(n)
+        # **点贴近轴的左缘**：`set_yticklabels` 把标签画在轴**左侧**，
+        # 原写法把点画在轴中央（x=0），于是"标签 ……… 点"中间留一大片空白。
+        # 点移到左缘附近后，标签紧贴其左，一行读作"标签 — 点"。
+        # （不能把标签放右侧：图例列本来就在最右，右侧没有空间，会被裁。）
+        ax.scatter(np.full(n, 0.12), ys, s=sizes,
                    color="gray", edgecolor="black", linewidth=0.5, zorder=100)
+        # 给上下留半个间距，否则首尾的点和标签贴边被裁
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(-0.6, n - 0.4)
         ax.set_yticks(ys)
         ax.set_yticklabels(labels, fontsize="small")
         ax.set_xticks([])
         ax.tick_params(axis="x", bottom=False, labelbottom=False)
-        ax.tick_params(axis="y", left=False, labelleft=True)
+        ax.tick_params(axis="y", left=False, labelleft=True, pad=1)
         for sp in ax.spines.values():
             sp.set_visible(False)
         if title:
-            ax.set_title(title, fontsize="small")
+            ax.set_title(title, fontsize="small", pad=3, loc="left")
         return True
     return False
 
@@ -867,16 +885,22 @@ def place_labels(ax, xs, ys, texts, fontsize=7, pad_px=2.0,
     renderer = fig.canvas.get_renderer()
     inv = ax.transData.inverted()
 
-    # 候选方向：8 个方位，由近及远多圈外扩
-    dirs = [(1, 0), (-1, 0), (0, 1), (0, -1),
-            (1, 1), (1, -1), (-1, 1), (-1, -1)]
+    # 候选方向：8 个方位，由近及远多圈外扩。
+    # **优先向右/左上** —— 这类散点的点在左侧挤成竖列（x≈0），右侧是空的。
+    dirs = [(1, 0), (1, 1), (1, -1), (0, 1), (0, -1),
+            (-1, 1), (-1, -1), (-1, 0)]
     placed_boxes = []
     used = []
+    # **标签必须留在坐标轴内。** 只判"标签之间不重叠"是不够的 ——
+    # 实测（run 35974071689）：点在左上角挤成一团时，贪心把 8 个标签
+    # 一路往右上推，**全部推出画布顶边**、还压住标题。
+    # 所以加一条包含判据：标签包围盒必须完全落在 axes 内。
+    ax_bb = ax.get_window_extent(renderer=renderer)
 
     for x, y, text in zip(xs, ys, texts):
-        # 锚点像素位置
         px, py = ax.transData.transform((x, y))
         chosen = None
+        best_outside = None   # 实在放不进时的次优（离轴内最近的一个）
         for ring in itertools.count(1):
             if ring * len(dirs) > max_iters:
                 break
@@ -889,11 +913,21 @@ def place_labels(ax, xs, ys, texts, fontsize=7, pad_px=2.0,
                     ha="left" if dx > 0 else ("right" if dx < 0 else "center"),
                     va="bottom" if dy > 0 else ("top" if dy < 0 else "center"),
                     color=PAL.get("ink", "#1A1A1A"))
-                bb = t.get_window_extent(renderer=renderer).expanded(
-                    1 + pad_px / max(t.get_window_extent(renderer=renderer).width, 1),
-                    1 + pad_px / max(t.get_window_extent(renderer=renderer).height, 1))
+                raw = t.get_window_extent(renderer=renderer)
+                bb = raw.expanded(1 + pad_px / max(raw.width, 1),
+                                  1 + pad_px / max(raw.height, 1))
                 if any(bb.overlaps(o) for o in placed_boxes):
                     t.remove()
+                    continue
+                inside = (bb.x0 >= ax_bb.x0 and bb.x1 <= ax_bb.x1 and
+                          bb.y0 >= ax_bb.y0 and bb.y1 <= ax_bb.y1)
+                if not inside:
+                    t.remove()
+                    if best_outside is None:
+                        # 记录"溢出最少"的那个（后面兜底用）
+                        over = (max(0, ax_bb.x0 - bb.x0) + max(0, bb.x1 - ax_bb.x1) +
+                                max(0, ax_bb.y0 - bb.y0) + max(0, bb.y1 - ax_bb.y1))
+                        best_outside = (over, cx, cy, dx, dy)
                     continue
                 placed_boxes.append(bb)
                 chosen = inv.transform((cx, cy))
@@ -902,10 +936,15 @@ def place_labels(ax, xs, ys, texts, fontsize=7, pad_px=2.0,
             if chosen is not None:
                 break
         if chosen is None:
-            # 极端拥挤：放远一点并保留（有引导线仍可读），不静默丢弃
-            cx, cy = px + 60, py + 60
+            # **放不进就带引导线放最近处**，不静默丢弃、也不推到画布外。
+            if best_outside is not None:
+                _, cx, cy, dx, dy = best_outside
+                ha = "left" if dx > 0 else ("right" if dx < 0 else "center")
+                va = "bottom" if dy > 0 else ("top" if dy < 0 else "center")
+            else:
+                cx, cy, ha, va = px + 30, py, "left", "center"
             ax.annotate(text, (x, y), xytext=(cx, cy), textcoords="offset pixels",
-                        fontsize=fontsize, ha="left", va="bottom",
+                        fontsize=fontsize, ha=ha, va=va,
                         color=PAL.get("ink", "#1A1A1A"),
                         arrowprops=dict(arrowstyle="-", lw=0.4,
                                         color=PAL.get("muted", "#999999")))
