@@ -435,14 +435,14 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
         lax.axis("off")
         # 大小图例：纵排、间距 0.11 —— 显式给，不再粘连
         lax.set_title("Dot size (%)", fontsize=7.5,
-                      pad=6, loc="left")
+                      pad=2, loc="left")
         for k, (f_, s_) in enumerate(size_handles):
-            yy = 0.80 - k * 0.11
+            yy = 0.68 - k * 0.08
             lax.scatter([0.34], [yy], s=s_, color="gray",
                         edgecolor="black", linewidth=0.3)
             lax.text(0.52, yy, f"{int(f_ * 100)}", va="center", fontsize=7.5)
         # 色标：纵排、放在大小图例下方
-        cax = fig.add_axes([0.900, 0.18, 0.020, 0.22])
+        cax = fig.add_axes([0.900, 0.10, 0.020, 0.20])
         cb = fig.colorbar(sm, cax=cax, orientation="vertical")
         cb.set_label("mean expression\nz-scored per gene", fontsize=7)
         cb.ax.tick_params(labelsize=7, left=False, right=True, labelleft=False, labelright=True)
