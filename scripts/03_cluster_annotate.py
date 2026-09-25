@@ -437,7 +437,7 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
         fig.text(0.995, 0.78, "Percent Expressed (%)", ha="right",
                   va="bottom", fontsize=7.5)
         for k, (f_, s_) in enumerate(size_handles):
-            yy = 0.62 - k * 0.09
+            yy = 0.60 - k * 0.09
             lax.scatter([0.38], [yy], s=s_, color="gray",
                         edgecolor="black", linewidth=0.3)
             lax.text(0.56, yy, f"{int(f_ * 100)}", va="center", fontsize=7.5)
