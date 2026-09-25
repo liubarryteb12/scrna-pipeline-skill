@@ -1355,6 +1355,38 @@ def place_labels(ax, xs, ys, texts, fontsize=7, pad_px=2.0,
     return used
 
 
+def _record_figure_overflow(cfg: dict, name: str, bad: dict) -> None:
+    """把"内容超出画布"落盘成产物，而不只是打一行 WARN。
+
+    Q-26 / E-49 的教训：`_content_overflow()` **早就检测到了**
+    `{'width_overflow_frac': 0.3523}`（与本地复现逐位吻合）、也**打了 WARN**，
+    而 `02-08-01` 的标题两侧仍被静默裁掉 35% —— 因为**告警没有消费者**。
+    "人读 CI 日志"已被证明会漏（E-30/E-31 同族，但这次连要读的那行字都是
+    程序打出来的）。
+
+    所以判据强度要从**警告级**升到**产物级**：写进 `figure_overflow.json`，
+    由 `main_analysis.py` 的验收项读它并判红。文件写在 `figures_dir` 的上一级
+    （即 `results/<dataset>/`），与其余 status/产物同级。
+    """
+    p = Path(cfg["output"]["figures_dir"]).parent / "figure_overflow.json"
+    try:
+        cur = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    except Exception:
+        cur = {}
+    figs = cur.get("figures") or {}
+    figs[name] = bad
+    cur["figures"] = figs
+    cur["n_overflow"] = len(figs)
+    cur["threshold_note"] = (
+        "超 2% 才记（_content_overflow 的容差）。width/height 键分别代表"
+        "横向/纵向超出画布的比例；savefig.bbox=standard 下超出的部分会被"
+        "**静默裁掉**，文件照样生成、图名图幅墨迹四条门禁全绿。")
+    try:
+        write_json(p, cur)
+    except Exception as e:  # 落盘失败不该让出图失败，但必须吼一声
+        log_warn(f"图 {name} 的溢出记录写不进 {p}：{type(e).__name__}: {e}")
+
+
 def save_fig(cfg: dict, name: str, fig=None, tight: bool = False) -> list:
     """
     保存一张图为 PNG + PDF，并返回写出的路径。
@@ -1365,7 +1397,8 @@ def save_fig(cfg: dict, name: str, fig=None, tight: bool = False) -> list:
     **`bbox_inches` 默认不再是 "tight"。** 参考规范
     （scientific-visualization）明确写着 tight 会改变输出的物理尺寸 ——
     投稿要求"单栏 89 mm"时，tight 出来的就不是 89 mm。装不下由
-    constrained layout 解决，另有 `_content_overflow()` 兜底并告警。
+    constrained layout 解决，另有 `_content_overflow()` 兜底并把溢出
+    **落盘**成 `figure_overflow.json`（供验收判红，见 `_record_figure_overflow`）。
 
     **不要在绘图代码里调用 plt.savefig 后不管 plt.close** —— 不关的话
     同一进程里后续的图会叠在旧 figure 上，产出"看着正常但内容错"的图。
@@ -1381,6 +1414,7 @@ def save_fig(cfg: dict, name: str, fig=None, tight: bool = False) -> list:
     if bad:
         log_warn(f"图 {name} 的内容超出画布（{bad}）—— 标签可能被裁掉。"
                  f"调大 figsize 或改用 layout='constrained'")
+        _record_figure_overflow(cfg, name, bad)
 
     written = []
     for ext in ("png", "pdf"):

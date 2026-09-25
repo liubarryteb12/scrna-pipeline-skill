@@ -116,6 +116,13 @@ REQUIRED_FIGURES = [
     ("02-03-04-unit1-celltype-scores-heatmap",   "细胞类型打分热图"),
     ("02-05-04-unit4-pseudotime-principal-path", "拟时序主路径+root"),
     ("02-05-05-unit2-pseudotime-ridgeline",      "拟时序山脊图"),
+    # Q-26 / E-48 补：这四条原来**不在这张表里**，所以"该有的图没有"这一整类
+    # 问题没有任何检查看得见。02-07-01 的 5 张图（本图 + unit2..5 单 TF 面板）
+    # 因 `figsize` 三元素元组从未产出过，而验收 70 项全绿。
+    ("02-07-01-unit1-tf-activity-vs-pseudotime", "TF 活性沿拟时序"),
+    ("02-07-02-unit1-tf-activity-heatmap",       "TF 活性热图"),
+    ("02-07-03-unit1-tf-specificity-scatter",    "TF 特异性散点"),
+    ("02-08-01-unit1-virtual-perturbation-effect", "虚拟扰动效应"),
 ]
 
 
@@ -129,6 +136,35 @@ def load_step_fn(module_file: str, fn_name: str):
 
 def has_file(p: Path) -> bool:
     return p.exists() and p.stat().st_size > 0
+
+
+# 嵌套 status 里，哪些取值算"崩了"。其余（`not_applied` / `not_done` /
+# `not_configured` / `skipped` …）都是**设计如此地没做**，只可见、不阻断。
+NESTED_FAILED_VALUES = ("failed", "error", "fail")
+
+
+def _iter_nested_status(obj, path=()):
+    """递归产出所有名为 `status` 的字段：`(路径, 值, 同级 reason)`。
+
+    Q-26 / E-48：`grn_status.json` 的**顶层** `status` 是 `"ok"`，而里面
+    `regulon_vs_pseudotime.status` 是 `"failed"` —— 五张图从未产出，而
+    `acceptance.json` 70 项全绿。步骤验收的判据是 `ok = (status == "ok")`，
+    只看顶层，所以嵌套字段**没有任何一条检查看得见**。
+
+    结构上这和"`_content_overflow()` 打了 WARN 没人读"是同一个错误：
+    `except` 把异常降级成了一个**没人读的字段**。所以这里把它读出来。
+    """
+    if isinstance(obj, dict):
+        if "status" in obj:
+            reason = obj.get("reason") or obj.get("message") or ""
+            yield path, obj["status"], reason
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)):
+                yield from _iter_nested_status(v, path + (str(k),))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            if isinstance(v, (dict, list)):
+                yield from _iter_nested_status(v, path + (str(i),))
 
 
 def _vp_engine_consistent(vp: dict) -> bool:
@@ -219,6 +255,11 @@ def run_all(cfg: dict, only: list = None) -> int:
     log_info(f"运行清单：{manifest_path(cfg)}")
 
     failed_required = []
+    # 溢出记录同样要**跑前清空**（与状态文件同理）：否则这一轮修好了，
+    # 上一轮留下的记录还在，验收会把已经修好的图判红。
+    _ovf_stale = res_dir / "figure_overflow.json"
+    if _ovf_stale.exists():
+        _ovf_stale.unlink()
     for sid, mfile, fn, required, label in STEPS:
         if only and sid not in only:
             log_info(f"--- 跳过 {label} ({sid})：不在 --steps 里")
@@ -291,11 +332,33 @@ def run_all(cfg: dict, only: list = None) -> int:
                        "required": required,
                        "detail": "存在" if ok else "**缺失或为空**"})
 
+    # 图属于哪一步，由图名里的模块号决定（`02-07-01-…` 的 `07` → `07_grn.py`
+    # → `grn`）。**图不能无条件要求产出** —— 可选步骤没配时它本就不该有图
+    # （如 `trajectory.enabled: false` 时 `02-05-*` 一张都不该有）。
+    # 上一版把 `02-05-04/02-05-05` 无条件写成 required=True，等于一旦关掉
+    # 轨迹，验收必红 —— 那是判据错了，不是产物错了。
+    _mod2sid = {mfile[:2]: sid for sid, mfile, _f, _r, _l in STEPS}
+    _step_status = {s["id"]: s.get("status", "not_run")
+                    for s in read_state(cfg).get("steps", [])}
+    _step_required = {sid: req for sid, _m, _f, req, _l in STEPS}
     for fname, desc in REQUIRED_FIGURES:
+        mod = fname.split("-")[1] if fname.count("-") >= 1 else ""
+        owner = _mod2sid.get(mod)
+        owner_status = _step_status.get(owner, "not_run") if owner else "not_run"
+        ran = owner_status == "ok"
         ok = has_file(fig_dir / f"{fname}.png")
+        if not ran and not _step_required.get(owner, False):
+            # 可选步骤没跑（或配置关闭）→ 不要求这张图，但**必须可见**
+            checks.append({
+                "item": f"图 {desc} ({fname}.png)", "ok": True,
+                "required": False,
+                "detail": f"步骤 {owner} = {owner_status}，本轮不要求产出",
+            })
+            continue
         checks.append({"item": f"图 {desc} ({fname}.png)", "ok": ok,
                        "required": True,
-                       "detail": "存在" if ok else "**缺失**"})
+                       "detail": "存在" if ok else
+                                 f"**缺失**（步骤 {owner} = {owner_status}）"})
 
     # ---- 模块零：运行清单（§0.3 / §0.4）-------------------------------------
     # 清单缺项不是"分析错了"，而是"这轮跑出来的东西没法追溯"。
@@ -367,6 +430,8 @@ def run_all(cfg: dict, only: list = None) -> int:
         })
 
     # 可选步骤的"没做"要在报告里可见 —— 不能只是绿
+    #
+    # **但"崩了"和"没做"必须分开** —— 见下面独立的内嵌 status 扫描（Q-26）。
     for sid, fname in (("pseudobulk_de", "pseudobulk_status.json"),
                        ("trajectory", "trajectory_status.json"),
                        ("communication", "communication_status.json"),
@@ -379,6 +444,60 @@ def run_all(cfg: dict, only: list = None) -> int:
         note = d.get("reason") or d.get("method") or ""
         checks.append({"item": f"可选步骤状态 {sid} = {st}", "ok": True,
                        "required": False, "detail": str(note)[:150]})
+
+    # ---- 内嵌 status 扫描（Q-26 / E-48，本轮新增）----------------------------
+    #
+    # 上一版没有任何检查看得见**嵌套**的失败：`grn_status.json` 的顶层
+    # `status` 是 `"ok"`，而里面 `regulon_vs_pseudotime.status` 是 `"failed"`
+    # （`figsize` 三元素元组 → 5 张图从未产出），`acceptance.json` 70 项全绿。
+    # 步骤验收的判据是 `ok = (status == "ok")`，只看顶层。
+    #
+    # 判据依据（真 artifact `scrna-results-55` 实测的嵌套取值分布）：
+    #   {'ok': 5, 'failed': 1, 'not_applied': 1, 'not_done': 2}
+    # 其中 `not_applied`（单样本无批次，不做整合）与 `not_done`（输入只有一套
+    # 计数，不做 RNA 速率）是**设计如此地没做**，必须放行；只有 `failed` 是崩了。
+    #
+    # 结构上这和"`_content_overflow()` 打了 WARN 没人读"是同一个错误：
+    # `except` 把异常降级成了一个**没人读的字段**。这里把它读出来。
+    for stf in sorted(res_dir.glob("*status.json")):
+        d = read_json(stf)
+        if not isinstance(d, dict):
+            continue
+        bad = [(".".join(p), str(r)[:200])
+               for p, v, r in _iter_nested_status(d)
+               if p and str(v).lower() in NESTED_FAILED_VALUES]
+        for where, why in bad:
+            checks.append({
+                "item": f"{stf.name} 内嵌 {where} = failed",
+                "ok": False, "required": True,
+                "detail": f"**内嵌失败**：{why or '(无 reason)'}",
+            })
+
+    # ---- 内容超出画布（Q-26 / E-49，本轮新增）--------------------------------
+    #
+    # `save_fig` 里的 `_content_overflow()` **早就检测到了**
+    # `{'width_overflow_frac': 0.3523}`、也**打了 WARN**，而 `02-08-01` 的标题
+    # 两侧仍被静默裁掉 35%（左端只剩 `dKnk:`、右端断在 `the 60`）—— 因为
+    # **告警没有消费者**。`savefig.bbox=standard` 下超出的部分直接被裁，
+    # 文件照样生成：图名合规、图幅合规（1606 px 对应 136 mm 没超）、墨迹正常
+    # （被裁的图照样有墨），四条现有门禁全绿。
+    #
+    # 所以判据强度从**警告级**（`log_warn`，会被忽略）升到**产物级**
+    # （写进 `figure_overflow.json`，这里读它并判红）。
+    ovf = read_json(res_dir / "figure_overflow.json") or {}
+    ovf_figs = ovf.get("figures") or {}
+    if ovf_figs:
+        for fname_o, info in sorted(ovf_figs.items()):
+            checks.append({
+                "item": f"图 {fname_o} 内容超出画布",
+                "ok": False, "required": True,
+                "detail": f"**会被静默裁掉**：{info}",
+            })
+    else:
+        checks.append({
+            "item": "没有图的内容超出画布", "ok": True, "required": False,
+            "detail": "figure_overflow.json 无记录（或无图被检测出溢出）",
+        })
 
     # ---- 内容级检查：状态文件在 ≠ 结果是对的 --------------------------------
     #

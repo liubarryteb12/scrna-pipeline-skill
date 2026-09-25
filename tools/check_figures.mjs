@@ -31,6 +31,25 @@
  * 实测标定下当前 161 张**零误判**（最低 2.39% / 最高 87.71%，
  * 距 FAIL 两侧各留 ≥2.3pp 与 ≥8pp 余量）。
  *
+ * ── 内容贴边检查（Q-26 / E-49，2026-09-25 新增）──────────────────
+ *
+ * 墨迹检查有一个盲区：**被裁掉的图照样有墨**。`02-08-01` 的标题两侧
+ * 各被切掉一段（左端只剩 `dKnk:`、右端断在 `the 60`），墨迹占比完全正常。
+ *
+ * 但裁切有一个物理后果：**墨迹一直延伸到画布边缘**。所以量非背景像素的
+ * 外接框到四边的距离，左右任一 < EDGE_MIN_PX 就判红。
+ *
+ * 阈值同样是实测标定，不是拍脑袋：
+ *   scrna 34 张：min(L,R) 分布 {0:1, 10:9, 11:2, 12:6, 13:13, 14:2, 41:1}
+ *   spatial 76 张：min(L,R) 分布 {10:4, 12:13, 13:38, 14:13, 15:1, 16:3, 20:3, 41:1}
+ *   → 110 张里唯一 < 10 px 的就是被裁的 `02-08-01`（L0/R0），
+ *     阈值取 3 px **零误伤**。
+ *
+ * **只看左右。** 实测 `02-05-05-unit1-pseudotime-by-cluster` 的上边距是 0
+ * —— 那是布局取舍（子图顶到边），不是内容装不下；横向贴边才是
+ * "内容比画布宽、被 savefig 切掉"的信号。
+ * 暗底图（照片类整幅都是"墨"）外接框必是满幅，量不出边距，跳过。
+ *
  * 用法: node tools/check_figures.mjs <目录> [更多目录...]
  */
 
@@ -44,6 +63,10 @@ const MIN_INK = 0.002;
 const INK_WARN_MIN = 0.02;
 const INK_WARN_MAX = 0.92;
 const INK_FAIL_MAX = 0.96;
+// 内容贴边判红阈值（px）：非背景像素外接框到画布左/右缘的距离下限。
+// 实测 110 张图（scrna 34 + spatial 76）里，除被裁的 02-08-01（0 px）外
+// 最小的也有 10 px —— 3 px 零误伤。
+const EDGE_MIN_PX = 3;
 
 function decodePng(buf) {
   if (buf.readUInt32BE(0) !== 0x89504e47) throw new Error("不是 PNG");
@@ -115,19 +138,31 @@ function inkFraction(png) {
 
   let ink = 0;
   const total = width * height;
+  // 非背景像素的外接框（Q-26 / E-49：内容贴边 = 被裁的信号）
+  let minX = width, maxX = -1, minY = height, maxY = -1;
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const o = (y * width + x) * channels;
       const d = Math.abs(pixels[o] - bg[0]) + Math.abs(pixels[o + 1] - bg[1]) +
                 Math.abs(pixels[o + 2] - bg[2]);
-      if (d > 30) ink++;
+      if (d > 30) {
+        ink++;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
     }
   }
   // 背景亮度一起返回：全黑图会让"四角取背景"把黑当成背景、算出 0% 墨迹，
   // 于是**糊死被误报成空白**。判据是相对量，必须再报一个绝对量才分得清
   // （与 AGENTS 里"检查器要挡住自己的盲区"同一条）。
   const bgLuma = (bg[0] + bg[1] + bg[2]) / 3;
-  return { frac: ink / total, bgLuma };
+  const margins = maxX < 0 ? null : {
+    left: minX, right: width - 1 - maxX,
+    top: minY, bottom: height - 1 - maxY,
+  };
+  return { frac: ink / total, bgLuma, margins };
 }
 
 const dirs = process.argv.slice(2);
@@ -138,6 +173,7 @@ if (dirs.length === 0) {
 
 let n = 0, blank = 0;
 const warnings = [];
+const edgeHits = [];
 for (const dir of dirs) {
   if (!existsSync(dir)) continue;
   for (const e of readdirSync(dir, { withFileTypes: true })) {
@@ -147,7 +183,7 @@ for (const dir of dirs) {
     const size = statSync(p).size;
     try {
       const png = decodePng(readFileSync(p));
-      const { frac, bgLuma } = inkFraction(png);
+      const { frac, bgLuma, margins } = inkFraction(png);
       // 暗背景（亮度 < 128）说明图不是白底 —— 此时"四角取背景"的墨迹占比
       // 不可解释，直接判红让人去看，而不是给出一个可能反过来的结论。
       const darkBg = bgLuma < 128;
@@ -162,11 +198,24 @@ for (const dir of dirs) {
                       `(色标压死 / 背景填满，图读不出信息)`);
         blank++;
       } else {
-        console.log(`  [OK]   ${e.name}  ${png.width}x${png.height}  ` +
-                    `墨迹 ${(frac * 100).toFixed(2)}%`);
-        // 双向提示：超出常见范围但不判红
-        if (frac < INK_WARN_MIN || frac > INK_WARN_MAX) {
-          warnings.push(`${e.name}  ${(frac * 100).toFixed(2)}%`);
+        // 内容贴边（Q-26 / E-49）：墨迹顶到左右缘 = 内容比画布宽、被切了。
+        // 暗底图整幅都是"墨"，外接框必满幅，量不出边距 —— 跳过。
+        const edgeBad = !darkBg && margins &&
+                        (margins.left < EDGE_MIN_PX || margins.right < EDGE_MIN_PX);
+        if (edgeBad) {
+          console.error(`  [贴边] ${e.name}  ${png.width}x${png.height}  ` +
+                        `左右边距 ${margins.left}/${margins.right} px ` +
+                        `< ${EDGE_MIN_PX} px  ← 内容比画布宽，两侧被 savefig 切掉了`);
+          blank++;
+          edgeHits.push({ figure: e.name, left: margins.left, right: margins.right });
+        } else {
+          console.log(`  [OK]   ${e.name}  ${png.width}x${png.height}  ` +
+                      `墨迹 ${(frac * 100).toFixed(2)}%` +
+                      (margins ? `  边距 L/R ${margins.left}/${margins.right}` : ""));
+          // 双向提示：超出常见范围但不判红
+          if (frac < INK_WARN_MIN || frac > INK_WARN_MAX) {
+            warnings.push(`${e.name}  ${(frac * 100).toFixed(2)}%`);
+          }
         }
       }
     } catch (err) {
@@ -223,7 +272,16 @@ if (n === 0) {
   process.exit(1);
 }
 if (blank > 0) {
+  if (edgeHits.length > 0) {
+    console.error(`\n其中 ${edgeHits.length} 张内容贴到画布左右缘（边距 < ${EDGE_MIN_PX} px）` +
+                  `—— 内容比画布宽，两侧已被 savefig 静默切掉：`);
+    for (const h of edgeHits) {
+      console.error(`    ${h.figure}  L${h.left}/R${h.right} px`);
+    }
+    console.error("  修法：调大 figsize 宽度、或把标题/图例改短（折行）。" +
+                  "注意宽度仍要落在 89/136/183 mm 三档之内。");
+  }
   console.error(`\n${blank}/${n} 张图有问题`);
   process.exit(1);
 }
-console.log(`\n${n} 张图全部非空白、非糊死`);
+console.log(`\n${n} 张图全部非空白、非糊死、内容不贴边`);

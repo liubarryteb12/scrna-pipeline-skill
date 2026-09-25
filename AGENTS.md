@@ -137,7 +137,8 @@ artifact 路径形如 `data/<dataset_id>/raw.h5ad`，脚本里是
   无上限增长会画出装不进任何期刊一页的图 —— 实测修之前最宽的
   `domain_markers_dotplot` 是 370 mm。
 - `save_fig()` 默认**不再用 tight bbox**。`bbox_inches="tight"` 会**改变物理
-  输出尺寸**，让上面的毫米约定失效。溢出改由 `_content_overflow()` 检测并告警。
+  输出尺寸**，让上面的毫米约定失效。溢出改由 `_content_overflow()` 检测，并
+  **落盘成 `figure_overflow.json`**（不再是只打 WARN —— 见规则 25）。
 - **`set_seed()` 末尾会 `apply_style()`** —— rcParams 在**图创建时**就被读取，
   在 `save_fig()` 里设样式已经太晚。
 - 图上文字一律英文：matplotlib 自带的 DejaVu Sans 没有中文字形。
@@ -674,5 +675,94 @@ PAL_CYCLE**（与 `axes.prop_cycle` 同源），需要就加显式图例。
 > 看不见图例位置。一张图例压在数据点上的图，在
 > "文件存在 / 有墨迹 / 图名合规 / 配色合规 / 图幅合规"眼里**全都是合格的** ——
 > 这正是工作区治理层错误台账（`governance/15_ERROR_LEDGER.md`，**不在本仓库内**）E-06「门禁本身有盲区」的又一例。
+
+
+## 25. 四条"图没了 / 图被裁了却全绿"的补强（Q-26，2026-09-25）
+
+起因是台账 E-48 与 E-49 两条**互相独立**的缺陷，它们暴露了验收层与门禁层
+**四个各自独立的盲区**。四条补强分别堵一个，缺一条那类缺陷就还能再犯一次。
+
+### 25.1 嵌套 `status` 的 `failed` 必须判红（验收层）
+
+`status` 不只在顶层。`qc_status.json` / `integration_status.json` /
+`cluster_status.json` / `grn_status.json` 里都有**嵌套**的 `status` 字段，
+而旧验收层只看顶层 `d.get("status")`。
+
+实测（真 artifact `scrna-results-55`）：顶层分布 `{ok: 7, not_configured: 1}`，
+**嵌套分布 `{ok: 5, failed: 1, not_applied: 1, not_done: 2}`** ——
+唯一那条 `failed` 是 `grn_status.json → regulon_vs_pseudotime.status = failed`
+（`ValueError: Invalid unit 6.800000000000001 in 'figsize'`，E-48 的后果），
+而它的顶层 `status` 是 `ok`。**顶层全绿、里面已经崩了。**
+
+判据必须**只把 `failed` / `error` / `fail` 判红**：
+
+| 嵌套值 | 含义 | 处置 |
+|---|---|---|
+| `failed` / `error` / `fail` | 崩了 | **判红（required）** |
+| `not_applied` / `not_done` | 设计如此地没做 | 可见不阻断 |
+| `ok` | 正常 | 放行 |
+
+误判的代价是双向的：把 `not_applied`（单样本不做整合）判红会让每个 job 都红，
+把 `failed` 放行则正是 E-48。实现是 `_iter_nested_status(obj, path=())`
+递归产出 `(路径, 值, 同级 reason)`，扫**全部** `*status.json`
+（不只可选步骤那 5 个 —— 上面四个文件里三个是必需步骤的）。
+
+### 25.2 图验收必须条件化，且要覆盖全部出图脚本（验收层）
+
+`REQUIRED_FIGURES` 原来只有 14 条，**不含 `02-07-*`（三张 GRN 图）与
+`02-08-01`** —— E-48 让 5 张图从未产出，而验收层根本不知道它们该存在。
+
+补齐之后还有第二个问题：**图不能无条件要求产出**。`trajectory.enabled: false`
+时 `02-05-*` 一张都不该有，旧写法一关轨迹就必红。所以改成由图名第 2 段
+（`02-07-01` 的 `07`）反查所属步骤，从 `read_state(cfg)` 取该步骤的
+status 与 required：
+
+- 所属步骤**可选且未跑成** → `required: False`，detail 写明
+  `步骤 grn = not_configured，本轮不要求产出`
+- 否则 → `required: True`，缺失时 detail 带 `**缺失**（步骤 grn = ok）`
+
+**兜底是 25.1 那条独立扫描** —— 步骤崩了的时候，即使图项因条件化放行，
+嵌套 `failed` 仍会把它判红。
+
+### 25.3 溢出检测必须落盘，不能只打 WARN（产物级）
+
+E-49 的形态：`_content_overflow()` **正确检测到了**
+`width_overflow_frac=0.3523`、**正确打了 WARN**，然后**没有任何人读** ——
+标题超宽 35%，在 `savefig.bbox: standard` 下被静默裁掉，图照样生成、
+门禁照样绿。
+
+**"检测到了"不等于"有人会知道"。** 现在 `save_fig()` 里的
+`_record_figure_overflow(cfg, name, bad)` 把溢出**落盘**到
+`results/<dataset_id>/figure_overflow.json`（`{figures: {名: bad}, n_overflow}`），
+验收层读它并**判红（required）**，detail 写明"**会被静默裁掉**"。
+
+三条配套约束：
+
+1. **与状态文件同理，跑前必须删旧文件**（`_ovf_stale.unlink()`）——
+   否则图修好了旧记录还在，验收把已修好的图判红。
+2. **只累积、不覆盖** —— 同一次运行多张图溢出要全部记下。
+3. **记录可被修复** —— 标题改短后不应再新增记录（已做双向验证）。
+
+### 25.4 门禁要查"内容贴边"，不能只查"有没有墨"（门禁层）
+
+`check_figures.mjs` 原来只查"有没有墨 / 是不是糊死"。
+**被裁掉的图照样有墨** —— 这正是它当年漏掉 E-49 的原因。
+
+裁切的物理后果是**墨迹延伸到画布边缘**，所以量非背景像素外接框到左右边的
+距离。阈值 `EDGE_MIN_PX = 3`，实测标定（scrna 34 张 + spatial 76 张）：
+
+- scrna 边距分布 `{0:1, 10:9, 11:2, 12:6, 13:13, 14:2, 41:1}` ——
+  `L<3 或 R<3`、`L==0 或 R==0`、`L<6 或 R<6` **都只命中 `02-08-01` 一张**
+  （就是 E-49 那张），零误伤。
+- spatial 76 张全部通过，零误伤。
+
+两条刻意的取舍：
+
+1. **只判左右，不判上下。** 实测 `02-05-05-unit1-pseudotime-by-cluster`
+   上边距 = 0 —— 那是布局取舍，不是裁切。单看某一边会误伤。
+2. **暗底图跳过。** 整幅都是"墨"，外接框必满幅，判了全是假阳性。
+
+> 本文件与 `spatial-pipeline-skill/tools/check_figures.mjs` **必须逐字相同**
+> （两仓同一份，见该文件头注释）；改一侧必须同步另一侧并比对哈希。
 
 
