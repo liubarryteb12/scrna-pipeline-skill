@@ -895,6 +895,21 @@ scripts/01_qc.py:79                     in run_scrublet
 OpenBLAS 0.3.34。**上游修复（0.3.35）尚未进入任何 numpy wheel**
 （PyPI 上最新仍是 2.5.3），所以只能钉，不能等。
 
+**上线复验（run `36153515064` / commit `f19eff9`，2026-09-25T15:20Z）**：
+**attempt 1 一次过** —— 这是本条 60 个 run 里**第一次** att1 就成功
+（此前 8 个 rerun 全是 att1 失败）。日志 segfault 命中 **0**；CI 实际装的
+是 `numpy-2.5.1-cp312-cp312-manylinux_2_27_x86_64…whl`，artifact
+`run_manifest.json` 的 `versions.numpy = 2.5.1` —— **两处对上，说明钉上界
+真的生效，而不是"这次恰好没崩"**。artifact `scrna-results-61` 亲验：
+`acceptance.json` = **75 项全过 / 0 失败**、`figure_overflow.json`
+不存在、`figures/` 39 PNG + 39 PDF（`02-07-01-unit1..5` 全在）。
+
+> **"一次过"本身不是证明。** #6026 是**宿主相关**的偶发缺陷 —— 单轮成功
+> 只说明"这一轮的宿主 k ≤ 256"。真正的证据是**版本已经落到正常侧**
+> （2.5.1 → OpenBLAS 0.3.33.112.0），所以这一轮的成败**不再是随机的**。
+> 要再确认，观测口径是**后续若干轮的 rerun 率应降到 0**，而不是
+> "再看一轮是不是绿的"。
+
 **`PYTHONFAULTHANDLER: 1` 继续留着**，理由变了：它这次兑现了价值（没有它
 根因定不下来），而 numpy 上界只覆盖 OpenBLAS 这一个来源。
 
