@@ -840,10 +840,89 @@ def plot_marker_dotplot(ax, frac, zmat, *, cmap="RdBu_r",
     ax.tick_params(length=2, pad=2)
 
     sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap_obj)
-    # 大小图例句柄：按 20/40/60/80/100% 取点，间距由调用方画在独立轴上
+    # 大小图例句柄：25/50/75/100% 四档（用户第七轮：五档太挤）
     size_handles = [(f, size_min + f * (size_max - size_min)) for f in
                     (0.25, 0.5, 0.75, 1.0)]
     return sm, size_handles
+
+
+def build_marker_dotplot_figure(frac_df, z_df, *, group_label, title,
+                                subtitle, fig_width=None, fig_height_mm=126):
+    """
+    构建**整张** marker dotplot（主图 + 底部横带图例），返回 `(fig, size_handles)`。
+
+    **为什么把它抽成函数（这是本图第八轮才做对的关键）。** 前七轮图例布局的
+    代码是**内联在调用脚本里**的，而验证脚本又**照抄了一份** —— 同一段布局
+    存在三份镜像（scrna 脚本 / spatial 脚本 / 本地验证脚本）。于是：
+
+    * 改一处、另两处不同步 → 验证脚本测的不是生产代码，**"全 PASS"是假的**；
+    * 每次微调都要改三处，而 matplotlib 的位置参数**看不到效果**，
+      只能靠一轮轮烧 CI 去猜 —— 实测调了七轮、每轮都要你重新看图。
+
+    抽成一个函数后，**脚本与验证脚本调用的是同一份代码**，改一次全体生效。
+
+    **图例为什么放底部横带。** 用户提供的参考代码
+    （`可参考代码/99.单细胞：自动注释`）用 `scCustomize::do_DotPlot(dot.scale=12)`
+    —— Seurat 生态的标准范式：图例在主图**下方一条横带**，左半点大小、
+    右半横向色标。前七轮把两块图例竖着塞进右侧 1/6 宽的窄列，两块图例加
+    两个标题挤在 0.4 图高的竖条里，**没有不受挤的排法**（实测调四轮仍相撞）。
+    改横带后主图横向延展到全宽，两个标题各在自己图例正上方，与点列物理分离。
+
+    **必须 `set_layout_engine("none")`。** 本仓库全局开着
+    `figure.constrained_layout.use: True`（AGENTS 规则 13），而它会**在每次
+    draw 时重排手动设的坐标** —— 这正是前几轮"改了没效果、底部留白越调越多"
+    的原因：`fig.add_axes([...])` 设的位置被 constrained layout 覆盖了。
+    这张图的几何由本函数全权控制，所以显式关掉它。
+
+    :param frac_df: DataFrame，index=分组，columns=基因，值 = 表达细胞比例
+    :param z_df: DataFrame，同形状，值 = 按基因 z-score 后的表达
+    :param group_label: y 轴标签（"Leiden cluster" / "Spatial domain"）
+    :param title: suptitle（如 "Top markers per cluster"）
+    :param subtitle: 主图标题第二行（轴语义说明）
+    :param fig_width: 图宽（默认 W_DOUBLE）
+    :param fig_height_mm: 图高（毫米）
+    :returns: `(fig, size_handles)`
+    """
+    import matplotlib.pyplot as plt
+
+    w = W_DOUBLE if fig_width is None else fig_width
+    fig = plt.figure(figsize=(w, mm(fig_height_mm)))
+    # **关掉 constrained layout** —— 见 docstring：它会覆盖下面所有手动坐标
+    fig.set_layout_engine("none")
+
+    # 主图占满上方（左右各留一点给 y 轴标签与右缘）
+    ax = fig.add_axes([0.075, 0.315, 0.905, 0.535])
+    sm, size_handles = plot_marker_dotplot(ax, frac_df, z_df)
+    ax.set_xlabel("gene", fontsize=8)
+    ax.set_ylabel(group_label, fontsize=8)
+    fig.suptitle(title, fontsize=11, y=0.965)
+    ax.set_title(subtitle, fontsize=8, pad=6, loc="left")
+
+    # ---- 底部横带 · 左半：Percent Expressed (%)（四点横排）---------------
+    lax = fig.add_axes([0.075, 0.045, 0.42, 0.13])
+    lax.set_xlim(0, 1)
+    lax.set_ylim(0, 1)
+    lax.axis("off")
+    lax.text(0.0, 0.88, "Percent Expressed (%)", ha="left", va="center",
+             fontsize=7.5)
+    for k, (f_, s_) in enumerate(size_handles):
+        xx = 0.06 + k * 0.20
+        lax.scatter([xx], [0.42], s=s_, color="gray",
+                    edgecolor="black", linewidth=0.3)
+        lax.text(xx, 0.02, f"{int(f_ * 100)}", ha="center", va="center",
+                 fontsize=7.5)
+
+    # ---- 底部横带 · 右半：Mean Expression（横向色标）--------------------
+    cax = fig.add_axes([0.60, 0.085, 0.28, 0.035])
+    cb = fig.colorbar(sm, cax=cax, orientation="horizontal")
+    cax.text(0.0, 1.9, "Mean Expression", transform=cax.transAxes,
+             ha="left", va="bottom", fontsize=7.5)
+    cb.set_ticks([-1, 0, 1])
+    cb.set_ticklabels(["Low", "Mid", "High"])
+    cb.ax.tick_params(labelsize=7, top=False, bottom=True,
+                      labeltop=False, labelbottom=True)
+    return fig, size_handles
+
 
 def fix_dotplot_legends(fig, size_title=None, cbar_title=None):
     """

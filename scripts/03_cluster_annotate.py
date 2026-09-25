@@ -35,7 +35,7 @@ import scanpy as sc  # noqa: E402
 import yaml  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed, write_json, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, plot_marker_dotplot, PAL,)
+                    log_warn, parse_args, record_step, save_fig, set_seed, write_json, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, plot_marker_dotplot, build_marker_dotplot_figure, PAL,)
 
 
 def load_signatures(cfg: dict) -> dict:
@@ -418,50 +418,14 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
         z_df = pd.DataFrame(zmat, index=ug, columns=top3)
 
         # **图例放主图下方的横带（Seurat do_DotPlot 范式，用户第七/八轮反馈）。**
-        # 前七轮把两块图例竖着塞在右侧窄列里，标题与点列的相对位置调了四轮仍会
-        # 相撞 —— 右列宽 1/6、高 133mm，两块图例加两个标题挤在 0.4 图高的竖条里，
-        # 没有不受挤的排法。参考代码（可参考代码/99.单细胞：自动注释）用的
-        # `scCustomize::do_DotPlot(dot.scale=12)` 是 Seurat 生态的标准范式：
-        # **图例放主图下方一条横带** —— 左半点大小图例（横排）、右半横向色标。
-        # 改成这个布局后：主图横向延展到全宽，两个标题各在自己图例正上方，
-        # 与点列物理分离，重叠从布局上不可能发生。
-        fig = plt.figure(figsize=(W_DOUBLE, mm(138)))
-        gspec = fig.add_gridspec(
-            2, 2, height_ratios=[4.0, 1.0], width_ratios=[1.0, 1.0],
-            hspace=0.04, wspace=0.10)
-        ax = fig.add_subplot(gspec[0, :])
-        sm, size_handles = plot_marker_dotplot(ax, frac_df, z_df)
-        ax.set_xlabel("gene")
-        ax.set_ylabel("Leiden cluster")
-        fig.suptitle("Top markers per cluster", fontsize=11)
-        ax.set_title(
-            "rows = Leiden clusters (identities: celltype_annotation.csv)"
-            "\ndot size = fraction of cells expressing the gene",
-            fontsize=8, pad=8, loc="left")
-
-        # ---- 底部横带 · 左半：Percent Expressed (%)（4 点横排）-----------
-        lax = fig.add_subplot(gspec[1, 0])
-        lax.set_xlim(0, 1); lax.set_ylim(0, 1)
-        lax.axis("off")
-        lax.text(0.16, 0.92, "Percent Expressed (%)", ha="left",
-                 va="top", fontsize=7.5)
-        for k, (f_, s_) in enumerate(size_handles):
-            xx = 0.16 + k * 0.17
-            lax.scatter([xx], [0.45], s=s_, color="gray",
-                        edgecolor="black", linewidth=0.3)
-            lax.text(xx, 0.06, f"{int(f_ * 100)}", ha="center",
-                     va="top", fontsize=7.5)
-
-        # ---- 底部横带 · 右半：Mean Expression（横向色标）----------------
-        # 色标横条 + 标题在其正上方 + Low/Mid/High 刻度在下缘。
-        cax = fig.add_axes([0.665, 0.035, 0.150, 0.045])
-        cb = fig.colorbar(sm, cax=cax, orientation="horizontal")
-        cax.text(0.0, 1.90, "Mean Expression", transform=cax.transAxes,
-                 ha="left", va="bottom", fontsize=7.5)
-        cb.set_ticks([-1, 0, 1])
-        cb.set_ticklabels(["Low", "Mid", "High"])
-        cb.ax.tick_params(labelsize=7, top=False, bottom=True,
-                          labeltop=False, labelbottom=True)
+        # 整图构建抽在 `common.build_marker_dotplot_figure` —— 前七轮把这段
+        # 内联在脚本里、验证脚本又照抄一份，三份镜像不同步，导致"改了没效果"
+        # 与七轮返工（详见该函数 docstring）。
+        fig, size_handles = build_marker_dotplot_figure(
+            frac_df, z_df,
+            group_label="Leiden cluster",
+            title="Top markers per cluster",
+            subtitle="rows = Leiden clusters (identities: celltype_annotation.csv)\ndot size = fraction of cells expressing the gene")
 
         save_fig(cfg, "02-03-03-unit1-markers-dotplot", fig)
         # **灰底 marker UMAP 网格**（差距清单 #19，文献范式）：
