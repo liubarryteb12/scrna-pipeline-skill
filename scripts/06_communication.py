@@ -377,7 +377,7 @@ def run_06_communication(cfg: dict) -> dict:
     # 同时**必须夹到 W_DOUBLE**：实测原来算出 259.1 mm，装不进任何期刊的一栏
     # （规则 13）。
     fig_h = min(W_DOUBLE, max(2.6, 0.16 * len(mat) + 1.9))
-    fig_w = min(W_DOUBLE, max(W_ONE_HALF, 0.55 * len(groups) + 2.2))
+    fig_w = W_ONE_HALF  # 上限夹到一栏半：上限若用 W_DOUBLE，n 处于中间值时算出非标宽（实测 153.7mm）
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     im = ax.imshow(mat.values, aspect="auto", cmap="viridis")
     ax.set_xticks(range(len(mat.columns)))

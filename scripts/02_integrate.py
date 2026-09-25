@@ -89,15 +89,32 @@ def run_02_integrate(cfg: dict) -> dict:
     log_info(f"高变基因: {n_hvg}")
     adata.raw = adata
 
-    # HVG 图：均值-离散度，标出被选中的
+    # HVG 图：均值-离散度，标出被选中的。
     #
-    # **注意 scanpy 版本的 API 差异。** `sc.pl.highly_variable_genes` 在
-    # 1.12 里**没有 `return_fig`**（传了会 TypeError），它画到当前 figure 上。
-    # 所以这里用 plt.gcf() 取，而不是靠返回值。
+    # **不用 `sc.pl.highly_variable_genes`**：它是高层 API，自己建 figure、
+    # figsize 不受控（实测 177.8mm，不在三档标准栏宽里），且样式门禁
+    # （fig_dpi / legend_convention）对它也无从约束。`sc.pp.highly_variable_genes`
+    # 已经把 `means` / 离散度指标 / `highly_variable` 写进 `adata.var`，
+    # 直接用那些列自己画（不重算，口径与 scanpy 一致）。
+    # 离散度列随 flavor 而异：seurat_v3 是 variances_norm，其余是 dispersions_norm。
     import matplotlib.pyplot as plt
-    sc.pl.highly_variable_genes(adata, show=False)
-    fig = plt.gcf()
-    fig.suptitle(f"HVG ({hvg_flavor_used}, n={n_hvg})")
+    import matplotlib.patches
+
+    disp_col = "variances_norm" if hvg_flavor_used == "seurat_v3" else "dispersions_norm"
+    hv = adata.var["highly_variable"].to_numpy()
+    means = adata.var["means"].to_numpy()
+    disp = adata.var[disp_col].to_numpy()
+    colors = np.where(hv, PAL["highlight"], PAL["muted"])
+    fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(70)))
+    ax.scatter(means, disp, c=colors, s=3, linewidths=0, alpha=0.7)
+    ax.set_xlabel("mean expression of genes")
+    ax.set_ylabel(f"{disp_col} of genes")
+    ax.set_title(f"HVG selection ({hvg_flavor_used}, n={n_hvg})\n"
+                 "orange = highly variable; grey = other genes")
+    fig.legend(handles=[
+        matplotlib.patches.Patch(color=PAL["highlight"], label="highly variable genes"),
+        matplotlib.patches.Patch(color=PAL["muted"], label="other genes"),
+    ], fontsize=7, ncol=1, loc="outside right center")
     save_fig(cfg, "02-02-01-unit1-hvg-selection", fig)
 
     # ---- 2. 子集到 HVG ------------------------------------------------------

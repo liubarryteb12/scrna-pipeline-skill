@@ -694,7 +694,10 @@ def run_05_trajectory(cfg: dict) -> dict:
                    .reset_index())
     per_cluster.to_csv(res_dir / "pseudotime_by_cluster.csv", index=False)
 
-    fig, ax = plt.subplots(figsize=(max(W_SINGLE, 0.5 * n_clusters + 2), mm(58)))
+    # 宽度直接取标准档位：夹到区间只会得到区间内的任意值（n=5 时 114.3mm，非标），
+    # 档位判据（89/136/183±1.5mm）照样判红。簇多信息多 → 一栏半；簇少 → 单栏。
+    fig_w = W_ONE_HALF if n_clusters > 4 else W_SINGLE
+    fig, ax = plt.subplots(figsize=(fig_w, mm(58)))
     order = per_cluster.sort_values("consensus_median")["cluster"].tolist()
     data = [consensus[adata.obs["leiden"].astype(str).values == c] for c in order]
     # matplotlib 3.9 起 boxplot 的 `labels` 改名 `tick_labels`；老名字在 3.11 直接 TypeError
