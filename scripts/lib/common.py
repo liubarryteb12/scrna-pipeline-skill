@@ -771,7 +771,7 @@ def _content_overflow(fig) -> dict:
 
 
 def plot_marker_dotplot(ax, frac, zmat, *, cmap="RdBu_r",
-                        size_max=340, size_min=12, dot_edge=0.3):
+                        size_max=170, size_min=10, dot_edge=0.3):
     """
     手工画 marker dotplot：颜色 = 按基因做 z-score（跨簇可比偏离方向），
     点大小 = 表达该基因的细胞比例。
@@ -842,7 +842,7 @@ def plot_marker_dotplot(ax, frac, zmat, *, cmap="RdBu_r",
     sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap_obj)
     # 大小图例句柄：按 20/40/60/80/100% 取点，间距由调用方画在独立轴上
     size_handles = [(f, size_min + f * (size_max - size_min)) for f in
-                    (0.2, 0.4, 0.6, 0.8, 1.0)]
+                    (0.25, 0.5, 0.75, 1.0)]
     return sm, size_handles
 
 def fix_dotplot_legends(fig, size_title=None, cbar_title=None):
