@@ -338,7 +338,15 @@ def run_07_grn(cfg: dict) -> dict:
                                           label="±1 SD")
                         ax_t.set_xlabel("pseudotime bin (higher = later)")
                         ax_t.set_ylabel("regulon activity")
-                        ax_t.set_title(f"{tf} activity along pseudotime (mean ± 1 SD per bin)")
+                        # **标题必须折两行**（Q-26 验收层首跑抓到，E-51）：
+                        # 单行 `f"{tf} activity along pseudotime (mean ± 1 SD per bin)"`
+                        # 在面板宽度 W_SINGLE=89mm 上，SMARCA4 就超出 3.71%，
+                        # 更长的 TF 名（SMARCAD1 实测 +4.85%）超得更多 ——
+                        # `savefig.bbox: standard` 下**静默裁掉右端**，图照样生成。
+                        # 折行后第二行宽度固定，任何 TF 名都留 2.4% 余量
+                        # （本地用 common._content_overflow 逐名标定，见 E-51）。
+                        ax_t.set_title(f"{tf} activity along pseudotime\n"
+                                       "(mean ± 1 SD per bin)")
                         ax_t.legend(fontsize=6)
                         save_fig(cfg, TF_FIG_BASE + str(ui + 1) + "-tf-" + tf.lower() + "-trend", fig_t)
         except Exception as e:  # noqa: BLE001
