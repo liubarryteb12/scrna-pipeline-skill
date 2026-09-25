@@ -816,8 +816,12 @@ ax_t.set_title(f"{tf} activity along pseudotime\n(mean ± 1 SD per bin)")
 
 CI 的「跑流水线」步骤偶发 **exit 139**。日志停在 `01_qc.py:226` 的
 `过滤: …` 之后一行 `Segmentation fault (core dumped)`，**没有任何
-Python traceback**。近 20 轮里 4 轮需要 rerun，最早可追溯到
-2026-09-24 的 `5e24329` —— 一直存在，只是被 rerun 掩盖。
+Python traceback**。
+
+**它是长期存在的，不是哪一轮引入的。** 全量 60 个 run 里有 8 个
+`run_attempt>1`，**全部**是"att1 失败 + rerun 成功"形态，最早一个是
+`06977d0`（2026-09-20T11:34:50Z）。**这 8 个的 att1 崩溃位置逐字相同**，
+跨 5 天、跨 7 个 commit。**"rerun 能过"把它掩盖了整整 5 天。**
 
 ### 26.1 崩溃点怎么锁死的
 
@@ -829,59 +833,95 @@ Python traceback**。近 20 轮里 4 轮需要 rerun，最早可追溯到
 **但 `01_qc.py:85` 的 `except Exception` 接不住它** —— native SIGSEGV
 直接杀进程，`qc_status.json` 里连一行失败原因都没有。
 
-### 26.2 首要嫌疑：Numba 的并行运行期
+### 26.2 根因：OpenBLAS 0.3.34 的 `dgemm_kernel_HASWELL` 栈越界
 
-调用链（**必须追到"函数头上挂的是谁的装饰器"**）：
+**这一步是靠 `PYTHONFAULTHANDLER: 1` 拿到的真栈定下来的**（run
+`36150495910`）—— 在此之前只能靠猜。栈的落点（逐字，自下往上读）：
 
 ```
-sc.pp.scrublet
-  → _scrublet/__init__.py:435-440  pipeline.zscore(scrub)
-  → _scrublet/pipeline.py:36       fast_array_utils.stats.mean_var
-  → _mean_var.py:44-45             _sparse_mean_var
-  → _mean_var.py:90-117 / 120-147  sparse_mean_var_*：for i in numba.prange(n_threads)
+scipy/sparse/linalg/_interface.py:1118  in _matmat      ← return self.A @ X
+scipy/sparse/linalg/_interface.py:451   in _shared_matmat
+scipy/sparse/linalg/_interface.py:491   in matmat
+scipy/sparse/linalg/_eigen/_svds.py:511 in svds         ← Av = X_matmat(eigvec)
+scipy/_lib/_util.py:306                 in wrapper
+sklearn/decomposition/_pca.py:740       in _fit_truncated
+sklearn/decomposition/_pca.py:542       in _fit
+sklearn/decomposition/_pca.py:440       in fit
+scanpy/preprocessing/_scrublet/pipeline.py:84  in pca
+scanpy/preprocessing/_scrublet/__init__.py:448 in _scrublet_call_doublets
+scanpy/preprocessing/_scrublet/__init__.py:243 in _run_scrublet
+scanpy/preprocessing/_scrublet/__init__.py:298 in scrublet
+scripts/01_qc.py:79                     in run_scrublet
 ```
 
-那两个函数头上挂的是 **`fast_array_utils.numba.njit`**，不是 numba 原生
-`@njit`：它 `{parallel: numba.njit(..., parallel=parallel) for parallel in
-(True, False)}` **同时编译两个版本**（`fast_array_utils/numba/__init__.py:106-109`），
-运行时由 wrapper 分派（L112-123）。Linux 主线程上
-`_needs_parallel_runtime_probe()` 恒为 False（只对 apple silicon + torch
-生效），于是 **永远走 `parallel=True`**，`prange` 真实启动线程层。
+**栈里一帧 numba 都没有。** 崩溃是一次**稠密 GEMM**：`_scrublet/pipeline.py`
+第 79 行先把稀疏矩阵 `.toarray()`，第 84 行交给
+`PCA(svd_solver="arpack")`，sklearn 走 `svds` → ARPACK 求特征向量后做
+`X_matmat(eigvec)`，而 `self.A` 已是**稠密 ndarray**，于是落到
+`dgemm_kernel_HASWELL`。
 
-**本地实测**：真 `sc.pp.scrublet` 调用**之前** `threading_layer()` 未初始化，
-调用**之后**返回 **`omp`**；启动前设 `NUMBA_THREADING_LAYER=workqueue`
-则返回 **`workqueue`**，且 `mean_var` 结果**逐位相同**。
+上游 **OpenBLAS #6026**（2026-09-11 报、09-13 关）的形态与本仓**逐项吻合**：
 
-**注意 `NUMBA_NUM_THREADS=1` 管不住这一层** —— 实测在它之下
-`threading_layer()` 依然是 `omp`。"几个线程"与"用哪套线程运行时"是两个
-独立旋钮。
+- 环境原文即 `OpenBLAS 0.3.34, as bundled in the scipy-openblas64 wheel
+  shipped with numpy 2.5.2 and 2.5.3` + `OPENBLAS_CORETYPE=Haswell` +
+  GitHub 托管 `ubuntu-latest` —— 正是本仓 job env 凑齐的组合。
+- **机制**：Haswell 内核把 k 维分块打包进一个固定 `0x7080` 字节的**栈
+  缓冲区**，每步写 96 字节且**对 k 无上界**；k ≳ 319 时越界覆盖
+  callee-saved 寄存器与返回地址槽，最后那条 `ret` 直接 SIGSEGV。
+- **为什么偶发、为什么 rerun 能过**：level-3 的 blocking（决定 k 的大小）
+  **在运行期按宿主 cache 拓扑选取**。GitHub 的 Azure fleet 混着不同型号
+  CPU —— 落到 k 会变大的机器上就崩，落到 k ≤ 256 的机器上就过。
+  **同一 commit、同一批包版本、相隔 8 分钟的两个 run 一成一败**，只能
+  这样解释。
+- 上游实测**受影响的机器上约三次崩一次** —— 与本仓观测到的 rerun 频率一致。
 
-### 26.3 处置：两条 env，一条取证一条降概率
+**附带风险：越界若只覆盖了保存寄存器、没碰到返回地址，进程会正常返回而
+数值被污染。** 即"没崩"不等于"算对了"。
 
-```yaml
-NUMBA_THREADING_LAYER: workqueue   # 3b) 换掉 omp，不碰 OpenMP
-PYTHONFAULTHANDLER: 1              # 4) 再崩时给出真正的 Python 栈
-```
+**各 numpy wheel 自带的 OpenBLAS**（读 `numpy.libs/libscipy_openblas64_*.so`
+里的版本串得到）：
 
-选 `workqueue` 的依据是**依赖方自己写下来的**：
-`fast_array_utils/numba/__init__.py:117-120` 的告警原文就指名
-``Set `NUMBA_THREADING_LAYER=workqueue` or install `tbb` to avoid this fallback.``
+| numpy | 自带 OpenBLAS | 状态 |
+|---|---|---|
+| 2.4.6 | 0.3.31.188.0 | 正常 |
+| 2.5.0 / 2.5.1 | 0.3.33.112.0 | **最后一个正常版** |
+| 2.5.2 | 0.3.34.0.0 | 回归 |
+| **2.5.3**（本仓此前浮动到的） | **0.3.34.106.0** | 回归 |
 
-**`PYTHONFAULTHANDLER` 继续留着**，因为 ② 只降概率、**没有证明修好**。
+### 26.3 处置
 
-### 26.4 四条规则
+**修复是钉 numpy 上界**（`requirements.txt`）：
+`numpy>=2.1,<2.5.2` —— 下界 2.1 是 `anndata 0.13` 的硬要求，上界躲开
+OpenBLAS 0.3.34。**上游修复（0.3.35）尚未进入任何 numpy wheel**
+（PyPI 上最新仍是 2.5.3），所以只能钉，不能等。
+
+**`PYTHONFAULTHANDLER: 1` 继续留着**，理由变了：它这次兑现了价值（没有它
+根因定不下来），而 numpy 上界只覆盖 OpenBLAS 这一个来源。
+
+**`NUMBA_THREADING_LAYER: workqueue` 保留，但它的立项理由已被推翻。**
+它是按"numba 并行运行期"的假设加的，而栈证明 numba 不在路径上 ——
+带上它照崩（run `36150495910`）。保留只剩一条防御性理由：numba 的 `omp`
+线程层会加载一份 libgomp，而 scikit-learn 自己 bundle 了一份
+（`sklearn.utils._openmp_helpers`，实测在崩溃轮的 218 个 extension
+modules 里），**同进程两份 OpenMP 运行时**是上游有记录的崩溃形态。
+
+### 26.4 五条规则
 
 1. **native 崩溃不能靠 `except` 兜底。** `except Exception` 只覆盖 Python
    层异常；凡是有 C 扩展参与的关键步骤，都要问一句"它要是崩了，我会不会
    连日志都没有"。
-2. **"rerun 能过"不等于"没有问题"。** 重试成功是掩盖，不是修复 ——
-   应当把重试率本身当成一项可观测指标。
-3. **同名装饰器不同来源，语义可以完全不同。** "我读了这个函数"与
-   "我读了这个函数真正被编译成的版本"是两件事。本条的弯路就是看到
-   `@njit` 就当成 numba 原生装饰器（那个是裸 `@njit`，`prange` 其实退化
-   成串行），据此误判"Numba 无关"。
-4. **改并行配置后必须复验数值逐位不变。** 线程层换掉若改变了归约顺序，
-   就会以"修好了崩溃"为名引入更难发现的数值漂移。
+2. **"rerun 能过"不等于"没有问题"。** 重试成功是掩盖，不是修复。本条被
+   掩盖了 5 天、8 次 rerun —— **应当把重试率本身当成一项可观测指标**。
+3. **给 native 崩溃留一条取证路径，比急着改代码值钱。** 从"日志停在
+   `过滤:`"到"OpenBLAS 栈越界"之间隔了一整轮错误的归因；`faulthandler`
+   一条 env 就把它终结了。**改代码之前先确认自己有没有能力观测。**
+4. **依赖的二进制缺陷也是本仓的缺陷。** 这次崩的不是本仓任何一行代码，
+   而是 numpy wheel 里打包的 OpenBLAS。**依赖"没钉上界"就是把自己的
+   稳定性交给上游的发布节奏** —— `requirements.txt` 开头的告诫因此
+   不只是"API 会变"，也包括"二进制会坏"。
+5. **同一份二进制在不同宿主机上行为可以不同。** "本地复现不了"不等于
+   "没问题"：k 的大小取决于宿主 cache 拓扑，这是**设计如此**的行为。
+   遇到宿主相关的间歇失败，先找"哪个量在运行期按机器选"。
 
 台账：`governance/15_ERROR_LEDGER.md` E-52；任务行 `governance/02_TASKLIST.md` V-02。
 
