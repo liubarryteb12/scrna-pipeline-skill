@@ -812,4 +812,79 @@ ax_t.set_title(f"{tf} activity along pseudotime\n(mean ± 1 SD per bin)")
 `savefig.bbox: standard` 下静默裁切）。
 
 
+## 26. native 崩溃绕过 `except`：`sc.pp.scrublet` 偶发 SIGSEGV（E-52，2026-09-25）
+
+CI 的「跑流水线」步骤偶发 **exit 139**。日志停在 `01_qc.py:226` 的
+`过滤: …` 之后一行 `Segmentation fault (core dumped)`，**没有任何
+Python traceback**。近 20 轮里 4 轮需要 rerun，最早可追溯到
+2026-09-24 的 `5e24329` —— 一直存在，只是被 rerun 掩盖。
+
+### 26.1 崩溃点怎么锁死的
+
+`01_qc.py:226` 的 `过滤:` 是崩溃前最后一行，下一句是 L229
+`db = run_scrublet(adata, cfg)`，里面 L79 `sc.pp.scrublet(...)`。
+`scripts/lib/common.py` 第 62 行的 `print(..., flush=True)` **逐行 flush**，
+所以"日志最后一行"就是"代码走到哪一行"，不存在缓冲区丢日志。
+
+**但 `01_qc.py:85` 的 `except Exception` 接不住它** —— native SIGSEGV
+直接杀进程，`qc_status.json` 里连一行失败原因都没有。
+
+### 26.2 首要嫌疑：Numba 的并行运行期
+
+调用链（**必须追到"函数头上挂的是谁的装饰器"**）：
+
+```
+sc.pp.scrublet
+  → _scrublet/__init__.py:435-440  pipeline.zscore(scrub)
+  → _scrublet/pipeline.py:36       fast_array_utils.stats.mean_var
+  → _mean_var.py:44-45             _sparse_mean_var
+  → _mean_var.py:90-117 / 120-147  sparse_mean_var_*：for i in numba.prange(n_threads)
+```
+
+那两个函数头上挂的是 **`fast_array_utils.numba.njit`**，不是 numba 原生
+`@njit`：它 `{parallel: numba.njit(..., parallel=parallel) for parallel in
+(True, False)}` **同时编译两个版本**（`fast_array_utils/numba/__init__.py:106-109`），
+运行时由 wrapper 分派（L112-123）。Linux 主线程上
+`_needs_parallel_runtime_probe()` 恒为 False（只对 apple silicon + torch
+生效），于是 **永远走 `parallel=True`**，`prange` 真实启动线程层。
+
+**本地实测**：真 `sc.pp.scrublet` 调用**之前** `threading_layer()` 未初始化，
+调用**之后**返回 **`omp`**；启动前设 `NUMBA_THREADING_LAYER=workqueue`
+则返回 **`workqueue`**，且 `mean_var` 结果**逐位相同**。
+
+**注意 `NUMBA_NUM_THREADS=1` 管不住这一层** —— 实测在它之下
+`threading_layer()` 依然是 `omp`。"几个线程"与"用哪套线程运行时"是两个
+独立旋钮。
+
+### 26.3 处置：两条 env，一条取证一条降概率
+
+```yaml
+NUMBA_THREADING_LAYER: workqueue   # 3b) 换掉 omp，不碰 OpenMP
+PYTHONFAULTHANDLER: 1              # 4) 再崩时给出真正的 Python 栈
+```
+
+选 `workqueue` 的依据是**依赖方自己写下来的**：
+`fast_array_utils/numba/__init__.py:117-120` 的告警原文就指名
+``Set `NUMBA_THREADING_LAYER=workqueue` or install `tbb` to avoid this fallback.``
+
+**`PYTHONFAULTHANDLER` 继续留着**，因为 ② 只降概率、**没有证明修好**。
+
+### 26.4 四条规则
+
+1. **native 崩溃不能靠 `except` 兜底。** `except Exception` 只覆盖 Python
+   层异常；凡是有 C 扩展参与的关键步骤，都要问一句"它要是崩了，我会不会
+   连日志都没有"。
+2. **"rerun 能过"不等于"没有问题"。** 重试成功是掩盖，不是修复 ——
+   应当把重试率本身当成一项可观测指标。
+3. **同名装饰器不同来源，语义可以完全不同。** "我读了这个函数"与
+   "我读了这个函数真正被编译成的版本"是两件事。本条的弯路就是看到
+   `@njit` 就当成 numba 原生装饰器（那个是裸 `@njit`，`prange` 其实退化
+   成串行），据此误判"Numba 无关"。
+4. **改并行配置后必须复验数值逐位不变。** 线程层换掉若改变了归约顺序，
+   就会以"修好了崩溃"为名引入更难发现的数值漂移。
+
+台账：`governance/15_ERROR_LEDGER.md` E-52；任务行 `governance/02_TASKLIST.md` V-02。
+
+
+
 

@@ -99,6 +99,34 @@ jobs:
       #    Numba 的 `prange` 线程数由它控制，不走 OMP/MKL。
       #    **但实测它也没解决 scFates 的漂移**（见上表最后一行）。
       NUMBA_NUM_THREADS: 1
+      # 3b) Numba 的**线程层**（另一个独立旋钮：3) 管"几个线程"，
+      #     3b) 管"用哪套线程运行时"）。钉死为 `workqueue` —— Numba
+      #     自带的纯 Python 线程池，**完全不碰 OpenMP**。
+      #
+      #     起因是 E-52：`run_scrublet` 偶发 SIGSEGV（exit 139）。崩溃
+      #     点在 `sc.pp.scrublet` 内部，而它的归一化那一步走的是
+      #     `_scrublet/pipeline.py:35` 的 `zscore()` →
+      #     `fast_array_utils.stats.mean_var` → `_mean_var.py:90/120`
+      #     的 `sparse_mean_var_*`，那两个函数带 `numba.prange`，且头上
+      #     挂的是 **`fast_array_utils.numba.njit`** —— 它会**同时编译
+      #     `parallel=True` 与 `parallel=False` 两个版本**并按运行环境
+      #     分派；Linux 主线程上永远选 `parallel=True`，于是**真实启动
+      #     Numba 的并行运行期**（本地实测：调用前 `threading_layer()`
+      #     未初始化，调用后变成 `omp`）。
+      #
+      #     注意这**不是** `_normalization.py` 的 `_normalize_csr` —— 那
+      #     个是裸 `@njit`，它的 `prange` 其实退化成串行、不启动线程层。
+      #     我第一版 E-52 就是只看后者而误判"Numba 无关"，见台账。
+      #
+      #     选 `workqueue` 的依据：`fast_array_utils` **自己**在
+      #     `fast_array_utils/numba/__init__.py:117-120` 的告警里就把
+      #     `NUMBA_THREADING_LAYER=workqueue` 列为推荐规避手段
+      #     （原文："Detected an unsupported numba parallel runtime.
+      #     ... Set `NUMBA_THREADING_LAYER=workqueue` or install `tbb`"）。
+      #     本地实测：workqueue 可被真正选中，且 `mean_var` 结果与 omp
+      #     **逐位相同**（不是"换个近似"，是换一套等价线程池）。
+      #     环境变量只在**导入时**读取，所以必须放这里。
+      NUMBA_THREADING_LAYER: workqueue
       # 4) 崩溃取证。`run_scrublet`（`sc.pp.scrublet`）会以约 1/5 的概率
       #    让整个进程 **SIGSEGV 退出（exit 139）**，而 native 崩溃**直接杀
       #    进程**：`01_qc.py:85` 的 `except Exception` 接不住，日志里只有
@@ -110,7 +138,8 @@ jobs:
       #    **纯取证开关，不改变任何计算**；必须在进程启动前生效，所以
       #    只能放这里 —— 在 `common.py` 里补已经太晚（`01_qc.py:26` 的
       #    `import scanpy` 早于 L28 的 `from common import …`）。
-      #    见 `governance/15_ERROR_LEDGER.md` E-52。
+      #    **3b) 只是"降低概率"，没有证明修好** —— 所以这一条继续留着，
+      #    等它再崩时给出真正的栈。见 `governance/15_ERROR_LEDGER.md` E-52。
       PYTHONFAULTHANDLER: 1
 
     steps:
