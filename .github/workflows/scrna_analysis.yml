@@ -99,6 +99,19 @@ jobs:
       #    Numba 的 `prange` 线程数由它控制，不走 OMP/MKL。
       #    **但实测它也没解决 scFates 的漂移**（见上表最后一行）。
       NUMBA_NUM_THREADS: 1
+      # 4) 崩溃取证。`run_scrublet`（`sc.pp.scrublet`）会以约 1/5 的概率
+      #    让整个进程 **SIGSEGV 退出（exit 139）**，而 native 崩溃**直接杀
+      #    进程**：`01_qc.py:85` 的 `except Exception` 接不住，日志里只有
+      #    一行 `Segmentation fault (core dumped)`，**没有任何 Python 栈**。
+      #    打开 faulthandler 后，崩溃时会把**崩溃线程的逐帧 Python 栈**
+      #    打到 stderr —— 这是定位"崩在哪一行"的唯一手段（本地实测：
+      #    不设时零输出，设了以后打出 `Current thread … (most recent call
+      #    first):` 的完整栈）。
+      #    **纯取证开关，不改变任何计算**；必须在进程启动前生效，所以
+      #    只能放这里 —— 在 `common.py` 里补已经太晚（`01_qc.py:26` 的
+      #    `import scanpy` 早于 L28 的 `from common import …`）。
+      #    见 `governance/15_ERROR_LEDGER.md` E-52。
+      PYTHONFAULTHANDLER: 1
 
     steps:
       - uses: actions/checkout@v4
