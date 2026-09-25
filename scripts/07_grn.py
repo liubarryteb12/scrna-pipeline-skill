@@ -297,7 +297,19 @@ def run_07_grn(cfg: dict) -> dict:
                     sd[sd == 0] = 1.0
                     matz = np.nan_to_num((mat - mu) / sd)
 
-                    fig, ax = plt.subplots(figsize=(W_ONE_HALF, W_SINGLE, max(mm(56), 0.26 * len(show) + 1.6)))
+                    # **`figsize` 是两个元素的元组，第三个元素是历史事故。**
+                    # 原写作 `figsize=(W_ONE_HALF, W_SINGLE, max(mm(56), 0.26*len(show)+1.6))`
+                    # —— 三元素元组会被 matplotlib 当成 `(nrows, ncols, figsize)` 的
+                    # 参数串位，抛 `ValueError: Invalid unit 6.8 in 'figsize'`。
+                    # 该行在 `try:` 内、被下面的 `except` 吞成
+                    # `grn_status.regulon_vs_pseudotime.status = failed`，
+                    # 于是热图与紧随其后的 4 张单 TF 面板**从未产出过**
+                    # （commit a3a86fb 引入，早于 K-01b），而顶层 `status` 仍是
+                    # `ok`、`acceptance.json` 全绿 —— 图没了却没人发现。
+                    # 第三个值随 `len(show)`（行数）变化，是**高度**，所以
+                    # 宽度取 W_ONE_HALF、高度取它。
+                    fig, ax = plt.subplots(
+                        figsize=(W_ONE_HALF, max(mm(56), 0.26 * len(show) + 1.6)))
                     im = ax.imshow(matz, aspect="auto", cmap="RdBu_r", vmin=-2, vmax=2)
                     ax.set_yticks(range(len(show)))
                     ax.set_yticklabels(show, fontsize=7)

@@ -989,9 +989,15 @@ def run_08_virtual_perturbation(cfg: dict) -> dict:
                         textcoords="offset points", va="center",
                         fontsize=6.5, color=PAL["muted"])
         ax.set_xlabel("scTenifoldKnk perturbation distance (manifold, log scale)")
+        # 标题必须放得进画布。上一版第二行 104 字符、宽 724 px，而画布只有
+        # 535 px（W_ONE_HALF @300 dpi）—— 超出 35%，被 `savefig.bbox:
+        # standard` **静默裁掉**：CI 产物 PNG 上左右边距实测为 0 px，
+        # 左端只剩 "dKnk:"、右端断在 "the 60"。`_content_overflow()` 当时
+        # 已检测到（width_overflow_frac=0.3523）但只打了 WARN，没有拦。
+        # 现在压到 ~327 px（20%），留足余量。工具名与方法写在标题里，
+        # 轴标签里的 "log scale" 不在这里重复。
         ax.set_title("Virtual knockout: predicted effect size\n"
-                     "(scTenifoldKnk: tensor-decomposed network + manifold alignment;"
-                     " mean distance over the 600-gene network)",
+                     "(scTenifoldKnk tensor network, manifold distance)",
                      fontsize=9)
     else:
         top = best.head(12)
