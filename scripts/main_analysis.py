@@ -131,6 +131,33 @@ def has_file(p: Path) -> bool:
     return p.exists() and p.stat().st_size > 0
 
 
+def _vp_engine_consistent(vp: dict) -> bool:
+    """状态里的引擎清单与方法串必须自洽。
+
+    原来这条查的是"方法串里必须出现 'scTenifoldKnk' 和 'PerturbNet' 两个词"，
+    用来证明**没跑**这两个工具。K-01b 把真 scTenifoldKnk 接进来之后，那条
+    判据会**把正确的结果判红** —— 方法串里现在必须出现 scTenifoldKnk 来
+    *说明跑了它*，而不是来否认它。所以判据换成自洽性：
+
+      * 记了 `engines_used` 就必须逐个在方法串里被点名；
+      * 没跑 tenifold 时，方法串必须写明**为什么没跑**（而不是假装跑了）；
+      * PerturbNet 始终没跑，方法串必须仍然否掉它。
+    """
+    if not vp:
+        return False
+    used = vp.get("engines_used") or []
+    method = str(vp.get("method", ""))
+    names = {"first_order": "一阶", "tenifold": "scTenifoldKnk"}
+    if not all(names.get(e, e) in method for e in used):
+        return False
+    if "tenifold" not in used:
+        td = vp.get("tenifold") or {}
+        # 没跑 tenifold：要么配置里就没选它，要么它失败并留了原因
+        if vp.get("engine") in ("tenifold", "both") and not td.get("reason"):
+            return False
+    return "PerturbNet" in method
+
+
 def run_all(cfg: dict, only: list = None) -> int:
     set_orchestrated(True)
     res_dir = Path(cfg["output"]["results_dir"])
@@ -530,14 +557,30 @@ def run_all(cfg: dict, only: list = None) -> int:
             "detail": f"{len(vp.get('limitations') or [])} 条",
         })
         checks.append({
-            "item": "虚拟扰动明确声明不是 scTenifoldKnk / PerturbNet",
-            # 这一条是防"报了个数就被当成因果预测"的。方法串里必须出现
-            # 这两个否定，否则读者会以为跑的是规范点名的工具。
-            "ok": all(t in str(vp.get("method", ""))
-                      for t in ("scTenifoldKnk", "PerturbNet")),
-            "required": False,
-            "detail": str(vp.get("method", ""))[:120],
+            "item": "虚拟扰动声明的方法与状态里的引擎一致",
+            # 这一条是防"报了个数就被当成因果预测"的。原来它只查方法串里
+            # 有没有"不是 scTenifoldKnk"两个词 —— 那个判据在真跑通 R 引擎
+            # 之后会**把正确的结果判红**（K-01b 换掉了它）。现在的判据是
+            # **自洽性**：状态里记了哪些引擎，方法串就必须点名哪些引擎，
+            # 且必须仍然否掉没跑的 PerturbNet。
+            "ok": _vp_engine_consistent(vp), "required": False,
+            "detail": (f"engines_used={vp.get('engines_used')}；"
+                       + str(vp.get("method", ""))[:100]),
         })
+        _vp_td = vp.get("tenifold") or {}
+        if _vp_td:
+            _td_ok = _vp_td.get("status") == "ok"
+            checks.append({
+                "item": "scTenifoldKnk（R 引擎）的产出或失败原因已记录",
+                # 失败也必须留下原因 —— 否则"没跑"和"跑了没结果"长得一样。
+                "ok": bool(_vp_td.get("reason")) or _td_ok,
+                "required": False,
+                "detail": (f"网络 {_vp_td.get('n_genes_network')} 基因，"
+                           f"{_vp_td.get('elapsed_sec')} s，"
+                           f"版本 {(_vp_td.get('meta') or {}).get('engine_version')}"
+                           if _td_ok else
+                           f"{_vp_td.get('status')}：{str(_vp_td.get('reason'))[:80]}"),
+            })
         _vp_fig = "02-08-01-unit1-virtual-perturbation-effect.png"
         ok_fig = has_file(fig_dir / _vp_fig)
         checks.append({"item": f"图 虚拟敲除效应 ({_vp_fig})",

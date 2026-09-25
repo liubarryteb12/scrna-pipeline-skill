@@ -111,6 +111,72 @@ jobs:
           # 3.12 上这些包都有现成 wheel。
           python-version: "3.12"
 
+      # ---- R 层：只为真 scTenifoldKnk 而装 ----------------------------------
+      #
+      # 装 R 的**唯一**目的是 08_virtual_perturbation.py 的 tenifold 引擎。
+      # 其余全流程是纯 Python。
+      #
+      # **为什么以前没装**：`scTenifoldKnk` 不在 PyPI，于是"装不上"被写成了
+      # 状态文件里的不可用理由。那条理由是**真的**，结论**越界了** ——
+      # 它在 CRAN 上（v1.1，`NeedsCompilation: no`），能不能用取决于 CI 里
+      # 有没有 R，而不是取决于它有没有 Python wheel。（K-01b）
+      #
+      # 系统库清单照抄 geo-normal-pipeline-skill —— 少一个就会在装
+      # igraph / enrichR 的传递依赖时源码编译失败，而失败信息只提那个包名，
+      # 不会告诉你缺的是 libxml2。
+      - name: 装 R 的系统库
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcurl4-openssl-dev libssl-dev libxml2-dev \
+            libfontconfig1-dev libfreetype6-dev libharfbuzz-dev \
+            libfribidi-dev libpng-dev libtiff5-dev libjpeg-dev
+
+      - name: 设置 R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          # **用 release，不钉 4.3.0**（与 geo 一致，理由见 geo_analysis.yml）：
+          # Posit P3M 的二进制是按**当前** R 构建的，runner 是 ubuntu-24.04
+          # (noble)；钉旧版会退化成全量源码编译，而 scTenifoldNet 带
+          # RcppArmadillo（`NeedsCompilation: yes`），源码编译要十几分钟。
+          r-version: 'release'
+          use-public-rspm: true
+
+      # **改了下面的 packages 列表就必须递增这个 vN。**
+      # cache key 一旦存在就不再写回 —— 沿用旧 key 时新装的包每次被丢掉，
+      # 于是每轮 CI 都重装一遍，看起来像"缓存没命中"，其实是 key 没换。
+      - name: 缓存 R 包
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.R_LIBS_USER }}
+          key: rlib-${{ runner.os }}-sc-tenifold-v1
+          restore-keys: |
+            rlib-${{ runner.os }}-
+
+      - name: 安装 R 包（scTenifoldKnk）
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::scTenifoldKnk
+            any::scTenifoldNet
+            any::Matrix
+            any::jsonlite
+          cache-version: 1
+
+      - name: 记录 R 环境
+        # continue-on-error：这一步只是留证据，不该因为它失败就让整条流水线变红。
+        continue-on-error: true
+        run: |
+          Rscript -e 'cat("R", as.character(getRversion()), "\n")'
+          Rscript -e 'for (p in c("scTenifoldKnk","scTenifoldNet","Matrix","jsonlite")) cat(sprintf("  %-16s %s\n", p, if (requireNamespace(p, quietly=TRUE)) as.character(packageVersion(p)) else "MISSING"))'
+
+      - name: 自检 R 引擎（方向断言 + 读写契约）
+        # **这一步不跑流水线**，只跑 tenifold_knk.R 自己的 --selftest：
+        # 六条断言里有三条是"转置必须被拦住"，而转置**不会报错** ——
+        # 它会照常建出一个垃圾网络、所有状态字段看起来都正常。
+        # 所以这条检查必须独立于流水线存在，流水线跑绿也证明不了它。
+        run: Rscript scripts/lib/tenifold_knk.R --selftest
+
       - name: 静态检查（不装依赖）
         run: |
           node tools/check_py_syntax.mjs
@@ -119,6 +185,11 @@ jobs:
           # 既有检查器全都看不见图例位置 —— 图例压在数据点上的图，
           # 在"文件存在 / 有墨迹 / 图名合规 / 配色合规 / 图幅合规"眼里都是合格的。
           node tools/check_legend_convention.mjs
+          # R 脚本的静态检查 + **R↔Python 的 CLI 契约**。
+          # 后者是重点：R 的 DEFAULTS 参数名、Python 的 --xxx 拼写、R 写出的
+          # 文件名、Python 读回的文件名，分布在两个语言里，**没有任何编译器
+          # 能发现它们不一致**，而失败方式都是"看起来像 R 崩了"。
+          node tools/check_r_syntax.mjs
 
       - name: 缓存 pip
         uses: actions/cache@v4

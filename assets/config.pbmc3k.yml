@@ -108,6 +108,12 @@ grn:
 # 内部调控子（按簇特异性取前 top_n 个），此时 signature_alignment 为空。
 perturbation:
   enabled: true
+  # 用哪个引擎。三个值：
+  #   both（默认）  = 一阶近似 + 真 scTenifoldKnk，两法各自落盘 + 一张一致性表
+  #   first_order   = 只跑一阶单跳线性传播（秒级，有细胞类型分辨率）
+  #   tenifold      = 只跑真 scTenifoldKnk（R/CRAN，分钟级，无细胞类型分辨率）
+  # **拼错不会静默退回默认** —— 会直接报错，否则"我配了 tenifold"会变成假话。
+  engine: both
   # Part 1 交接的候选靶基因 CSV，相对路径按 data_dir 解析。
   # 需要一列 gene（或 target / symbol），可选一列 logFC（或 log2FC）。
   # 该文件不存在时回退到内部调控子，并在状态里写明回退了。
@@ -116,6 +122,22 @@ perturbation:
   top_n: 20
   # 过表达抬高多少个标准差
   overexpress_sd: 1.0
+  # ---- scTenifoldKnk 参数 ----------------------------------------------------
+  # **max_genes 是唯一真正要紧的旋钮**：它决定跑不跑得完。scTenifoldNet
+  # README 的实测表（细胞 x 基因 -> 耗时）：300x1000 = 3.5 min；
+  # 1000x5000 = 2 h 52 min / 9.2 GB；7500x7500 = 10 h 16 min / 22.6 GB。
+  # 本数据是 2652 细胞 x 13714 基因，全基因集绝对跑不动（CI job 上限 45 min）。
+  # **候选敲除基因不受这个上限约束** —— 它们必须全部进网络，否则 R 侧直接
+  # stop（包对不在网络里的 gKO 不跳过）。上限只用来补足其余名额。
+  tenifold:
+    max_genes: 600
+    n_net: 10            # 包默认：建几个子网络做张量分解
+    n_cells: 500         # 包默认：每个网络有放回抽多少细胞
+    n_comp: 3            # 包默认：PC 回归主成分数
+    td_k: 3              # 包默认：张量分解秩
+    ma_n_dim: 2          # 包默认：流形对齐维度
+    n_cores: 1           # CI 钉单线程（与 workflow 的 env 一致）
+    timeout_sec: 1500    # 单个 R 进程上限；CI job 45 min，留足余量
 
 # ---- 分析选项 ---------------------------------------------------------------
 analysis:
