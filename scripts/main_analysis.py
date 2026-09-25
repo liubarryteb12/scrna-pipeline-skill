@@ -522,9 +522,12 @@ def run_all(cfg: dict, only: list = None) -> int:
 
     # ---- §1.7 / §1.8 虚拟扰动（保留框架）------------------------------------
     #
-    # 这一节的**重点是"没做什么"**。规范点名的三个工具在本环境全都装不了，
-    # 而"装不了"和"没装"是两件事 —— 前者有确切原因，后者是疏忽。
-    # 所以逐个列出原因，并且把"用的是自建一阶近似"这件事写在最显眼处。
+    # 这一节的**重点是"没做什么"**。规范点名的三个工具里，PerturbNet 与
+    # RegVelo 在本环境装不了，而"装不了"和"没装"是两件事 —— 前者有确切
+    # 原因，后者是疏忽。所以逐个列出原因，并且把"用的是自建一阶近似"这件事
+    # 写在最显眼处。**scTenifoldKnk 从 K-01b 起已经真的跑了**（R 引擎，
+    # 见 `scripts/lib/tenifold_knk.R`），它的可用性由探针实测，不再是
+    # 一条写死的"不可用"。
     vp = read_json(res_dir / "virtual_perturbation_status.json") or {}
     vp_tools = vp.get("tools") or {}
     if vp_tools:
@@ -580,6 +583,27 @@ def run_all(cfg: dict, only: list = None) -> int:
                            f"版本 {(_vp_td.get('meta') or {}).get('engine_version')}"
                            if _td_ok else
                            f"{_vp_td.get('status')}：{str(_vp_td.get('reason'))[:80]}"),
+            })
+        # 空敲除（出度为 0 的候选基因）必须被点名。
+        #
+        # 包的敲除方式是"把网络里该基因那一行清零"；该基因出度为 0 时，
+        # 清一行全 0 的行等于没敲，`KO` 与 `WT` 逐位相同，返回的"距离"
+        # 只剩浮点噪声（实测 ~1e-16）。**它不报错、不给 NA**，读表的人
+        # 只会得出"敲除这个基因没有影响"—— 而这正是错的。
+        #
+        # 所以判据是：只要 R 侧数出了空敲除，状态文件里就必须有它的
+        # 数量和基因名，供下游（和读报告的人）区分"效应为 0"与
+        # "这个网络表达不了该扰动"。
+        if _vp_td.get("status") == "ok":
+            _n_empty = int(_vp_td.get("n_empty_knockout") or 0)
+            _empty_genes = _vp_td.get("empty_knockout_genes") or []
+            checks.append({
+                "item": "scTenifoldKnk 的空敲除（网络里出度为 0 的候选）已点名",
+                "ok": (_n_empty == 0) or (len(_empty_genes) == _n_empty),
+                "required": False,
+                "detail": ("没有空敲除" if _n_empty == 0 else
+                           f"{_n_empty} 个：{'、'.join(_empty_genes)}"
+                           f"（**不是效应为 0，是该网络表达不了该扰动**）"),
             })
         _vp_fig = "02-08-01-unit1-virtual-perturbation-effect.png"
         ok_fig = has_file(fig_dir / _vp_fig)

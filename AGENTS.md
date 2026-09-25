@@ -225,20 +225,77 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 参考规范：三大部分整合文档 §1.7 / §1.8。规范把这两节标为**保留框架**、
 主语言 Python，候选靶基因由 Part 1 产出。落地在 `08_virtual_perturbation.py`。
 
-**规范点名的三个工具在本环境全都装不了 —— 理由都是实测的，不是"没装"：**
+**规范点名的三个工具，两个装不了、一个已经真跑了（理由都是实测的，不是"没装"）：**
 
-| 工具 | 原因 |
-|---|---|
-| `scTenifoldKnk` | R/CRAN 包，**不在 PyPI**（`scTenifoldKnk` / `sctenifoldknk` 都查过） |
-| `PerturbNet` | PyPI 上 0.0.2/0.0.3 钉 `requires_python='<3.8,>=3.7'`，0.0.3b0/b1 钉 `'<3.11,>=3.10'` —— **没有任何一版支持 CI 的 3.12** |
-| `RegVelo` | 能装，但要 RNA velocity 的 spliced/unspliced 层（本数据没有），且拉入 `torch` + `scvi-tools` |
+| 工具 | 状态 | 原因 |
+|---|---|---|
+| `scTenifoldKnk` | ✅ **已接入** | R/CRAN 包（`scripts/lib/tenifold_knk.R` + CI 的 setup-r 层）。**"不在 PyPI"曾经被读成"用不了"** —— 见下 |
+| `PerturbNet` | ❌ 装不了 | PyPI 上 0.0.2/0.0.3 钉 `requires_python='<3.8,>=3.7'`，0.0.3b0/b1 钉 `'<3.11,>=3.10'` —— **没有任何一版支持 CI 的 3.12** |
+| `RegVelo` | ❌ 装不了 | 能装，但要 RNA velocity 的 spliced/unspliced 层（本数据没有），且拉入 `torch` + `scvi-tools` |
+
+> **E-41 的教训（探针查不到 ≠ 目标不存在）。** 早先 `probe_tools()` 对三个工具
+> 统一用 `importlib.util.find_spec(name)`，而 `find_spec` **只查 Python import
+> 路径，对 R 包在原理上不可能返回 True**。于是"我没装 R"被写成"这个工具不存在"，
+> 还被一条验收项固化成"**必须**声明不是 scTenifoldKnk"。**理由那句"不在 PyPI"
+> 是真的** —— 真理由 + 越界结论 = 一条读起来完全合理、实则自我封闭的记录。
+> 现在 `scTenifoldKnk` 走 `_probe_r_package()`（`shutil.which("Rscript")` +
+> `requireNamespace`），并**区分**"Rscript 不在 PATH（CI 没装 R）"与
+> "R 装了但包没装"。**每加一个 `find_spec`/`which`/`exists` 式判断，都要能
+> 回答"目标存在时它返回什么"**；答不上来就说明这条判断测的是探针自己。
 
 **"装不了"和"没装"是两件事。** 前者有确切原因、要写进状态文件；
 后者是疏忽。所以 `tools` 里逐个记 `{available, reason}`，
 验收项的判据是**每个不可用的都有原因**，而不是"全都不可用" ——
 将来某个工具能装了，这条应该自动变 PASS 而不是 FAIL。
 
-### 自建的一阶近似：能报什么，不能报什么
+### 两个引擎并列，一张图只画一个
+
+`perturbation.engine` 取 `both`（默认）/ `first_order` / `tenifold`。
+**拼错不静默退回默认** —— 那会让"我配了 tenifold"变成一句假话，所以直接报错。
+
+两套结果**并列落盘**（`virtual_perturbation.csv` 与
+`virtual_perturbation_tenifold.csv`），一致性只比排名、不比数值
+（一阶是 z 分数的 L2 范数，tenifold 是流形欧氏距离，**量纲不同**）。
+一致性高**不说明哪个对**：两法共享同一个上游（`07_grn` 的共表达边），
+可能只是共享了同一个偏差。
+
+**出图默认画 tenifold（真方法），它没跑出来时退回一阶**，标题写明是哪个。
+两法不画在同一根 x 轴上 —— 那会让人以为可以直接比大小。
+
+**`scTenifoldKnk` 没有细胞类型分辨率**：整份数据只建一个网络，输出是
+「扰动基因 × 网络基因」的全局距离。**本仓库没有**把距离按细胞类型重新加权 ——
+那会造出一个既不是 scTenifoldKnk、也不是本仓库一阶近似的新方法，
+然后借它的名字发出去。
+
+### 空敲除：网络表达不了该扰动 ≠ 效应为 0
+
+`scTenifoldKnk` 的 `transcriptomeWide` 模式敲除一个基因的方式是把 WT 网络的
+**那一行清零**（**scTenifoldKnk 包内源码** `R/scTenifoldKnk.R` L206–L207
+`KO <- WT; KO[g, ] <- 0`）。
+若该基因**出度本来就是 0**，清一行全 0 的行等于什么都没敲，`KO` 与 `WT`
+逐位相同，`manifoldAlignment` 对两个完全一样的网络对齐，返回的"距离"
+只剩浮点噪声（实测 ~1e-16）。
+
+**它不报错、不给 NA、不给零** —— 给出一排看起来完全正常的数，
+读表的人只会得出"敲除这个基因没有影响"。所有既有图门禁都会通过，
+因为它们查的是"有没有产出"不是"产出对不对"。
+
+判据是**结构事实（出度）**，不是"距离是不是很小"—— 后者会把一个真实
+但微弱的扰动也误判掉。R 侧 `zero_outdegree_targets()` 算出度并整行置 NA，
+meta 里带 `empty_knockout_genes` + `target_outdegree`；Python 侧
+`compress_tenifold_distances()` 用**那份结构证据**打标记
+（而不是从"整行都是 NA"反推 —— 那会把 R 侧别的 NA 原因也误标成空敲除），
+空敲除行报 `None` 而**不是 `0.0`**，并在 `compare_engines()` 里
+**显式剔除并记账**，而不是靠 `dropna()` 悄悄少几个点。
+
+**两侧各有自检**：`Rscript scripts/lib/tenifold_knk.R --selftest` 验出度计算，
+`python tools/selftest_tenifold.py`（**不需要 R**）验 Python 侧有没有把
+那份证据正确消费成 `None` / 标记列，并且**端到端跑一遍
+`run_tenifold_engine`（用假的 Rscript）** —— 抽出函数时最容易漏改的
+`return` 里的旧变量名，`py_compile` 查不出来，只会在 CI 上 tenifold
+真跑通那一刻抛 `NameError`，而那时 R 已经跑了 6.5 分钟。
+
+### 一阶近似：能报什么，不能报什么
 
 用 `07_grn.py` 的调控子边表做**一阶、单跳**线性传播：
 
@@ -260,8 +317,13 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 **不做多跳传播。** 在相关网络上做多跳会放大噪声，看起来像"网络效应"，
 其实只是把相关系数乘了几遍。
 
-**不假装跑过点名的工具。** 状态里的 `method` 必须显式写出
-"**不是 scTenifoldKnk，也不是 PerturbNet**"，验收项会检查这两个否定词在不在。
+**`PerturbNet` 始终没跑，`method` 必须仍然否掉它。** 状态里的 `method`
+显式写出"**不是 PerturbNet**"，验收项检查这个否定词在不在。
+（原来那句"也不是 scTenifoldKnk"已随 K-01b 删除 —— 那条判据在真跑通
+R 引擎之后会**把正确的结果判红**。现在的判据是"声明的方法与状态里的
+引擎一致"：记了 `engines_used` 就必须逐个在方法串里被点名，
+没跑 tenifold 时必须写明**为什么没跑** —— 否则"没跑"和"跑了没结果"
+长得一样。）
 
 ### 跨部分交接只走 CSV（§0.2）
 

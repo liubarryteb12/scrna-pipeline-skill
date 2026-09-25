@@ -449,6 +449,61 @@ def select_tenifold_genes(var_names, cand_genes, max_genes: int,
     return [g for g in names if g in keep]
 
 
+def compress_tenifold_distances(dist: pd.DataFrame, rmeta: dict) -> pd.DataFrame:
+    """把「扰动基因 × 网络基因」的距离矩阵压成每基因一行的可解读量。
+
+    scTenifoldKnk 的 `perturbationDistances[g, y]` 是「敲掉 g 之后，基因 y
+    在流形里移动了多远」。**没有细胞类型这一维** —— 它整份数据只建一个网络。
+    所以这里报的是全局量，列名里明确带 `tenifold_` 前缀，防止与一阶近似的
+    细胞类型分辨率混为一谈（两边都有 `gene` 列，但分辨率含义不同）。
+
+    **空敲除**：R 侧把出度为 0 的候选基因整行置了 NA（见 `tenifold_knk.R`
+    的 `zero_outdegree_targets`）。这里用 meta 里那份**结构证据**
+    （`empty_knockout_genes`）打标记，而不是反过来从「整行都是 NA」去推断 ——
+    推断会把「R 侧因为别的原因给了 NA」也误标成空敲除。
+
+    抽成独立函数是为了能**不装 R 就测**（见 `tools/selftest_tenifold.py`）：
+    空敲除这条保护一旦失效，失败方式是"输出一排看起来正常的数"，
+    没有别的机会发现。
+    """
+    empty_ko = set(rmeta.get("empty_knockout_genes") or [])
+    outdeg = rmeta.get("target_outdegree") or {}
+    dmat = dist.to_numpy(dtype=float)
+    rows = []
+    for i, g in enumerate(dist.index.astype(str)):
+        v = dmat[i]
+        ok = ~np.isnan(v)
+        is_empty = g in empty_ko
+        # 空敲除的行必须报 None，不能报 0.0 —— 0.0 读起来是"敲除没有影响"，
+        # 而真相是这个网络表达不了这个扰动。
+        if ok.sum() == 0 or is_empty:
+            rows.append({"gene": g, "tenifold_n_genes_scored": 0,
+                         "tenifold_mean_distance": None,
+                         "tenifold_max_distance": None,
+                         "tenifold_top_gene": None,
+                         "tenifold_top_distance": None,
+                         "tenifold_target_outdegree": outdeg.get(g),
+                         "tenifold_empty_knockout": bool(is_empty)})
+            continue
+        vv = np.where(ok, v, -np.inf)
+        j = int(np.argmax(vv))
+        rows.append({
+            "gene": g,
+            "tenifold_n_genes_scored": int(ok.sum()),
+            "tenifold_mean_distance": round(float(np.nanmean(v)), 6),
+            "tenifold_max_distance": round(float(np.nanmax(v)), 6),
+            "tenifold_top_gene": str(dist.columns[j]),
+            "tenifold_top_distance": round(float(v[j]), 6),
+            "tenifold_target_outdegree": outdeg.get(g),
+            "tenifold_empty_knockout": False,
+        })
+    tdf = pd.DataFrame(rows)
+    # 按平均距离降序 —— 与一阶近似的 `ko_magnitude` 降序方向一致，
+    # 这样两边的"top N"是可比的排名。NaN 排在最后（pandas 默认
+    # na_position='last'），正好让空敲除的行沉底。
+    return tdf.sort_values("tenifold_mean_distance", ascending=False)
+
+
 def run_tenifold_engine(cfg: dict, X_counts, var_names, targets: pd.DataFrame,
                         out_dir: Path, tparams: dict) -> dict:
     """跑真 scTenifoldKnk，落盘距离矩阵 + meta。
@@ -550,37 +605,14 @@ def run_tenifold_engine(cfg: dict, X_counts, var_names, targets: pd.DataFrame,
     shutil.rmtree(tmp, ignore_errors=True)
 
     # ---- 把「扰动基因 × 网络基因」的距离压成每基因一行的可解读量 ----------
-    #
-    # scTenifoldKnk 的 `perturbationDistances[g, y]` 是「敲掉 g 之后，基因 y
-    # 在流形里移动了多远」。**没有细胞类型这一维** —— 它整份数据只建一个网络。
-    # 所以这里报的是全局量，列名里明确带 `tenifold_` 前缀，防止与一阶近似的
-    # 细胞类型分辨率混为一谈（两边都有 `gene` 列，但含义分辨率不同）。
-    dmat = dist.to_numpy(dtype=float)
-    rows = []
-    for i, g in enumerate(dist.index.astype(str)):
-        v = dmat[i]
-        ok = ~np.isnan(v)
-        if ok.sum() == 0:
-            rows.append({"gene": g, "tenifold_n_genes_scored": 0,
-                         "tenifold_mean_distance": None,
-                         "tenifold_max_distance": None,
-                         "tenifold_top_gene": None,
-                         "tenifold_top_distance": None})
-            continue
-        vv = np.where(ok, v, -np.inf)
-        j = int(np.argmax(vv))
-        rows.append({
-            "gene": g,
-            "tenifold_n_genes_scored": int(ok.sum()),
-            "tenifold_mean_distance": round(float(np.nanmean(v)), 6),
-            "tenifold_max_distance": round(float(np.nanmax(v)), 6),
-            "tenifold_top_gene": str(dist.columns[j]),
-            "tenifold_top_distance": round(float(v[j]), 6),
-        })
-    tdf = pd.DataFrame(rows)
-    # 按平均距离降序 —— 与一阶近似的 `ko_magnitude` 降序方向一致，
-    # 这样两边的"top N"是可比的排名
-    tdf = tdf.sort_values("tenifold_mean_distance", ascending=False)
+    # 逻辑在 `compress_tenifold_distances()` 里（抽出来是为了能不装 R 就测）。
+    tdf = compress_tenifold_distances(dist, rmeta)
+    n_empty = int(tdf["tenifold_empty_knockout"].sum())
+    if n_empty:
+        log_warn(f"scTenifoldKnk: {n_empty}/{len(tdf)} 个候选基因在去噪网络中"
+                 f"出度为 0（{'、'.join(sorted(set(rmeta.get('empty_knockout_genes') or [])))}）"
+                 f"—— 它们的距离行已置空，"
+                 f"**不是「效应为 0」，而是这个网络表达不了该扰动**")
     tdf.to_csv(out_dir / "virtual_perturbation_tenifold.csv", index=False)
     tdf.head(10).to_csv(out_dir / "virtual_perturbation_tenifold_top.csv",
                         index=False)
@@ -591,6 +623,12 @@ def run_tenifold_engine(cfg: dict, X_counts, var_names, targets: pd.DataFrame,
     return {"status": "ok", "elapsed_sec": round(elapsed, 1),
             "n_genes_network": int(dist.shape[1]),
             "n_targets": int(dist.shape[0]),
+            "n_empty_knockout": n_empty,
+            # 从 meta 取，不从 `compress_tenifold_distances` 的局部变量取 ——
+            # 那个变量随函数抽出去一起走了（抽出时这里漏改过一次，
+            # `py_compile` 查不出来，只有 tenifold 真跑通那一刻才会
+            # NameError）。
+            "empty_knockout_genes": sorted(rmeta.get("empty_knockout_genes") or []),
             "genes": genes, "targets": cand,
             "meta": rmeta,
             "table": tdf}
@@ -607,12 +645,21 @@ def compare_engines(fo: pd.DataFrame, td: pd.DataFrame) -> dict:
     """
     if fo is None or td is None or fo.empty or td.empty:
         return {"comparable": False, "reason": "两套引擎没有同时产出结果"}
+    # 空敲除的基因（距离为空）不能进相关性 —— 它们的"距离"是浮点噪声，
+    # 算进去等于往相关系数里掺随机数。这里显式剔掉并记账，而不是靠
+    # dropna() 悄悄少几个点。
+    td_valid = td[td["tenifold_mean_distance"].notna()]
+    excluded = sorted(set(td["gene"]) - set(td_valid["gene"]))
     fo_best = (fo.loc[fo.groupby("gene")["ko_magnitude"].idxmax()]
                  [["gene", "ko_magnitude"]])
-    m = fo_best.merge(td[["gene", "tenifold_mean_distance"]], on="gene",
+    m = fo_best.merge(td_valid[["gene", "tenifold_mean_distance"]], on="gene",
                       how="inner").dropna()
     out = {"comparable": True, "n_shared_genes": int(len(m)),
            "engines": ["first_order", "scTenifoldKnk"]}
+    if excluded:
+        out["excluded_empty_knockout"] = excluded
+        out["excluded_reason"] = ("这些基因在去噪网络里出度为 0，scTenifoldKnk "
+                                  "对它们的输出是浮点噪声，不参与相关性")
     if len(m) < 3:
         # 两个点永远能连成一条线 —— 少于 3 个共享基因不报相关系数
         out["reason"] = f"只有 {len(m)} 个共享基因，少于 3 个不报相关系数"
@@ -624,7 +671,8 @@ def compare_engines(fo: pd.DataFrame, td: pd.DataFrame) -> dict:
                    "（07_grn 的共表达边），一致性高可能只是共享了同一个偏差")
     # 两个排名的 top 5 重合度：比单一相关系数更好读
     a = list(fo_best.sort_values("ko_magnitude", ascending=False)["gene"][:5])
-    b = list(td.sort_values("tenifold_mean_distance", ascending=False)["gene"][:5])
+    b = list(td_valid.sort_values("tenifold_mean_distance",
+                                  ascending=False)["gene"][:5])
     out["first_order_top5"] = a
     out["tenifold_top5"] = b
     out["top5_overlap"] = sorted(set(a) & set(b))
@@ -847,8 +895,14 @@ def run_08_virtual_perturbation(cfg: dict) -> dict:
         log_info("一阶引擎本轮没有产出（引擎=%s）" % engine)
 
     # ---- 2c. 两法一致性 ------------------------------------------------------
+    # `td_ok` = tenifold **真的跑出了结果**（决定 engines_used / 方法串 /
+    # 一致性对比）；`use_td` = **图里画的是 tenifold**（决定画哪张图）。
+    # 两者必须分开：全部候选都是空敲除时 tenifold 确实跑了（该记进
+    # engines_used），但图得退回一阶 —— 把"跑了"和"画了"当成一件事，
+    # 会让状态文件里 tenifold 消失、方法串也不再提它。
+    td_ok = tenifold is not None and tenifold["status"] == "ok"
     cmp = None
-    if rows and tenifold is not None and tenifold["status"] == "ok":
+    if rows and td_ok:
         cmp = compare_engines(df, tenifold["table"])
         log_info(f"两法排名一致性: Spearman rho="
                  f"{cmp.get('spearman_rho')}（{cmp['n_shared_genes']} 个共享基因）")
@@ -858,10 +912,21 @@ def run_08_virtual_perturbation(cfg: dict) -> dict:
     # 一张图只能画一个引擎 —— 两法的量纲不同（一阶是 z 分数的 L2 范数，
     # tenifold 是流形欧氏距离），画在同一根 x 轴上会让人以为可以直接比大小。
     # 默认画 tenifold（真方法），它没跑出来时退回一阶，并在标题里写明是哪个。
-    use_td = tenifold is not None and tenifold["status"] == "ok"
+    #
+    # 空敲除的行距离是空的（见 `tenifold_knk.R` 的 `zero_outdegree_targets`），
+    # 它们**不能进图** —— 柱长会变成 0，读起来正是"敲除没有影响"这个我们要
+    # 避免的误读。若全部候选都是空敲除，图会变成一张白板，而**白板能通过
+    # 所有既有图门禁**（图非空/图名/图幅/dpi/配色都只查"有没有产出"），
+    # 所以这里显式退回一阶的图。
+    td_plot = (tenifold["table"][tenifold["table"]["tenifold_mean_distance"].notna()]
+               if td_ok else pd.DataFrame())
+    use_td = td_ok and not td_plot.empty
+    if td_ok and td_plot.empty:
+        log_warn("scTenifoldKnk 跑通了，但**所有候选基因都是空敲除**"
+                 "（在去噪网络里出度为 0），没有可画的效应 —— 图退回一阶引擎；"
+                 "这不是「效应都很小」，是网络装不下这批候选")
     if use_td:
-        tdt = tenifold["table"]
-        top = tdt.head(12)
+        top = td_plot.head(12)
         fig, ax = plt.subplots(
             figsize=(min(W_ONE_HALF, max(W_SINGLE, 0.30 * len(top) + 3.0)), mm(70)))
         ax.barh(range(len(top))[::-1], top["tenifold_mean_distance"].values,
@@ -888,11 +953,15 @@ def run_08_virtual_perturbation(cfg: dict) -> dict:
     save_fig(cfg, "02-08-01-unit1-virtual-perturbation-effect", fig)
 
     # ---- 4. 状态 ------------------------------------------------------------
+    # 这里用的是 `td_ok`（**跑了**），不是 `use_td`（**画了**）——
+    # 全部候选都是空敲除时图退回一阶，但 tenifold 确实跑了、也确实产出了
+    # 距离表，它必须出现在 engines_used 和方法串里，否则状态文件会谎称
+    # "本轮没跑 scTenifoldKnk"。
     n_align = int(df["ko_signature_alignment"].notna().sum()) if rows else 0
     engines_used = []
     if rows:
         engines_used.append("first_order")
-    if use_td:
+    if td_ok:
         engines_used.append("tenifold")
 
     method_bits = []
@@ -900,13 +969,13 @@ def run_08_virtual_perturbation(cfg: dict) -> dict:
         method_bits.append(
             "**一阶单跳线性传播**：把候选基因的 z 分数变化按共表达边权传给它的"
             "直接靶基因；有细胞类型分辨率（基因 x 细胞类型）")
-    if use_td:
+    if td_ok:
         method_bits.append(
             f"**scTenifoldKnk {tenifold['meta'].get('engine_version', '')}**（R/CRAN）："
             f"对 {tenifold['n_genes_network']} 个基因的计数矩阵做"
             f"主成分回归建网络 -> 张量分解去噪 -> 逐个敲除候选基因 -> "
             f"流形对齐量扰动距离；**没有细胞类型分辨率**（整份数据只建一个网络）")
-    if not use_td and engine in ("tenifold", "both"):
+    if not td_ok and engine in ("tenifold", "both"):
         method_bits.append(
             f"**scTenifoldKnk 本轮没有产出结果**（{tenifold['status'] if tenifold else '未执行'}："
             f"{(tenifold or {}).get('reason', '')}）—— 状态里的 `tenifold` 字段记了原因")
@@ -925,7 +994,7 @@ def run_08_virtual_perturbation(cfg: dict) -> dict:
              "**在该细胞类型里表达高**，而不是在网络里被连得紧。"
              "要看后者请用 `network_sensitivity` 列（它与表达无关）"),
         ]
-    if use_td:
+    if td_ok:
         limitations += [
             ("**scTenifoldKnk 没有细胞类型分辨率**：它整份数据只建一个网络，"
              "输出是「扰动基因 x 网络基因」的全局距离。本仓库**没有**把距离按"
@@ -938,6 +1007,17 @@ def run_08_virtual_perturbation(cfg: dict) -> dict:
              "且 `qc=FALSE` —— 本仓库 01_qc 已做过 QC，再滤会改变细胞集，"
              "两法就不可比了"),
         ]
+        if tenifold.get("n_empty_knockout"):
+            limitations.append(
+                f"**scTenifoldKnk 有 {tenifold['n_empty_knockout']} 个候选基因是"
+                f"「空敲除」**（{'、'.join(tenifold.get('empty_knockout_genes') or [])}）："
+                f"它们在去噪后的网络里**出度为 0**，而包的敲除方式是把网络里该基因的"
+                f"那一行清零 —— 清一行本来就全 0 的行等于什么都没敲，`KO` 与 `WT` "
+                f"逐位相同，返回的\"距离\"只剩浮点噪声（实测 ~1e-16）。"
+                f"本仓库把这些行置空并标了 `tenifold_empty_knockout` 列，"
+                f"**它们不表示「敲除没有影响」，只表示这个网络表达不了该扰动**；"
+                f"要拿到真实效应，该基因需要先进入网络（调大 "
+                f"`perturbation.tenifold.max_genes`）或换网络推断方式")
     limitations += [
         "表达层面而非蛋白层面：TF 的 mRNA 与其活性经常不相关",
         ("两法共享同一个上游（07_grn 的共表达边），一致性高可能只是"

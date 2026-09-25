@@ -201,6 +201,32 @@ read_counts <- function(path, meta_path) {
   list(mat = Matrix::Matrix(mat, sparse = TRUE), meta = meta)
 }
 
+# ---- "空敲除"检测（本脚本存在的第二个理由）----------------------------------
+# `transcriptomeWide` 模式敲除一个基因的方式是把 WT 网络的**那一行**清零
+# （`scTenifoldKnk.R` L206–L207：`KO <- WT; KO[g, ] <- 0`）。包自己的注释
+# 把这一行称作"outgoing edges from the KO gene"（同文件 L224），所以这里
+# 跟着叫**出度** —— 术语以包自己的措辞为准，不是我们的推断。
+#
+# 问题：如果该基因在网络里**出度本来就是 0**，那一行全是 0，清零等于没清 ——
+# `KO` 与 `WT` 逐位相同，`manifoldAlignment` 对两个完全一样的网络做对齐，
+# `dRegulation` 算出来的"距离"就只剩浮点噪声（实测 ~1e-16）。
+#
+# **这不会报错，也不会给 NA** —— 它会输出一排看起来正常的数，读表的人只会
+# 得出"敲除 FOXM1 没有影响"这个结论。而真相是**这个网络根本表达不了这个
+# 扰动**（该基因在去噪后的网络里没有任何出边）。这两件事必须区分开。
+#
+# 所以：出度为 0 的候选基因，距离行一律置 NA（NA 不会被误读成"效应为 0"），
+# 并在 meta 里逐个点名。判据用的是**结构事实**（出度），不是"距离是不是
+# 很小"—— 后者会把一个真实但微弱的扰动也误判掉。
+zero_outdegree_targets <- function(wt, targets) {
+  deg <- vapply(targets, function(g) {
+    if (!g %in% rownames(wt)) return(NA_integer_)
+    as.integer(sum(wt[g, ] != 0))
+  }, integer(1))
+  names(deg) <- targets
+  deg
+}
+
 # ---- 主流程 -----------------------------------------------------------------
 run_tenifold <- function(input, meta_path, targets_path, out_dir,
                          n_net, n_cells, n_comp, td_k, ma_n_dim, n_cores) {
@@ -261,13 +287,35 @@ run_tenifold <- function(input, meta_path, targets_path, out_dir,
     stop("perturbationDistances 的列名与输入基因顺序不一致", call. = FALSE)
   }
 
-  dist_csv <- file.path(out_dir, "tenifold_perturbation_distances.csv")
-  utils::write.csv(pd, dist_csv, row.names = TRUE)
-
   # 网络本身也留一份"形状证据"：WT 网络的维度与非零边数。
   # **不落盘完整网络** —— 那是 nGenes x nGenes 的稀疏矩阵，落盘只是占地方；
   # 真正被下游用的是距离矩阵。
   wt <- res$tensorNetworks$WT
+
+  # ---- 空敲除筛查（见 zero_outdegree_targets 的注释）-----------------------
+  # 必须放在写 CSV **之前** —— 否则 NA 只进了 meta 没进落盘的距离表。
+  deg <- zero_outdegree_targets(wt, targets)
+  empty_ko <- names(deg)[!is.na(deg) & deg == 0L]
+  if (length(empty_ko) > 0L) {
+    pd[empty_ko, ] <- NA_real_
+    cat(sprintf(
+      "[tenifold] 警告: %d/%d 个候选基因在去噪网络中出度为 0，其距离行已置 NA: %s\n",
+      length(empty_ko), length(targets), paste(empty_ko, collapse = ", ")
+    ))
+    cat(paste0(
+      "[tenifold]   （清零一行本来就全 0 的行 = 什么都没敲掉，包仍会返回一排 ~1e-16 的浮点噪声；\n",
+      "[tenifold]    置 NA 是为了让下游把「这个网络表达不了该扰动」与「扰动效应确实是 0」分开）\n"
+    ))
+  }
+  missing_in_wt <- names(deg)[is.na(deg)]
+  if (length(missing_in_wt) > 0L) {
+    stop("以下候选基因不在 WT 网络里（包本该 stop，这里先报）: ",
+         paste(missing_in_wt, collapse = ", "), call. = FALSE)
+  }
+
+  dist_csv <- file.path(out_dir, "tenifold_perturbation_distances.csv")
+  utils::write.csv(pd, dist_csv, row.names = TRUE)
+
   elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
 
   meta <- list(
@@ -286,6 +334,10 @@ run_tenifold <- function(input, meta_path, targets_path, out_dir,
     wt_network_nonzero = as.integer(sum(wt != 0)),
     distances_non_na = as.integer(sum(!is.na(pd))),
     distances_total = as.integer(length(pd)),
+    # 空敲除筛查结果（见 zero_outdegree_targets 的注释）
+    n_empty_knockout = length(empty_ko),
+    empty_knockout_genes = if (length(empty_ko) > 0L) empty_ko else NULL,
+    target_outdegree = as.list(deg),
     params = list(n_net = n_net, n_cells = n_cells, n_comp = n_comp,
                   td_k = td_k, ma_n_dim = ma_n_dim, n_cores = n_cores),
     internal_seed = "包内硬编码 set.seed(1)（scTenifoldKnk.R L163/L172/L208/L231）",
@@ -413,6 +465,33 @@ run_selftest <- function() {
   }
   cat(sprintf("[selftest] 距离矩阵 %d x %d，非零 %d 个，范围 [%.4f, %.4f]\n",
               nrow(pd), ncol(pd), sum(pd != 0), min(pd), max(pd)))
+
+  # --- 断言 4b：空敲除（出度为 0 的候选）必须被识别出来 ---
+  # 这条验的是本脚本加的保护：出度为 0 的基因，清零等于没清，包会返回一排
+  # ~1e-16 的浮点噪声，读起来像"敲除没有影响"。这里造一个**确定的**零出度
+  # 行，确认 zero_outdegree_targets 能认出来。
+  fake_wt <- matrix(0, nrow = 5L, ncol = 5L,
+                    dimnames = list(c("A", "B", "C", "D", "E"),
+                                    c("A", "B", "C", "D", "E")))
+  fake_wt["A", "B"] <- 1      # A 有出边
+  fake_wt["B", "C"] <- 1      # B 有出边
+  # C / D / E 全零行 = 零出度
+  fake_deg <- zero_outdegree_targets(fake_wt, c("A", "B", "C", "D", "E"))
+  if (!identical(as.integer(fake_deg), c(1L, 1L, 0L, 0L, 0L))) {
+    stop("selftest: zero_outdegree_targets 判错了 —— 收到 ",
+         paste(fake_deg, collapse = ","), "，期望 1,1,0,0,0", call. = FALSE)
+  }
+  if (!identical(names(fake_deg)[fake_deg == 0L], c("C", "D", "E"))) {
+    stop("selftest: 零出度基因的名字没保留下来", call. = FALSE)
+  }
+  # 不在网络里的基因必须返回 NA（而不是 0）—— 两者含义完全不同：
+  # NA = 网络里没有这个基因；0 = 有但没出边。
+  fake_deg2 <- zero_outdegree_targets(fake_wt, c("A", "ZZZ"))
+  if (!is.na(fake_deg2[["ZZZ"]])) {
+    stop("selftest: 不在网络里的基因应返回 NA，实际返回 ", fake_deg2[["ZZZ"]],
+         call. = FALSE)
+  }
+  cat("[selftest] 空敲除检测：零出度被认出、网络外基因返回 NA\n")
 
   # --- 断言 5：读写契约往返 ---
   # 这一段验的是**本脚本与 Python 之间的文件格式契约**，不是 scTenifoldKnk。

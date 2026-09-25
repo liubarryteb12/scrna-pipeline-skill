@@ -239,6 +239,22 @@ jobs:
         run: |
           python tools/selftest_part1_handoff.py --config ${{ github.event.inputs.config || 'assets/config.pbmc3k.yml' }}
 
+      - name: 自检 scTenifoldKnk 的空敲除处理
+        # **不需要 R**：它拿假距离矩阵喂给 `compress_tenifold_distances()`
+        # 和 `compare_engines()`，只验 Python 侧有没有把 R 侧那份结构证据
+        # （`empty_knockout_genes`）正确消费成 None / 标记列。
+        #
+        # 为什么单独测这一段：scTenifoldKnk 敲除一个基因是把网络里那一行
+        # 清零，若该基因**出度本来就是 0**，等于什么都没敲，包仍会返回
+        # 一排 ~1e-16 的浮点噪声 —— **不报错、不给 NA**，读表的人只会
+        # 得出"敲除这个基因没有影响"。所有既有图门禁都会通过，
+        # 因为它们查的是"有没有产出"不是"产出对不对"。
+        #
+        # R 侧另有 `Rscript scripts/lib/tenifold_knk.R --selftest` 验出度
+        # 计算；两边都必要 —— R 侧算对了而 Python 侧读丢了，症状一模一样。
+        run: |
+          python tools/selftest_tenifold.py
+
       - name: 检查图不是空白
         run: node tools/check_figures.mjs results/pbmc3k/figures
 
