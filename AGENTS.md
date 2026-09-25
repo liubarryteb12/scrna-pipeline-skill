@@ -195,7 +195,8 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 | 函数 | 记录什么 | 规范条款 |
 |---|---|---|
 | `init_manifest` | 开新一轮（**清掉上一轮**） | — |
-| `capture_versions` | 全量已装包 + `KEY_PACKAGES` 逐个 | §0.3 |
+| `capture_versions` | 全量已装 Python 包 + `KEY_PACKAGES` + `R_KEY_PACKAGES` 逐个 | §0.3 |
+| `probe_r_packages` | 起一次 `Rscript` 问 R 这些包装了没有 | §0.3 |
 | `record_input` | 输入文件的 sha256 | §0.4 |
 | `record_params` | 全部参数**含 seed** | §0.3 |
 | `record_decision` | Agent 决策链（问题/结论/证据） | §0.4 |
@@ -208,6 +209,8 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 1. **未装的工具要记成 `null`，不能省略键。** `key_versions` 里
    `"liana": null` 和"没有 liana 这个键"是两件事：前者是"查过了，没装"，
    后者是"没查"。省略会让读者分不清。
+   **但"查过了"的前提是问对了地方** —— R 包走 `R_KEY_PACKAGES` +
+   `probe_r_packages()`，见第 6 条。
 2. **人工复核未确认不算失败。** `human_review` 默认就是 `pending`，
    判成 FAIL 会让每个 job 都红，反而没人看。但必须**可见**。
 3. **`init_manifest` 必须清掉上一轮。** 和规则 14 同一个道理：
@@ -215,7 +218,36 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 4. **清单在步骤跑完之后才登记输入。** 可选步骤这轮有没有产物，
    跑完才知道；在开头登记会把"上轮残留"记成本轮输入。
 5. **`pip freeze` 不用 subprocess 抓。** 沙箱下管道捕获会 EPERM，
-   用 `importlib.metadata` 枚举。
+   用 `importlib.metadata` 枚举。**这条只对 Python 包成立** —— 见第 6 条。
+6. **R 包必须问 R，`importlib` 永远问不出来。** `importlib.metadata` 与
+   `importlib.util.find_spec` 查的都是 Python 的发行版数据库 / 模块查找器，
+   对 R 包**原理上**永远返回"没有"。那个 `None` 会被读成"查过了，装不上"，
+   而它真正的含义是"**问错了地方**"。
+
+   实测的后果：K-01b 起 CI 装了 R、`scTenifoldKnk` 真跑了 6 分钟，而
+   `run_manifest.json`（**复现依据**）仍记 `scTenifoldKnk: null` ——
+   于是它与 `virtual_perturbation_status.json` 的
+   `tools.scTenifoldKnk.available = true` 对**同一个工具**给出相反结论。
+
+   所以拆成两条通道，且**失败原因分开写**：
+
+   | 通道 | 实现 | 清单字段 |
+   |---|---|---|
+   | Python 包 | `importlib.metadata` 枚举（不起子进程） | `key_versions` |
+   | R 包 | `probe_r_packages()`：一次 `Rscript -e requireNamespace` | `key_versions` + `r` |
+
+   `r` 那段（`{rscript, r_version, packages, reason}`）是必要的：
+   `key_versions` 是**平铺**的 name→version，读不出"哪些是 R 包、
+   R 是什么版本、R 到底有没有装"。
+
+   三种失败各有独立 `reason`，**不能混成一句**：包名非法（拒绝把任意
+   字符串拼进 `Rscript -e`）/ `Rscript` 不在 PATH（本机没 CI 没装 R）/
+   退出码非 0。"没装 R"与"R 装了但包没装"必须区分开，
+   否则排查方向会被带偏。
+
+   `08_virtual_perturbation.py` 的 `_probe_r_package()` **转调**
+   `probe_r_packages()`，不再自己拼一遍 —— 同一件事只留一份代码
+   （抄两份时验证的往往只是副本，见 E-41 与规则 15 的教训）。
 
 `run_manifest.json` 落在 `results/` 下，随 artifact 一起上传 ——
 **它必须和结果同时可及**，否则追溯链是断的。

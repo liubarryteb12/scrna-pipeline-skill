@@ -109,9 +109,9 @@ from scipy import sparse  # noqa: E402
 from scipy.stats import spearmanr  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, PAL, parse_args, record_cross_language,
-                    record_decision, record_step, save_fig, set_seed,
-                    write_json, W_ONE_HALF, W_SINGLE, mm,)
+                    log_warn, PAL, parse_args, probe_r_packages,
+                    record_cross_language, record_decision, record_step,
+                    save_fig, set_seed, write_json, W_ONE_HALF, W_SINGLE, mm,)
 
 # 候选基因没有外部靶基因表时，用调控子按簇特异性排序取前 N 个
 DEFAULT_TOP_N = 20
@@ -178,33 +178,26 @@ def _probe_r_package(pkg: str) -> dict:
     那是 Python 的模块查找器，对 R 包永远返回 False。第一版就是这么把
     scTenifoldKnk 判成不可用的：理由写的是"不在 PyPI"（真的），
     结论却是"不可用"（越界了）。R 包能不能用，取决于 CI 里有没有 R。
+
+    实现转调 `common.probe_r_packages()` —— **同一件事只留一份代码**。
+    这里原本自己拼了一次 `Rscript -e requireNamespace`，而 `capture_versions`
+    那条通道查的是 `importlib.metadata`，于是同一轮里
+    `virtual_perturbation_status.json` 说"装了 1.1"、
+    `run_manifest.json` 说"没装"（两份产物互相矛盾，而后者是复现依据）。
+    两份实现的差别不在写法，在**问错了对象** —— 修法是把问的对象统一成 R。
     """
-    rscript = shutil.which("Rscript")
-    if rscript is None:
-        return {"available": False,
-                "reason": "Rscript 不在 PATH 上 —— CI 没有装 R（见 workflow 的 setup-r 步骤）",
-                "version": None, "r_version": None}
-    expr = (f'if (requireNamespace("{pkg}", quietly=TRUE)) '
-            f'cat("OK", as.character(utils::packageVersion("{pkg}")), '
-            f'as.character(getRversion()), sep="\\t") else cat("MISSING")')
-    try:
-        p = subprocess.run([rscript, "-e", expr], capture_output=True, text=True,
-                           timeout=120)
-    except (OSError, subprocess.SubprocessError) as e:  # noqa: BLE001
-        return {"available": False,
-                "reason": f"调用 Rscript 失败: {type(e).__name__}: {e}",
-                "version": None, "r_version": None}
-    out = (p.stdout or "").strip()
-    if p.returncode != 0 or not out.startswith("OK"):
-        return {"available": False,
-                "reason": (f"R 装上了，但 CRAN 包 {pkg} 没装上 —— "
-                           f"检查 CI 的 R 依赖步骤。Rscript 输出: "
-                           f"{(p.stderr or out).strip()[:200]}"),
-                "version": None, "r_version": None}
-    parts = out.split("\t")
-    return {"available": True, "reason": None,
-            "version": parts[1] if len(parts) > 1 else None,
-            "r_version": parts[2] if len(parts) > 2 else None}
+    info = probe_r_packages([pkg])
+    version = info["packages"].get(pkg)
+    if version is not None:
+        return {"available": True, "reason": None,
+                "version": version, "r_version": info["r_version"]}
+    if info["reason"]:
+        reason = info["reason"]
+    else:
+        reason = (f"R {info['r_version']} 装上了，但 CRAN 包 {pkg} 没装上 —— "
+                  f"检查 CI 的 R 依赖步骤")
+    return {"available": False, "reason": reason,
+            "version": None, "r_version": info["r_version"]}
 
 
 def probe_tools() -> dict:
@@ -304,9 +297,26 @@ def load_targets(cfg: dict, reg: pd.DataFrame) -> tuple:
             log_warn(f"配置指定的 Part 1 交接表不存在: {p} —— 回退到内部调控子")
 
     n = int(pert.get("top_n", DEFAULT_TOP_N))
-    head = reg.head(n)
+    # **先按 TF 去重，再取前 N 行。** `tf_regulons.csv` 是**行级**排名：同一个
+    # TF 在不同簇上各有一行（217 行 / 201 个唯一 TF，15 个 TF 出现多次）。
+    # `reg.head(n)` 是行级截断，于是 20 个候选里只有 17 个唯一 —— TBX21 /
+    # IRF1 / EZH2 各出现两次。后果不只是候选表多几行：
+    #   - `virtual_perturbation.csv` 出现 21 行重复的 (gene, cell_type)；
+    #   - status 的 `n_rows` 报 140（真值 119），虚报 18%；
+    #   - 传给 R 的 target 列表是 20 条，而实际只有 17 个基因被敲。
+    # 去重后**不丢基因、还会多出 3 个**（E2F3 / ELK4 / TCF3）—— 因为名额
+    # 原本被重复行占了。这正是 AGENTS 规则 23.4 记的那件事，当时只修了图，
+    # 消费侧这条漏了。
+    #
+    # `drop_duplicates` 保首行，而 `reg` 已按 `cluster_specificity` 降序 ——
+    # 所以留下的是该 TF 特异性最高的那一行，不是任意一行。
+    reg_u = reg.drop_duplicates(subset=["tf"])
+    head = reg_u.head(n)
     out = pd.DataFrame({"gene": head["tf"].astype(str)})
     out["logfc"] = np.nan
+    if len(reg_u) < len(reg):
+        log_info(f"候选表按 TF 去重：{len(reg)} 行 -> {len(reg_u)} 个唯一 TF"
+                 f"（取前 {len(out)} 个）")
     log_info(f"候选靶基因来自内部调控子（按簇特异性取前 {len(out)} 个）—— "
              f"**没有 Part 1 签名，signature_alignment 会是 NaN**")
     # §0.2：**这一轮没有发生跨语言交接，必须说出来。**
@@ -449,6 +459,33 @@ def select_tenifold_genes(var_names, cand_genes, max_genes: int,
     return [g for g in names if g in keep]
 
 
+def _sig6(v: float) -> float:
+    """保留 6 位**有效数字**（不是 6 位小数）。
+
+    **这是 K-01b 第一版的一个真 bug 的修法。** 当时写的是 `round(v, 6)`，
+    而 scTenifoldKnk 的流形距离量级是 **1e-9 ~ 1e-3** —— 6 位小数把
+    `1.48e-08` 归成 `0.0`、把 `1.09e-06` 压成 `1e-06`。后果：
+
+      - 15 个基因里 8 个 mean 变成 `0.0`、6 个并列 `1e-06`，**排序被摧毁**
+        —— 而排序正是这张表存在的全部意义；
+      - 出图用的就是这列（`ax.barh(top["tenifold_mean_distance"])`），
+        于是 5 根柱子长度为零、6 根等长，图上看不出谁强谁弱；
+      - 一致性系数被改动：原始 mean 算 Spearman rho=0.575（p=0.0249），
+        round6 后 0.5634（p=0.0287）—— 落盘的是后者。
+
+    `round()` 的位数是**绝对**刻度，对跨数量级的量必然出事；有效数字是
+    **相对**刻度，这正是"只想压缩显示、不想改变排序"时该用的东西。
+    一阶近似那边用 `round(x, 4)` 没事，因为它的量级是 O(1)~O(10)。
+
+    实现用 `:.6g`（6 位有效数字），转回 float 让 pandas 写出来是数值而不是
+    字符串。非有限值原样返回。
+    """
+    f = float(v)
+    if not np.isfinite(f):
+        return f
+    return float(f"{f:.6g}")
+
+
 def compress_tenifold_distances(dist: pd.DataFrame, rmeta: dict) -> pd.DataFrame:
     """把「扰动基因 × 网络基因」的距离矩阵压成每基因一行的可解读量。
 
@@ -490,10 +527,10 @@ def compress_tenifold_distances(dist: pd.DataFrame, rmeta: dict) -> pd.DataFrame
         rows.append({
             "gene": g,
             "tenifold_n_genes_scored": int(ok.sum()),
-            "tenifold_mean_distance": round(float(np.nanmean(v)), 6),
-            "tenifold_max_distance": round(float(np.nanmax(v)), 6),
+            "tenifold_mean_distance": _sig6(float(np.nanmean(v))),
+            "tenifold_max_distance": _sig6(float(np.nanmax(v))),
             "tenifold_top_gene": str(dist.columns[j]),
-            "tenifold_top_distance": round(float(v[j]), 6),
+            "tenifold_top_distance": _sig6(float(v[j])),
             "tenifold_target_outdegree": outdeg.get(g),
             "tenifold_empty_knockout": False,
         })
@@ -927,15 +964,34 @@ def run_08_virtual_perturbation(cfg: dict) -> dict:
                  "这不是「效应都很小」，是网络装不下这批候选")
     if use_td:
         top = td_plot.head(12)
+        vals = top["tenifold_mean_distance"].to_numpy(dtype=float)
+        ys = np.arange(len(top))[::-1]
         fig, ax = plt.subplots(
             figsize=(min(W_ONE_HALF, max(W_SINGLE, 0.30 * len(top) + 3.0)), mm(70)))
-        ax.barh(range(len(top))[::-1], top["tenifold_mean_distance"].values,
-                color=PAL["primary"], alpha=0.85)
-        ax.set_yticks(range(len(top))[::-1])
+        # **点，不是柱子。** 十个候选的距离跨 3~4 个数量级（1.1e-09 ~ 4.5e-06），
+        # 柱子的长度是"从基线量起"的，零基线在这里没有意义 —— 画线性柱时
+        # 弱的一半会变成零长（看起来正是"敲除没有影响"这个我们要避免的
+        # 误读），画对数柱时"柱长"又会被读成倍数。位置编码允许非零起点，
+        # 所以改成对数轴上的点：排名看得见，且轴标签写明是对数。
+        ax.plot(vals, ys, "o", linestyle="none", color=PAL["primary"],
+                ms=5.0, markeredgecolor="white", markeredgewidth=0.6)
+        ax.set_xscale("log")
+        ax.set_yticks(ys)
         ax.set_yticklabels([str(g) for g in top["gene"]], fontsize=7)
-        ax.set_xlabel("scTenifoldKnk perturbation distance (manifold)")
+        ax.set_ylim(-0.6, len(top) - 0.4)
+        # 左右各留出标注文字的净空（数值标在点的右侧）。**不用 `margins()`** ——
+        # 对数轴上它的伸缩是按倍率算的，量级跨度大时会留出一大段空白。
+        ax.set_xlim(vals.min() * 0.45, vals.max() * 4.5)
+        # 每个点右边标出真实数值 —— 对数轴上看不出绝对量级，
+        # 而这列数字是这张图唯一的定量产出。
+        for y, v in zip(ys, vals):
+            ax.annotate(f"{v:.2g}", (v, y), xytext=(4, 0),
+                        textcoords="offset points", va="center",
+                        fontsize=6.5, color=PAL["muted"])
+        ax.set_xlabel("scTenifoldKnk perturbation distance (manifold, log scale)")
         ax.set_title("Virtual knockout: predicted effect size\n"
-                     "(scTenifoldKnk: tensor-decomposed network + manifold alignment)",
+                     "(scTenifoldKnk: tensor-decomposed network + manifold alignment;"
+                     " mean distance over the 600-gene network)",
                      fontsize=9)
     else:
         top = best.head(12)

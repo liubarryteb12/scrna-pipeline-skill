@@ -17,6 +17,9 @@ import hashlib
 import json
 import os
 import random
+import re
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -228,18 +231,35 @@ MANIFEST_NAME = "run_manifest.json"
 
 # 文档 §2 点名的工具。**没装的记 None，不省略键** —— 键消失和"版本是 None"
 # 看起来完全不同，后者才说明"这个工具本该有但没装"。
+#
+# **但这张表里的 R 包不能靠 `importlib.metadata` 判"没装"。** 那句话的前提是
+# "本仓库 CI 里没有 R"，K-01b 之后不成立了：CI 装了 R，`scTenifoldKnk` 真跑了
+# 6 分钟，而 `key_versions` 仍记 None —— 于是 `run_manifest.json`（复现依据）
+# 与 `virtual_perturbation_status.json` 对**同一个工具**给出相反结论。
+# 所以 R 包从这张表里挪出去，单独走 `R_KEY_PACKAGES` + `probe_r_packages()`
+# （起一次 `Rscript` 问，而不是问 Python 的包数据库）。
 KEY_PACKAGES = [
     # §2 核心 Python 包
     "scanpy", "anndata", "scvi-tools", "cellbender", "harmonypy", "scvelo",
     "celltypist", "pyscenic", "liana", "doubletdetection", "scrublet",
     # §2.6 拟时序
     "palantir", "scfates", "cytotrace",
-    # §2 点名的 R 包（本仓库无 rpy2 路径，正常就是 None）
-    "monocle3", "slingshot", "cellchat", "soupx", "scdblfinder",
-    # §1.7/§1.8 虚拟扰动。**三个都装不上，但键必须留着** ——
+    # §1.7/§1.8 虚拟扰动。PerturbNet / RegVelo 是 **Python** 包（PyPI 上的版本
+    # 都钉死了 Python 上限），所以走上面那条 `importlib.metadata` 通道；
     # 记 None 是"查过了，装不上"，省略键是"没查"。
     # 确切原因写在 virtual_perturbation_status.json 的 tools 字段里。
-    "scTenifoldKnk", "PerturbNet", "RegVelo",
+    "PerturbNet", "RegVelo",
+]
+
+# R 包（CRAN / Bioconductor）。**版本只能问 R。** `importlib.metadata` 枚举的是
+# Python 发行版，对 R 包原理上永远返回 None —— 那个 None 会被读成
+# "查过了，装不上"，而它其实只是"问错了地方"。
+#
+# `scTenifoldKnk` 是 §1.8 点名的虚拟敲除工具，K-01b 起 CI 真的装了它并每轮跑
+# （见 workflow 的 setup-r 步骤与 `scripts/lib/tenifold_knk.R`）。
+R_KEY_PACKAGES = [
+    "monocle3", "slingshot", "cellchat", "soupx", "scdblfinder",
+    "scTenifoldKnk",
 ]
 
 
@@ -393,7 +413,9 @@ def named_tools_note() -> str:
     """一句话说明本仓库为什么 §2 点名的方法多数没用上。"""
     return ("文档 §2.1–§2.8 点名的工具里，R 包（SoupX / SCTransform / scran / "
             "DESeq2 / edgeR / Monocle3 / Slingshot / CellChat）一个都用不了 —— "
-            "本仓库 CI 没有 R + rpy2；CellBender / scVelo / pySCENIC 有 PyPI 真包，"
+            "CI 从 K-01b 起装了 R，但只为 §1.8 的 `scTenifoldKnk` 一个包装的，"
+            "**没有 rpy2 通道**，所以这些 R 包仍然调不到；"
+            "CellBender / scVelo / pySCENIC 有 PyPI 真包，"
             "但分别卡在 GPU、缺 spliced/unspliced 层、需要 GB 级 motif 数据库；"
             "**`edgeR` 与 `slingshot` 在 PyPI 上是同名无关包**（浏览器重定向 / "
             "ElasticSearch 迁移）。逐条理由见各状态文件的 named_tools 字段。"
@@ -442,11 +464,92 @@ def _norm_pkg(name: str) -> str:
     return str(name).strip().lower().replace("_", "-").replace(".", "-")
 
 
+# R 包名允许的字符（CRAN 规范：字母开头，只含字母数字点）。
+# 用来挡住把任意字符串拼进 `Rscript -e` 表达式 —— 那不是解析，是拼串。
+_R_PKG_OK = re.compile(r"^[A-Za-z][A-Za-z0-9.]*$")
+
+
+def probe_r_packages(pkgs) -> dict:
+    """问 **R 自己** 这几个包装了没有。一次 `Rscript` 问完全部。
+
+    **为什么不能用 `importlib.metadata` 或 `find_spec`。** 那两条查的都是
+    Python 的包数据库 / 模块查找器，对 R 包原理上永远返回"没有"。K-01b 之前
+    本仓库 CI 里确实没有 R，所以那个 `None` 恰好是对的；K-01b 起 CI 装了 R、
+    `scTenifoldKnk` 真跑了 6 分钟，而 `key_versions` 仍记 `None` ——
+    于是 `run_manifest.json`（**复现依据**）与
+    `virtual_perturbation_status.json` 对同一个工具给出相反结论。
+    错的不是那个 `None` 的值，是**问错了地方**。
+
+    返回 `{"rscript", "r_version", "packages": {pkg: version|None}, "reason"}`。
+    Rscript 不在 PATH 时 `reason` 写明"CI 没有装 R"，各包版本记 `None` ——
+    这个 `None` 与"问了 R，R 说没装"含义不同，所以两个原因分开写。
+
+    这是本仓库**唯一**一处"问 R 包版本"的实现：`08_virtual_perturbation.py`
+    的 `_probe_r_package()` 转调这里，免得同一件事有两份代码（抄两份时
+    验证的往往只是副本 —— 见 AGENTS 规则 16 的教训）。
+    """
+    names = [str(p) for p in pkgs]
+    bad = [p for p in names if not _R_PKG_OK.match(p)]
+    if bad:
+        return {"rscript": None, "r_version": None, "packages": {p: None for p in names},
+                "reason": f"包名不是合法的 R 标识符，拒绝拼进表达式: {bad}"}
+
+    rscript = shutil.which("Rscript")
+    if rscript is None:
+        return {"rscript": None, "r_version": None,
+                "packages": {p: None for p in names},
+                "reason": ("Rscript 不在 PATH 上 —— 本机/本 CI 没有装 R"
+                           "（见 workflow 的 setup-r 步骤）")}
+
+    # 一次问完：每个包一行 `OK<TAB>名字<TAB>版本` 或 `MISSING<TAB>名字<TAB>`。
+    quoted = ", ".join('"' + p + '"' for p in names)
+    expr = (
+        f"pk <- c({quoted})\n"
+        "for (p in pk) {\n"
+        "  if (requireNamespace(p, quietly = TRUE)) {\n"
+        '    cat("OK\\t", p, "\\t", as.character(utils::packageVersion(p)), "\\n", sep = "")\n'
+        "  } else {\n"
+        '    cat("MISSING\\t", p, "\\t\\n", sep = "")\n'
+        "  }\n"
+        "}\n"
+        'cat("RVERSION\\t", as.character(getRversion()), "\\n", sep = "")\n'
+    )
+    try:
+        p = subprocess.run([rscript, "-e", expr], capture_output=True,
+                           text=True, timeout=180)
+    except (OSError, subprocess.SubprocessError) as e:  # noqa: BLE001
+        return {"rscript": rscript, "r_version": None,
+                "packages": {p2: None for p2 in names},
+                "reason": f"调用 Rscript 失败: {type(e).__name__}: {e}"}
+    if p.returncode != 0:
+        return {"rscript": rscript, "r_version": None,
+                "packages": {p2: None for p2 in names},
+                "reason": (f"Rscript 退出码 {p.returncode}: "
+                           f"{(p.stderr or '').strip()[:200]}")}
+
+    versions = {p2: None for p2 in names}
+    r_version = None
+    for line in (p.stdout or "").splitlines():
+        parts = line.split("\t")
+        if parts[0] == "RVERSION" and len(parts) > 1:
+            r_version = parts[1].strip() or None
+        elif parts[0] in ("OK", "MISSING") and len(parts) > 1:
+            name = parts[1].strip()
+            if name in versions and parts[0] == "OK" and len(parts) > 2:
+                versions[name] = parts[2].strip() or None
+    return {"rscript": rscript, "r_version": r_version, "packages": versions,
+            "reason": None}
+
+
 def capture_versions(cfg: dict, key_packages=None, extra: dict = None) -> dict:
     """§0.3 版本记录。
 
-    全量走 `importlib.metadata` 枚举已安装发行版，**不起子进程** ——
+    Python 包全量走 `importlib.metadata` 枚举已安装发行版，**不起子进程** ——
     管道捕获输出在受限沙箱里会 EPERM，而这里拿到的信息与 `pip freeze` 等价。
+
+    **R 包走另一条路**（`probe_r_packages`，起一次 `Rscript`）：`importlib`
+    对 R 包永远返回 None，那个 None 会被读成"查过了，装不上"。两条通道
+    分开走，且分开写原因 —— 混在一起会让"没装 R"看起来像"包不存在"。
 
     文档点名的关键工具单独放进 `key_versions`：全量 freeze 有几百行，
     关键工具淹没在里面。
@@ -468,6 +571,14 @@ def capture_versions(cfg: dict, key_packages=None, extra: dict = None) -> dict:
     key = {}
     for p in (key_packages if key_packages is not None else KEY_PACKAGES):
         key[p] = full.get(_norm_pkg(p))
+
+    # R 包：只有走默认清单时才探（调用方显式传 key_packages 时，
+    # 说明它只要那几个，别往里塞东西）。
+    r_probe = None
+    if key_packages is None and R_KEY_PACKAGES:
+        r_probe = probe_r_packages(R_KEY_PACKAGES)
+        key.update(r_probe["packages"])
+
     for k, v in (extra or {}).items():
         key[k] = v
 
@@ -476,6 +587,13 @@ def capture_versions(cfg: dict, key_packages=None, extra: dict = None) -> dict:
     m["key_versions"] = key
     m["n_packages"] = len(full)
     m["python"] = sys.version.split()[0]
+    if r_probe is not None:
+        # R 环境单独记一段：`key_versions` 是平铺的 name→version，
+        # 读不出"哪些是 R 包、R 是什么版本、R 到底有没有"。
+        m["r"] = {"rscript": r_probe["rscript"],
+                  "r_version": r_probe["r_version"],
+                  "packages": r_probe["packages"],
+                  "reason": r_probe["reason"]}
     try:
         import platform
         m["platform"] = platform.platform()
@@ -485,11 +603,24 @@ def capture_versions(cfg: dict, key_packages=None, extra: dict = None) -> dict:
     m["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     write_json(manifest_path(cfg), m)
 
-    missing = sorted(k for k, v in key.items() if v is None)
-    if missing:
-        log_warn(f"关键工具未安装（{len(missing)}/{len(key)}）：{', '.join(missing)}")
-    else:
-        log_info(f"关键工具全部就位（{len(key)} 个），共记录 {len(full)} 个已安装包")
+    # 警告分两句：Python 的"没装"和 R 的"没装"原因完全不同，
+    # 混成一句 `关键工具未安装（15/22）` 会把"问错了地方"也列进去。
+    py_missing = sorted(p for p in key if p not in set(R_KEY_PACKAGES)
+                        and key[p] is None)
+    if py_missing:
+        log_warn(f"关键 Python 工具未安装（{len(py_missing)}）：{', '.join(py_missing)}")
+    if r_probe is not None:
+        r_missing = sorted(p for p, v in r_probe["packages"].items() if v is None)
+        if r_probe["reason"]:
+            log_warn(f"R 包版本未取到：{r_probe['reason']}")
+        elif r_missing:
+            log_warn(f"关键 R 工具未安装（{len(r_missing)}，R "
+                     f"{r_probe['r_version']}）：{', '.join(r_missing)}")
+        else:
+            log_info(f"关键 R 工具全部就位（{len(r_probe['packages'])} 个，"
+                     f"R {r_probe['r_version']}）")
+    if not py_missing and (r_probe is None or not r_probe["reason"]):
+        log_info(f"关键工具版本已记录，共 {len(full)} 个已安装 Python 包")
     return key
 
 

@@ -31,7 +31,8 @@ liana、输入的 h5ad 是哪个哈希、随机种子是多少、置换跑了几
 | 条款 | 要求 | 接口 | 落到 manifest 的哪个字段 |
 |---|---|---|---|
 | §0.3 | `pip freeze` **全量**输出 | `capture_versions()` | `versions` |
-| §0.3 | 关键工具**逐个**记版本 | `capture_versions()` 的 `KEY_PACKAGES` | `key_versions` |
+| §0.3 | 关键工具**逐个**记版本（Python） | `capture_versions()` 的 `KEY_PACKAGES` | `key_versions` |
+| §0.3 | 关键工具**逐个**记版本（R） | `probe_r_packages()` 的 `R_KEY_PACKAGES` | `key_versions` + `r` |
 | §0.3 | 所有随机过程固定种子并记录 | `record_params()`（`params` 里含 `seed`）+ `m["seed"]` | `params`、`seed` |
 | §0.4 | 输入数据哈希 | `record_input()` | `inputs` |
 | §0.4 | 全部关键参数 | `record_params()` | `params` |
@@ -46,12 +47,14 @@ liana、输入的 h5ad 是哪个哈希、随机种子是多少、置换跑了几
 | 函数 | 作用 | 备注 |
 |---|---|---|
 | `MANIFEST_NAME` | `"run_manifest.json"` | 三个仓库一致 |
-| `KEY_PACKAGES` | 文档点名的关键工具 | 见 §4 |
+| `KEY_PACKAGES` | 文档点名的关键工具（**Python 包**） | 见 §4 |
+| `R_KEY_PACKAGES` | 文档点名的关键工具（**R 包**） | 见 §4 |
+| `probe_r_packages(pkgs)` | 起一次 `Rscript` 问 R 这些包装了没有 | 见 §3.6 |
 | `NAMED_TOOLS` | 点名但用不了的工具 + 理由 | 见 §5 |
 | `manifest_path(cfg)` | 清单路径 | |
 | `read_manifest(cfg)` | 读清单；文件不存在返回 `{}` | |
 | `init_manifest(cfg, language="python")` | **开新一轮，清掉上一轮** | 见 §3.1 |
-| `capture_versions(cfg, ...)` | 全量已装包 + `KEY_PACKAGES` 逐个 | |
+| `capture_versions(cfg, ...)` | 全量已装 Python 包 + `KEY_PACKAGES` + `R_KEY_PACKAGES` 逐个 | |
 | `record_input(cfg, path, ...)` | 输入文件的 sha256 与字节数 | |
 | `record_params(cfg, params)` | 参数（`update` 合并，可多次调用） | |
 | `record_decision(cfg, node, q, a, evidence)` | 决策链 | |
@@ -102,22 +105,57 @@ inputs_missing_required  只有 required=True 的缺失（供验收判 FAIL）
 包名归一化走 **PEP 503**（`_norm_pkg`）：`scikit-misc` / `scikit_misc` /
 `Scikit.Misc` 是同一个包，不归一会让 `key_versions` 里出现查不到的键。
 
+**这条只对 Python 包成立。** R 包必须起子进程 —— 见下条。
+
+### 3.6 R 包必须问 R，`importlib` 永远问不出来
+
+**`importlib.metadata` 与 `importlib.util.find_spec` 查的都是 Python 的
+发行版数据库 / 模块查找器，对 R 包原理上永远返回"没有"。** 那个 `None`
+会被读成"查过了，装不上"，而它真正的含义是"**问错了地方**"。
+
+K-01b 之前本仓库 CI 里确实没有 R，所以那个 `None` 恰好是对的，缺陷
+藏得住。K-01b 起 CI 装了 R、`scTenifoldKnk` 真跑了 6 分钟，而
+`key_versions` 仍记 `None` —— 于是 `run_manifest.json`（**复现依据**）
+与 `virtual_perturbation_status.json` 对同一个工具给出**相反结论**。
+
+所以拆成两条通道：
+
+| 通道 | 实现 | 清单字段 |
+|---|---|---|
+| Python 包 | `importlib.metadata` 枚举（不起子进程） | `key_versions` |
+| R 包 | `probe_r_packages()`：一次 `Rscript -e requireNamespace` | `key_versions` + `r` |
+
+`r` 那一段（`{rscript, r_version, packages, reason}`）是必要的：
+`key_versions` 是**平铺**的 name→version，读不出"哪些是 R 包、R 是什么
+版本、R 到底有没有装"。
+
+三种失败各有独立 `reason`，**不能混成一句**：包名非法（拒绝拼进
+`Rscript -e` 表达式）/ `Rscript` 不在 PATH（本机没装 R）/ 退出码非 0。
+"没装 R"与"R 装了但包没装"必须区分开，否则排查方向会被带偏。
+
+`08_virtual_perturbation.py` 的 `_probe_r_package()` **转调**
+`probe_r_packages()`，不再自己拼 `Rscript -e` —— 同一件事只留一份代码
+（抄两份时验证的往往只是副本，见 AGENTS 规则 16）。
+
 ---
 
-## 4. `KEY_PACKAGES`：三部分的清单
+## 4. 关键工具清单：`KEY_PACKAGES` + `R_KEY_PACKAGES`
 
 文档点名的工具**逐个列出**，装了的记版本、没装的记 `null`。
+**Python 包与 R 包分两张表** —— 它们走两条不同的探测通道（见 §3.6）。
 
 | 部分 | 数量 | 内容 |
 |---|---|---|
 | Part 1 | 15 | `GEOquery` `limma` `WGCNA` `clusterProfiler` `GSVA` `glmnet` `survival` `survminer` `timeROC` `rms` `STRINGdb` + `TRRUST` `ChEA3` + `scTenifoldKnk` `PerturbNet` `RegVelo` |
-| **Part 2（本仓库）** | 25 | `scanpy` `anndata` `scvi-tools` `cellbender` `harmonypy` `scvelo` `celltypist` `pyscenic` `liana` `doubletdetection` `scrublet` + 拟时序 `palantir` `scfates` `cytotrace` + R 包 `monocle3` `slingshot` `cellchat` `soupx` `scdblfinder` + `scTenifoldKnk` `PerturbNet` `RegVelo` |
+| **Part 2（本仓库）Python** | 21 | `scanpy` `anndata` `scvi-tools` `cellbender` `harmonypy` `scvelo` `celltypist` `pyscenic` `liana` `doubletdetection` `scrublet` + 拟时序 `palantir` `scfates` `cytotrace` + `PerturbNet` `RegVelo` |
+| **Part 2（本仓库）R** | 6 | `monocle3` `slingshot` `cellchat` `soupx` `scdblfinder` `scTenifoldKnk` |
 | Part 3 | 16 | `SpatialDE` `SpatialDE2` `spacexr` `BayesSpace` `SPARK-X` `cell2location` `STAGATE` `SpaGCN` `SpaceFlow` `stLearn` `ISORT` `Bering` `BOMS` + LIANA 等 |
 
-**Part 2 的清单里为什么有 R 包（`monocle3` / `slingshot` / `cellchat` /
-`soupx` / `scdblfinder`）：** 规范说 Part 2 是"Python (+R via rpy2)"，
-但**本仓库 CI 里没有 R**，所以这条路径实际不存在。这些键**本来就该是
-`null`** —— 但必须留着，否则读者不知道"是没查还是不该有"。
+**Part 2 的 R 包从 K-01b 起真的会被问到 R。** 在那之前本仓库 CI 里没有 R，
+这五个键**必然**是 `null`，于是"没装 R"与"包不存在"在清单里长得一样。
+K-01b 给 CI 加了 R 层（装 `scTenifoldKnk`），`scTenifoldKnk` 现在记的是
+真版本号（实测 `1.1`，R `4.6.1`），其余五个仍是 `null` —— 但那个 `null`
+现在是 **R 自己回答的**，含义从"问错了地方"变成"查过了，没装"。
 确切原因写在 `NAMED_TOOLS` 里（见 §5）。
 
 ---

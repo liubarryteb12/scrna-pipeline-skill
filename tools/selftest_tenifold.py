@@ -367,6 +367,70 @@ def main() -> int:
         _fail("tenifold 失败且写明了原因，判据却判红 —— "
               "环境问题不该被当成分析错误")
 
+    # ---- 8. `_sig6` 必须保住排序（K-01b 第二版修的那个真 bug）-------------
+    #
+    # 第一版写的是 `round(v, 6)`，而 tenifold 距离的量级是 1e-9 ~ 1e-3 ——
+    # 6 位**小数**把 1.48e-08 归成 0.0、把 1.09e-06 压成 1e-06。
+    # 后果不是"数字不好看"：**排序被摧毁**，而排序是这张表存在的全部意义
+    # （图直接画这列）。下面这段的判据就是"压缩前后顺序必须一致"。
+    _raw = [4.5093e-06, 1.4774e-06, 1.4413e-06, 1.1208e-06, 1.0944e-06,
+            8.1719e-07, 5.5998e-07, 4.5300e-07, 3.8342e-07, 2.0413e-07,
+            7.8427e-08, 1.4847e-08, 1.0909e-08, 8.2891e-09, 1.1387e-09]
+    _sig = [vp._sig6(v) for v in _raw]
+    if any(s == 0.0 for s in _sig):
+        _fail(f"_sig6 把 {sum(1 for s in _sig if s == 0.0)} 个非零距离压成了 "
+              f"0.0 —— 这正是 `round(v, 6)` 干的事，会让弱的一半在图上消失")
+    if len(set(_sig)) != len(set(_raw)):
+        _fail(f"_sig6 把 {len(set(_raw))} 个不同的距离压成了 "
+              f"{len(set(_sig))} 个 —— 并列之后排序变成任意的")
+    _ord = sorted(range(len(_raw)), key=lambda i: -_raw[i])
+    _ord2 = sorted(range(len(_raw)), key=lambda i: -_sig[i])
+    if _ord != _ord2:
+        _fail(f"_sig6 改变了排序：{_ord} -> {_ord2}")
+    # 反向断言：旧的写法**必须**被这段判据抓住。若哪天有人把 `_sig6`
+    # 改回 `round(v, 6)` 而这里恰好也松了，这条就是最后一道网。
+    if len(set(round(v, 6) for v in _raw)) == len(set(_raw)):
+        _fail("这段判据本身失效了 —— `round(v, 6)` 竟然没压平这批数，"
+              "说明测试数据换了量级，该断言已经证明不了任何事")
+    # 非有限值原样返回（nan 不能变成字符串 'nan' 写进 CSV）
+    if not np.isnan(vp._sig6(float("nan"))):
+        _fail("_sig6(nan) 没原样返回 nan")
+    if vp._sig6(0.0) != 0.0:
+        _fail(f"_sig6(0.0)={vp._sig6(0.0)!r}，应该是 0.0")
+
+    # ---- 9. `load_targets` 内部回退分支必须按 TF 去重 ----------------------
+    #
+    # `tf_regulons.csv` 是**行级**排名：同一个 TF 在不同簇上各有一行
+    # （真数据 217 行 / 201 个唯一 TF）。`reg.head(n)` 是行级截断，于是
+    # 20 个候选里只有 17 个唯一（TBX21 / IRF1 / EZH2 各两次），下游
+    # `virtual_perturbation.csv` 出现 21 行重复的 (gene, cell_type)。
+    #
+    # 这条路径**不能靠图门禁发现** —— 图照样画得出来，只是 x 轴或
+    # 候选表里多了几行。它只能在代码层测。
+    _reg = pd.DataFrame({
+        "tf": ["TBX21", "TBX21", "IRF1", "IRF1", "EZH2", "EZH2", "GATA2"],
+        # 已按 cluster_specificity 降序（`drop_duplicates` 保首行，
+        # 所以留下的必须是特异性最高的那一行）
+        "cluster_specificity": [9.0, 3.0, 8.0, 2.0, 7.0, 1.0, 6.0],
+    })
+    # `load_targets` 会经 `record_decision()` 往清单里写东西，所以需要一个
+    # 真目录。**单独开一个 tempdir**，不复用第 6 段那个 —— 那个 `with` 块
+    # 已经退出、目录已被删掉，复用它会让 `write_json` 把目录重新建出来，
+    # 而那个目录从此再也没人清理。
+    with tempfile.TemporaryDirectory() as _td2:
+        _cfg = {"output": {"results_dir": str(Path(_td2) / "res"),
+                           "data_dir": str(Path(_td2) / "data")},
+                "dataset_id": "selftest", "perturbation": {"top_n": 4}}
+        _tgt, _src = vp.load_targets(_cfg, _reg)
+    if _src != "internal_top_regulons":
+        _fail(f"没配 targets_csv 时应该走内部回退，实得 source={_src!r}")
+    if list(_tgt["gene"]) != ["TBX21", "IRF1", "EZH2", "GATA2"]:
+        _fail(f"load_targets 没按 TF 去重：候选 = {list(_tgt['gene'])}，"
+              f"应该是 ['TBX21', 'IRF1', 'EZH2', 'GATA2'] —— "
+              f"重复行会占掉名额，去重后反而能多出候选")
+    if len(set(_tgt["gene"])) != len(_tgt):
+        _fail(f"候选表里仍有重复基因：{list(_tgt['gene'])}")
+
     _say("自检" + ("通过" if ok else "**失败**"))
     return 0 if ok else 1
 

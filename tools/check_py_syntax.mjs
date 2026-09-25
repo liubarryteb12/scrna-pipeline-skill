@@ -123,6 +123,10 @@ const WATCH_SYMBOLS = [
   "init_manifest", "capture_versions", "manifest_path", "read_manifest",
   "record_params", "record_input", "record_decision", "record_human_review",
   "record_cross_language", "manifest_summary",
+  // R 包探测。`08_virtual_perturbation.py` 的 `_probe_r_package()` 转调它 ——
+  // 漏 import 的话，本地没有 R 所以这条路径跑不到，只会在 CI 上
+  // 探针第一次被调用时炸（而那时前面的步骤已经跑了几分钟）。
+  "probe_r_packages",
 ];
 
 /** 去掉注释与字符串字面量，避免"名字只出现在注释里"的误报。 */
