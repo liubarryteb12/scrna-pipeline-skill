@@ -434,8 +434,8 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
         lax.set_xlim(0, 1); lax.set_ylim(0, 1)
         lax.axis("off")
         # 大小图例：纵排、间距 0.11 —— 显式给，不再粘连
-        lax.set_title("Percent Expressed (%)", fontsize=7.5,
-                      pad=2, loc="left")
+        fig.text(0.995, 0.78, "Percent Expressed (%)", ha="right",
+                  va="bottom", fontsize=7.5)
         for k, (f_, s_) in enumerate(size_handles):
             yy = 0.62 - k * 0.09
             lax.scatter([0.38], [yy], s=s_, color="gray",
@@ -445,7 +445,7 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
         # 色标：**高度与大小图例一致**（0.34），水平标题在上方（不旋转）
         cax = fig.add_axes([0.905, 0.08, 0.026, 0.32])
         cb = fig.colorbar(sm, cax=cax, orientation="vertical")
-        cax.text(0.995, 0.42, "Mean Expression", transform=fig.transFigure,
+        cax.text(0.995, 0.45, "Mean Expression", transform=fig.transFigure,
                  ha="right", va="bottom", fontsize=7)
         cb.set_ticks([-1, 0, 1])
         cb.set_ticklabels(["Low", "Mid", "High"])
