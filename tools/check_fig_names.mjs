@@ -46,7 +46,12 @@ const PART_BY_REPO = {
   "spatial-pipeline-skill": "03",
 };
 const repoName = basename(repo);
-const PART = PART_BY_REPO[repoName];
+// **发版包解压后目录名带版本后缀**（如 `scrna-pipeline-skill-v0.1.1`）。
+// 只做精确查表的话，用户解压交付包后跑门禁会得到"认不出仓库"而判红 ——
+// 而包本身是好的。实测 v0.1.1 打包后独立验证时踩到（2026-09-25）。
+// 所以：先精确匹配，认不出再退化为"以某个已知仓库名开头"。
+const PART = PART_BY_REPO[repoName]
+  ?? PART_BY_REPO[Object.keys(PART_BY_REPO).find((k) => repoName.startsWith(k))];
 if (!PART) {
   console.error(`认不出仓库 ${repoName} —— 阶段号表里没有它`);
   process.exit(1);
