@@ -212,7 +212,11 @@ STEP_ABORT_VALUES = (
     # 06 通讯：数据库里没有一对配体受体同时在数据里 / 打分全 0
     "no_pairs_in_data", "no_signal",
     # 04 拟bulk：聚合不出可用拟bulk / 没有一个细胞类型可检验 / 配置的列不存在
+    #   `missing_counts`（审计 S6）：上游没保留 counts 层 —— 这是**契约被破坏**，
+    #   不是"这批数据不适合做拟bulk"。旧实现静默退回 log 后的 `.X`，
+    #   离散度估计全错而产物看起来正常。
     "no_usable_pseudobulk", "no_celltype_testable", "column_missing",
+    "missing_counts",
 )
 
 # **设计如此地没做**（配置关掉了 / 输入不支持 / 环境缺包）—— 只可见、不阻断。

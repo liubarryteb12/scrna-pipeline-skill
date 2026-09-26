@@ -1,0 +1,125 @@
+# ============================================================================
+# assets/celltype_mapping.yml — marker 签名词表 ↔ CellTypist 词表的显式映射
+# ============================================================================
+# **为什么需要这个文件（审计 S3，台账 E-58）：**
+#
+# 本流水线有两条独立的注释路：
+#   - marker 签名打分 → `celltype_annotation.csv`，词表来自
+#     `assets/celltype_markers.yml`（`T_cell` / `CD8_T` / `Monocyte` …）；
+#   - CellTypist 预训练模型 → `celltypist_labels.csv`，词表来自模型
+#     （`Tcm/Naive helper T cells` / `Classical monocytes` / `B cells` …）。
+#
+# 两套词表**没有任何一个字符串相等**。`compare_annotations()` 原来直接做
+# `str(own).lower() == str(maj).lower()`，于是**恒等于 0** —— 实测
+# `n_agree_exact: 0 / agreement_frac: 0.0`，而逐簇看下去 `B_cell` ↔
+# `B cells`（purity 1.0）、`Platelet` ↔ `Megakaryocytes/platelets`（1.0）、
+# `Monocyte` ↔ `Classical monocytes`（0.994）**明显是一致的**。
+#
+# **一个恒为 0 的量比没有这个量更糟**：它看起来像一个结论（"两条路完全
+# 不一致"），实际只是词表不相交。这和 spatial 仓库 AGENTS 规则 8
+# （"没有外部参考时 NNLS 给一个看起来像答案、但不含信息的解"）是同一类错。
+#
+# **处置：** 显式写映射。**没有映射的簇不参与分母**，单独列成 `unmapped`
+# —— 猜一个映射会把"我没定义"伪装成"不一致"。
+#
+# 改自己的组织时：改这个文件。**别用血液的映射去套肿瘤。**
+# ============================================================================
+
+version: 1
+description: 外周血/免疫（pbmc3k 这类数据适用）；CellTypist Immune_All_Low.pkl 的标签
+note: 一个 marker 类型可以对应多个 CellTypist 标签（同一谱系的不同状态/亚型）
+
+# marker 类型 → CellTypist 标签列表
+# 列表里的标签**只要命中就算一致**（CellTypist 把 T 细胞分得比本仓库细）
+map:
+
+  T_cell:
+    - Tcm/Naive helper T cells
+    - Tem/Effector helper T cells
+    - MAIT cells
+    - Regulatory T cells
+    - Tcm/Naive cytotoxic T cells
+    - Tem/Trm cytotoxic T cells
+    - T cells
+    - CD4+ T cells
+    - CD8+ T cells
+
+  CD4_T:
+    - Tcm/Naive helper T cells
+    - Tem/Effector helper T cells
+    - Regulatory T cells
+    - MAIT cells
+    - CD4+ T cells
+
+  CD8_T:
+    - Tcm/Naive cytotoxic T cells
+    - Tem/Trm cytotoxic T cells
+    - CD8+ T cells
+
+  NK_cell:
+    - NK cells
+    - CD16+ NK cells
+
+  B_cell:
+    - B cells
+    - Naive B cells
+    - Memory B cells
+    - Age-associated B cells
+    - Follicular B cells
+
+  Plasma_cell:
+    - Plasma cells
+    - Plasmablasts
+
+  Monocyte:
+    - Classical monocytes
+    - Non-classical monocytes
+    - Intermediate monocytes
+    - Monocytes
+
+  Macrophage:
+    - Macrophages
+    - Alveolar macrophages
+    - Kupffer cells
+    - Microglia
+
+  Dendritic_cell:
+    - DC
+    - DC1
+    - DC2
+    - pDC
+    - cDC1
+    - cDC2
+    - Migratory DCs
+
+  Platelet:
+    - Megakaryocytes/platelets
+    - Megakaryocytes
+    - Platelets
+
+  Erythrocyte:
+    - Erythrocytes
+    - Erythroid cells
+    - Megakaryocyte-erythroid progenitors
+
+  Endothelial:
+    - Endothelial cells
+    - Vascular endothelial cells
+    - Lymphatic endothelial cells
+
+  Epithelial:
+    - Epithelial cells
+    - Basal cells
+    - Suprabasal cells
+
+  Fibroblast:
+    - Fibroblasts
+    - Myofibroblasts
+    - Stromal cells
+
+  Proliferating:
+    - Proliferating cells
+    - Proliferating T cells
+    - Proliferating NK cells
+    - Proliferating B cells
+    - Proliferating monocytes

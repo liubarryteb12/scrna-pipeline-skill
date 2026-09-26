@@ -657,14 +657,27 @@ def run_all(cfg: dict, only: list = None) -> int:
                    " —— marker 打分仍在，但少了第二条独立证据"),
     })
     if ct.get("status") == "ok":
+        # **"恒为 0 的一致率"必须显示成红的**（审计 S3 / 台账 E-58）。
+        # 两个词表不相交时字符串全等恒为 0，而它看起来像一个结论
+        # （"两条路完全不一致"），实际只是词表没映射。
+        # 所以判据分三层：没对比 → 红；有对比但**一个簇都没映射上** → 红
+        # （映射表缺了或过时了，正是旧缺陷的形态）；有映射 → 报真的一致率。
+        _cmp_ok = bool(ct_cmp.get("compared"))
+        _n_map = ct_cmp.get("n_mapped")
+        _no_map = _cmp_ok and (_n_map == 0) and (ct_cmp.get("n_clusters") or 0) > 0
         checks.append({
             "item": "CellTypist 与 marker 注释的一致性已量化（§2.4）",
-            "ok": bool(ct_cmp.get("compared")), "required": False,
-            "detail": (f"簇层面一致 {ct_cmp.get('n_agree_exact')}/"
-                       f"{ct_cmp.get('n_clusters')}"
-                       f"（{ct_cmp.get('agreement_frac')}）"
-                       if ct_cmp.get("compared") else
-                       f"**未对比**：{ct_cmp.get('reason')}"),
+            "ok": _cmp_ok and not _no_map, "required": False,
+            "detail": (
+                f"簇层面一致 {ct_cmp.get('n_agree_mapped')}/{_n_map}"
+                f"（{ct_cmp.get('agreement_frac_mapped')}）"
+                f"；{ct_cmp.get('n_unmapped')} 个簇的词表无映射，不计入分母"
+                if _cmp_ok and not _no_map else
+                (f"**{ct_cmp.get('n_clusters')} 个簇一个都没映射上** —— "
+                 f"`{ct_cmp.get('mapping_source')}` 缺条目或词表已变；"
+                 "此时字符串全等恒为 0，**不能读成『两条路不一致』**"
+                 if _no_map else
+                 f"**未对比**：{ct_cmp.get('reason')}")),
         })
 
     cm = read_json(res_dir / "communication_status.json") or {}

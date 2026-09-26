@@ -51,8 +51,24 @@ def aggregate_pseudobulk(adata, sample_key: str, celltype_key: str):
     **必须用 counts layer，不能用 X。** X 已经 normalize + log1p 过，
     而 DESeq2 的负二项模型要求原始计数 —— 把 log 值喂进去不会报错，
     只会给出错的离散度估计。
+
+    **没有 counts 层时不再静默退回 `adata.X`**（审计 S6）：原实现
+    docstring 写着"必须用 counts"，下一行却 `else adata.X` 且不留任何
+    记录 —— 于是「这一轮的离散度估计不可信」这件事在产物里完全看不见。
+    现在返回一个 `counts_source` 说明，由调用方判成失败。
     """
-    X = adata.layers["counts"] if "counts" in adata.layers else adata.X
+    has_counts = "counts" in adata.layers
+    if not has_counts:
+        # 不在这里抛异常：调用方要把这件事**写进 status** 再决定怎么办，
+        # 抛出去会被 `__main__` 的 except 记成步骤崩溃，反而看不出根因。
+        return None, None, {
+            "reason": ("`clustered.h5ad` 没有 `layers['counts']` —— "
+                       "DESeq2 的负二项模型要求原始计数，喂 log 值不会报错"
+                       "但离散度估计是错的。**拒绝用 `.X` 冒充计数**；"
+                       "请确认上游 `01_qc` / `02_integrate` 保留了 counts 层"),
+            "counts_source": "missing",
+        }
+    X = adata.layers["counts"]
     X = X.toarray() if sparse.issparse(X) else np.asarray(X)
 
     obs = adata.obs[[sample_key, celltype_key]].copy()
@@ -70,11 +86,13 @@ def aggregate_pseudobulk(adata, sample_key: str, celltype_key: str):
 
     if not mats:
         return None, None, {"reason": f"没有任何 (样本, 细胞类型) 组合达到 "
-                                      f"{MIN_CELLS_PER_PSEUDOBULK} 个细胞"}
+                                      f"{MIN_CELLS_PER_PSEUDOBULK} 个细胞",
+                            "counts_source": "layers['counts']"}
     keys = list(mats)
     mat = np.vstack([mats[k] for k in keys]).astype(np.float64)
     meta = pd.DataFrame(meta).set_index(pd.Index([f"{s}|{ct}" for s, ct in keys]))
-    return mat, meta, {"n_pseudobulk_samples": len(keys)}
+    return mat, meta, {"n_pseudobulk_samples": len(keys),
+                       "counts_source": "layers['counts']"}
 
 
 def run_04_pseudobulk_de(cfg: dict) -> dict:
@@ -125,7 +143,12 @@ def run_04_pseudobulk_de(cfg: dict) -> dict:
 
     mat, meta, agg = aggregate_pseudobulk(adata, sample_key, celltype_key)
     if mat is None:
-        status.update({"status": "no_usable_pseudobulk", **agg})
+        # `counts_source == "missing"` 是**上游契约被破坏**，不是"这批数据
+        # 不适合做拟bulk" —— 两者必须长得不一样（审计 S6）。
+        if agg.get("counts_source") == "missing":
+            status.update({"status": "missing_counts", **agg})
+        else:
+            status.update({"status": "no_usable_pseudobulk", **agg})
         log_warn(f"拟bulk 不可行: {agg['reason']}")
         write_json(res_dir / "pseudobulk_status.json", status)
         return status
@@ -139,6 +162,7 @@ def run_04_pseudobulk_de(cfg: dict) -> dict:
     from pydeseq2.ds import DeseqStats
 
     results, skipped = [], []
+    contrasts_used = {}
     for ct, sub in meta.groupby("celltype", observed=True):
         if sub["group"].nunique() < 2:
             skipped.append({"celltype": ct, "reason": "只有一个分组取值"})
@@ -160,21 +184,47 @@ def run_04_pseudobulk_de(cfg: dict) -> dict:
                            columns=adata.var_names)
         # DESeq2 不接受全零基因
         cts = cts.loc[:, cts.sum(axis=0) > 0]
-        coldata = pd.DataFrame({"group": sub["group"].values}, index=sub.index)
+
+        # ---- contrast 的分子/分母必须**显式定死**，不能靠行序（审计 S5）----
+        #
+        # 原实现 `str(sub["group"].unique()[0])` 取的是「第一次出现的取值」，
+        # 而 `sub` 的顺序来自 `meta.groupby(...)` —— 也就是 obs 的行序。
+        # **重排细胞顺序会让全部 log2FoldChange 变号，而 padj 一个都不变**
+        # （对比方向翻转是符号对称的），产物看起来完全正常。
+        #
+        # 所以这里把分组水平按**排序后的字典序**定死（可复现、与行序无关），
+        # 再把 numerator / reference 都记进 status 供事后核对。
+        levels = sorted(sub["group"].astype(str).unique())
+        if ref_group is not None and str(ref_group) not in levels:
+            # 指定的参考组在这个细胞类型里不存在 —— DESeq2 会抛错，
+            # 而原实现的 `except` 会把它吞成 skipped（审计 M20）。
+            # 这里显式记成"跳过 + 原因"，与"算失败"区分开。
+            skipped.append({
+                "celltype": ct,
+                "reason": (f"指定的 reference_group='{ref_group}' 在该细胞类型里"
+                           f"不存在（实际水平: {levels}）")})
+            log_warn(f"  {ct} 跳过：reference_group='{ref_group}' 不在 {levels}")
+            continue
+        numerator = levels[-1] if ref_group is None else [
+            lv for lv in levels if lv != str(ref_group)][0]
+        reference = levels[0] if ref_group is None else str(ref_group)
+        coldata = pd.DataFrame({"group": sub["group"].astype(str).values},
+                               index=sub.index)
 
         try:
             dds = DeseqDataSet(counts=cts, metadata=coldata, design="~group",
                                refit_cooks=True, quiet=True)
             dds.deseq2()
-            stat = DeseqStats(dds, contrast=["group", str(sub["group"].unique()[0]),
-                                             str(ref_group) if ref_group else
-                                             str(sub["group"].unique()[-1])],
+            stat = DeseqStats(dds, contrast=["group", numerator, reference],
                               quiet=True)
             stat.summary()
             df = stat.results_df.reset_index().rename(columns={"index": "gene"})
             df.insert(0, "celltype", ct)
             results.append(df)
+            contrasts_used[ct] = {"numerator": numerator, "reference": reference,
+                                  "levels": levels}
             log_info(f"  {ct}: {len(sub)} 个拟bulk 样本, "
+                     f"contrast={numerator} vs {reference}, "
                      f"{(df['padj'] < 0.05).sum() if 'padj' in df else 0} 个 padj<0.05")
         except Exception as e:  # noqa: BLE001
             skipped.append({"celltype": ct, "reason": f"{type(e).__name__}: {e}"})
@@ -193,6 +243,14 @@ def run_04_pseudobulk_de(cfg: dict) -> dict:
     status.update({
         "sample_key": sample_key, "group_key": group_key,
         "celltype_key": celltype_key, "reference_group": ref_group,
+        # 实际用到的对比方向（审计 S5）：没有它就无法事后核对
+        # `log2FoldChange` 的符号指的是哪个方向。
+        "contrast_used": contrasts_used,
+        "contrast_rule": ("分组水平按**字典序**定死；`reference_group` 为空时"
+                          "numerator=最大的水平、reference=最小的水平。"
+                          "**不看 obs 行序** —— 旧实现取 `unique()[0]`，"
+                          "重排细胞会让全部 log2FoldChange 变号而 padj 不变"),
+        "counts_source": agg.get("counts_source", "layers['counts']"),
         "min_cells_per_pseudobulk": MIN_CELLS_PER_PSEUDOBULK,
         "min_replicates_per_group": MIN_REPLICATES_PER_GROUP,
         "n_pseudobulk_samples": int(mat.shape[0]),

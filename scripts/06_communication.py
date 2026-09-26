@@ -312,6 +312,8 @@ def run_06_communication(cfg: dict) -> dict:
         return float(a * b)
 
     rows = []
+    n_evaluated = 0        # 真正做过置换检验的组合数
+    n_zero_dropped = 0     # 打分恒为 0、未做置换的组合数
     for pr in present:
         for src in groups:
             for dst in groups:
@@ -319,6 +321,22 @@ def run_06_communication(cfg: dict) -> dict:
                     continue
                 obs_score = score(pr["ligand"], pr["receptor"], masks[src], masks[dst])
                 if obs_score <= 0:
+                    # **零分组合仍要进 `rows`（审计 S4 / 台账 E-58）。**
+                    # 原实现 `continue` 掉它们，于是 BH 的分母是 649 而非
+                    # 1134 —— 检验家庭被**预过滤**缩小约 43%，`p_adj_bh`
+                    # 系统性偏小、`n_significant_bh` 上偏，方向恰好与
+                    # 下面注释说的"校正组合数多导致的假阳性"相反。
+                    # 零分的观测值本就无法被任何置换超越，`p = 1.0` 是
+                    # 它在这个检验家庭里的正确取值。
+                    n_zero_dropped += 1
+                    rows.append({
+                        "pair": pr["name"], "sender": src, "receiver": dst,
+                        "ligand": ",".join(pr["ligand"]),
+                        "receptor": ",".join(pr["receptor"]),
+                        "score": 0.0, "null_mean": None,
+                        "p_value": 1.0, "n_permutations": 0,
+                        "tested": False,
+                    })
                     continue
                 # 置换：打乱细胞标签，看这个分数有多容易随机出现
                 n_s, n_d = int(masks[src].sum()), int(masks[dst].sum())
@@ -328,11 +346,13 @@ def run_06_communication(cfg: dict) -> dict:
                     null[i] = score(pr["ligand"], pr["receptor"],
                                     perm[:n_s], perm[n_s:n_s + n_d])
                 p = float((np.sum(null >= obs_score) + 1) / (N_PERMUTATIONS + 1))
+                n_evaluated += 1
                 rows.append({
                     "pair": pr["name"], "sender": src, "receiver": dst,
                     "ligand": ",".join(pr["ligand"]), "receptor": ",".join(pr["receptor"]),
                     "score": round(obs_score, 5), "null_mean": round(float(null.mean()), 5),
                     "p_value": round(p, 5), "n_permutations": N_PERMUTATIONS,
+                    "tested": True,
                 })
 
     if not rows:
@@ -347,11 +367,16 @@ def run_06_communication(cfg: dict) -> dict:
 
     # 多重检验：这里报 BH 校正后的值。**不校正的话几百个组合里
     # 一定有一堆 p<0.05，而那只是组合数多。**
+    #
+    # **检验家庭 = 全部被评估过的组合，含零分那些。** 把 `obs_score <= 0`
+    # 的组合排除在外会让分母凭空变小、`p_adj_bh` 系统性偏小（审计 S4）。
+    # 零分组合的 `p_value` 已按 1.0 填入（见上面 `continue` 前的分支）。
     from statsmodels.stats.multitest import multipletests
     res["p_adj_bh"] = multipletests(res["p_value"], method="fdr_bh")[1].round(5)
     res.to_csv(res_dir / "cell_communication.csv", index=False)
     n_sig = int((res["p_adj_bh"] < 0.05).sum())
-    log_info(f"通讯打分: {len(res)} 个 (配体受体, 发送, 接收) 组合，"
+    log_info(f"通讯打分: {len(res)} 个 (配体受体, 发送, 接收) 组合"
+             f"（{n_evaluated} 个做了置换检验，{n_zero_dropped} 个打分恒为 0），"
              f"BH 校正后 {n_sig} 个 p<0.05")
 
     # 热图：配体-受体对 x 接收细胞类型 的总分
@@ -422,7 +447,15 @@ def run_06_communication(cfg: dict) -> dict:
                           "几乎不进 HVG —— 实测在 HVG 子集上 38 对里只有 3 对可用，"
                           "全基因集上是 27 对，差 9 倍"),
         "n_combinations": int(len(res)),
+        "n_combinations_tested": n_evaluated,
+        "n_combinations_zero_score": n_zero_dropped,
         "n_significant_bh": n_sig,
+        "bh_family_note": ("**BH 的检验家庭 = 全部被评估的组合"
+                           f"（{len(res)} 个），含打分为 0 的 "
+                           f"{n_zero_dropped} 个**（它们的 p 记为 1.0）。"
+                           "旧实现把零分组合 `continue` 掉，分母只剩 "
+                           f"{n_evaluated} 个，`p_adj_bh` 系统性偏小"
+                           "（审计 S4）"),
         "n_permutations": N_PERMUTATIONS,
         "top_pairs": df_to_records(res.head(15)),
         "liana": liana_info,

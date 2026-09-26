@@ -72,14 +72,29 @@ def run_scrublet(adata, cfg: dict) -> dict:
                 "fix": "pip install scikit-image"}
 
     try:
-        # scrublet 的期望双细胞率：10x 数据常见 5%-10%。用细胞数反推，
-        # 但不低于 0.05 —— 小数据上用默认 0.05 会让阈值不稳。
+        # scrublet 的期望双细胞率：**按 10x 装载量的经验式反推**（审计 S9）。
+        #
+        # 旧实现写的是 `np.clip(5000 / n * 0.01, 0.05, 0.10)`，注释说
+        # "用细胞数反推" —— 但 `5000/n*0.01` 只在 `500 <= n <= 1000`
+        # 区间内才落进夹取范围，**n > 1000 时恒被下界截断到 0.05**，
+        # 反推从不发生。pbmc3k 实测 n=2652、算出 0.01885、夹成 0.05，
+        # 而 10x 经验值约 0.8%/1000 细胞 → 2652 细胞约 2.1%，
+        # **高估一倍以上**，scrublet 阈值因此偏保守、`predicted_doublet` 偏少。
+        #
+        # 现在两个数都记进 status，读者能看见差距而不是相信一个注释。
         n = adata.n_obs
-        rate = float(np.clip(5000 / max(n, 1) * 0.01, 0.05, 0.10))
+        rate = float(np.clip(0.008 * n / 1000.0, 0.01, 0.10))
+        rate_old_rule = float(np.clip(5000 / max(n, 1) * 0.01, 0.05, 0.10))
         sc.pp.scrublet(adata, expected_doublet_rate=rate, random_state=cfg["analysis"]["seed"])
         n_db = int(adata.obs["predicted_doublet"].sum())
         return {"status": "ok",
                 "expected_doublet_rate": round(rate, 4),
+                "expected_doublet_rate_10x_rule": round(0.008 * n / 1000.0, 5),
+                "expected_doublet_rate_old_rule": round(rate_old_rule, 4),
+                "rate_rule_note": ("`expected_doublet_rate` 按 10x 经验式 "
+                                   "0.008 x n/1000 反推，夹在 [0.01, 0.10]；"
+                                   "`expected_doublet_rate_old_rule` 是旧公式"
+                                   "（n>1000 时恒为下限 0.05）的值，留作对照"),
                 "n_predicted_doublets": n_db,
                 "frac_predicted_doublets": round(n_db / max(n, 1), 5)}
     except Exception as e:  # noqa: BLE001

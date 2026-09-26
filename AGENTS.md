@@ -1022,6 +1022,130 @@ result_status=result_status_of(res))`；`except` 分支加 `result_status="faile
 台账：`governance/15_ERROR_LEDGER.md` E-56；任务行 `governance/02_TASKLIST.md` R-03。
 标定脚本：`D:\tmp\_s1\calib_e56.py`（正向 + 反向 19 类注入 + 回退版对照）。
 
+## 28. 九条"看起来在算、其实没在算"的缺陷（E-58，2026-09-26）
+
+R-03 第二批复核的是审计严重项 S2–S10。九条里 **7 条读码确认成立、1 条（S8）
+被实测否证、1 条（S3）根因比审计写的更具体**。共同点是：**代码在跑、产物齐全、
+状态全绿，但那个量取不到它声称要取的信息。**
+
+### 28.1 "恒为 0 / 恒为真"的量比没有这个量更糟
+
+`scripts/03_cluster_annotate.py` 的 `compare_annotations()` 原来做
+`str(own[c]).lower() == str(maj[c]).lower()`。marker 词表来自
+`assets/celltype_markers.yml`（`T_cell`/`Platelet`），CellTypist 词表来自模型
+（`Tcm/Naive helper T cells`/`Megakaryocytes/platelets`）—— **两套词表没有任何
+一个字符串相等**，于是 `n_agree_exact: 0 / agreement_frac: 0.0` 恒成立。而逐簇看
+`B_cell`↔`B cells`、`Platelet`↔`Megakaryocytes/platelets`、`Monocyte`↔
+`Classical monocytes` 明显一致。
+
+**一个恒为 0 的量看起来像一个结论（"两条路完全不一致"），实际只是词表不相交。**
+凡两套词表、两套坐标系、两个口径要对齐的地方，先跑一遍**看它到底能不能取到
+非平凡值**（同 Q-27 的 `figures:dynamic` 按前缀计数恒真）。
+
+处置：新增 `assets/celltype_mapping.yml` + `load_celltype_mapping()`；没有映射的
+簇**不进分母**、单独列 `unmapped`（猜一个映射等于把"我没定义"伪装成"不一致"）；
+字段改名带 `mapped`（`n_mapped`/`n_unmapped`/`n_agree_mapped`/
+`agreement_frac_mapped`），**旧字段名一并删除**，避免读者混用两个分母。消费侧
+`scripts/main_analysis.py` 分三层判：没对比 → 红；有对比但 `n_mapped == 0` → 红
+（映射表缺条目或词表已变，正是旧缺陷的形态）；有映射 → 报真的一致率。
+
+### 28.2 注释写着正确做法、下一行做了相反的事（三处）
+
+| 位置 | 注释说 | 代码做 |
+|---|---|---|
+| `scripts/01_qc.py:78` | "用细胞数反推期望双细胞率" | `clip(5000/n*0.01, 0.05, 0.10)` 在 n>1000 时**恒被下界截断到 0.05**，那个行为从不发生 |
+| `scripts/00_fetch.py:147` | "判断整个 `X` 是不是计数" | `X[:min(200, X.shape[0]), :]` 只抽前 200 行 |
+| `scripts/04_pseudobulk_de.py` | "必须用 counts layer，不能用 `X`" | `layers["counts"] if "counts" in layers else adata.X` 静默退回 log 值 |
+
+三处的共同后果都是**产物里完全看不见**：scrublet 阈值偏保守、`predicted_doublet`
+偏少（pbmc3k n=2652 实测新式 0.02122 vs 旧式 0.05000，**高估一倍以上**）；计数校验
+在数据按样本拼接时可能给出 `is_counts: True` 而整体不是计数 —— 而这是下游全部
+方法学的前提；喂 log 值给 DESeq2 不报错，只给错的离散度估计。
+
+写注释时问一句：**"这行代码真的会走到我说的那条路吗？"** 尤其 `clip` 的上下界、
+`if/else` 的两个分支、`[:200]` 这类抽样切片。
+
+处置：S9 改 10x 经验式 `clip(0.008*n/1000.0, 0.01, 0.10)` 并把**旧公式的值一并
+记进 status**（`expected_doublet_rate_old_rule`）—— 让读者看见差距，而不是相信
+一个注释；S10 改为**抽两批且抽法必须不同**（等距抽样作主判据 + 中段连续抽样作
+交叉核对），两批占比差 >1 个百分点即判 `sampling_consistent: False`；S6 没有
+counts 层时返回 `counts_source: "missing"` 而非退回，调用侧判成独立状态
+**`missing_counts`**（上游契约被破坏，与"这批数据不适合做拟bulk"必须长得不一样）。
+
+### 28.3 检验家庭不能被任何"预过滤"缩小
+
+`scripts/06_communication.py:321` 原来 `if obs_score <= 0: continue` —— 零分组合
+根本不进 `rows`，于是 `multipletests` 的分母是"打分 > 0 的组合"而非"全部被评估的
+组合"。实测 pbmc3k 上分母 649 vs 1134，**检验家庭缩小约 43%**，`p_adj_bh` 系统性
+偏小、`n_significant_bh` 上偏 —— 方向恰好与紧邻注释所担心的"校正组合数多导致的
+假阳性"**相反**。
+
+处置：零分组合仍进 `rows`，`p_value` 记 **1.0**（零分的观测值本就无法被任何置换
+超越，1.0 是它在检验家庭里的正确取值），另加 `tested` 布尔列区分"做过置换"与
+"恒为 0"。凡多重检验，**分母必须是"被评估过的全部假设"**。
+
+### 28.4 方向/符号不能靠数据行序决定
+
+`scripts/04_pseudobulk_de.py:169` 原来写 `str(sub["group"].unique()[0])` 当分子 ——
+取的是"**第一次出现的取值**"，而 `sub` 的顺序来自 `meta.groupby(...)`，即 obs
+行序。**重排细胞顺序会让全部 `log2FoldChange` 变号，而 `padj` 一个都不变**（对比
+方向翻转是符号对称的），产物看起来完全正常。
+
+同类：`05_trajectory.py:439-444` 的共识拟时序把 `cytotrace` 也算进去了，而
+`direction_source == "cytotrace_fallback"` 时 **`cytotrace` 正是方向参考**（`:417`）
+—— 同一文件在 `:414-425` 算方法间一致性时**正确地把参考排除了**，算共识时却没有，
+**参考方法既定了方向、又参与共识，等于自己给自己投票**。产物证据：
+`trajectory_direction.csv` 四个方法的原始 rho **全为负、全部被翻转**，即"方向修正"
+在做全部的工作。
+
+处置：S5 分组水平按 `sorted()` **字典序**定死（可复现、与行序无关），分子/分母拆成
+显式变量，实际对比方向写进 `status["contrast_used"]` + `contrast_rule`；S7 共识改用
+`consensus_names = cv_names if cv_names else names`（与一致性统计同口径），并**同时
+算一个含参考方法的共识**供对比、把两者 rho 写进 `consensus_vs_with_reference_rho`
+—— "差多少"本身就是信息。
+
+### 28.5 审计报告也会错：落修法前先证伪
+
+审计称 `scripts/07_grn.py:164` 的 `corr[top[:len(targets)]].mean()` 与 `targets`
+错位（`top` 是位置数组、`targets` 是名字列表）。**实测证明不会**：
+`top = np.argsort(corr)[::-1][:N_TARGETS]` 是**按 corr 降序**排的，所以
+`corr[k] > 0` 这个过滤必然保留 `top` 的一个**前缀** —— `top[:len(targets)]` 与
+`[k for k in top if corr[k] > 0]` **恒等**。两万次随机对拍（含 `-inf` 自排除、
+含并列值、含三种尺度）**零次不等**（`0/19944`）。
+
+处置：仍改成 `np.mean([w for _, w in pairs])`（等价、更钝 —— 不依赖"降序 → 前缀"
+这个推理，以后若有人把排序改成升序或改成按 p 值选，这里不会跟着错），并在源码
+注释里**写明审计前提不成立**，防止后人照审计报告改回去。
+
+**"读码推断"不等于"跑一遍对拍"**，尤其当论断依赖"某个数组的排序性质"时。
+
+### 28.6 marker 基因宇宙错位（S2）
+
+`scripts/03_cluster_annotate.py:71` 原来用 `adata.var_names` 过滤签名基因，而
+**同一函数下一段用 `use_raw=True` 打分** —— `adata` 此时只剩 2000 HVG，
+CD3D/CD8A/CD14 这类**在数据里真实存在、只是没进 HVG** 的 marker 被判成"缺失"，
+签名被削到无法区分（实测簇 1/簇 3 的 `T_cell` 与 `CD4_T` 分数逐位相同、margin
+恰为 0.0）。**同一个文件 `:385` 的 dotplot 已经用的是 `adata.raw.var_names`。**
+
+处置：改用 `raw_names = set(adata.raw.var_names) if adata.raw is not None else
+hvg_names`，并把诊断拆成两个字段：`missing_markers`（数据里真的没有）vs
+`not_in_hvg`（有、只是没进 HVG）—— **合并成一个字段会让"签名被 HVG 削弱"和
+"这批数据没测到"看起来一样**。
+
+### 28.7 四条规则
+
+1. **"恒为 0 / 恒为真"的量比没有这个量更糟** —— 它看起来像结论。新写一个
+   比例、一致率、覆盖率时，先跑一遍确认它**能取到非平凡值**。
+2. **注释陈述的行为必须与代码实际行为对得上** —— 逐条检查 `clip` 的边界、
+   `if/else` 的两个分支、抽样切片的范围。
+3. **多重检验的分母是"被评估过的全部假设"** —— 任何 `continue` 掉一批样本
+   再算 FDR 的写法，等价于偷偷改分母。
+4. **方向/符号来自显式排序，不来自数据行序** —— `unique()[0]`、`head(1)`、
+   `groupby` 首元素都不行；且要把实际用到的方向写进产物。
+
+台账：`governance/15_ERROR_LEDGER.md` E-58；任务行 `governance/02_TASKLIST.md` R-03。
+标定脚本：`D:\tmp\_s2\calib_s2_s10.py`（每条都配"回退版必须抓不到"的对照，34 项全过）。
+
 
 
 

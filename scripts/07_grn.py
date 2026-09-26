@@ -162,7 +162,18 @@ def run_07_grn(cfg: dict) -> dict:
             "tf": tf,
             "n_targets": len(targets),
             "top_targets": ",".join(targets[:12]),
-            "mean_corr": round(float(corr[top[:len(targets)]].mean()), 4),
+            # **从 `pairs` 取权重，不按位置切片 `corr`。**
+            #
+            # 审计 S8 说 `corr[top[:len(targets)]].mean()` 会与 `targets` 错位，
+            # **实测证明不会**：`top` 是按 `corr` **降序**排的，所以
+            # `corr[k] > 0` 这个过滤必然保留 `top` 的一个**前缀** ——
+            # `top[:len(targets)]` 与 `[k for k in top if corr[k] > 0]`
+            # 恒等。两万次随机对拍（含 `-inf` 自排除与并列值）零次不等。
+            #
+            # 但写法上按名字取更直接：它**不依赖"降序 → 前缀"这个推理**，
+            # 以后若有人把排序改成升序或改成按 p 值选，这里不会跟着错。
+            # 等价、更钝，所以保留。
+            "mean_corr": round(float(np.mean([w for _, w in pairs])), 4),
             "best_cluster": best,
             "best_cluster_activity": round(per_cluster[best], 4),
             "cluster_specificity": round(spec, 3),

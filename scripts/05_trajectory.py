@@ -438,12 +438,34 @@ def run_05_trajectory(cfg: dict) -> dict:
     save_fig(cfg, "02-05-02-unit1-trajectory-method-correlation", fig)
 
     # 共识拟时序：各方法 z-score 后取均值（方向已统一）
+    #
+    # **共识不能包含方向参考本身**（审计 S7）。退回模式下方向参考就是
+    # CytoTRACE，它既定了所有方法的符号、又与自己的相关恒为 ±1 ——
+    # 把它算进共识，等于让"定义了方向的那个方法"再投一次票。
+    # 上面算交叉验证一致性时已经排除了它（`cv_names`），共识必须同口径，
+    # 否则两个数讲的是两件不同的事。
+    consensus_names = cv_names if cv_names else names
     Z = np.column_stack([
         (corrected[n] - np.nanmean(corrected[n])) / (np.nanstd(corrected[n]) + 1e-12)
-        for n in names
+        for n in consensus_names
     ])
     consensus = np.nanmean(Z, axis=1)
-    log_info(f"共识拟时序完成；方法间平均 rho={mean_rho:+.4f}，最低 {min_rho:+.4f}")
+    # 同时算一个**含参考方法**的共识，供对比：两者差多少本身就是信息
+    if len(consensus_names) < len(names):
+        Z_all = np.column_stack([
+            (corrected[n] - np.nanmean(corrected[n])) / (np.nanstd(corrected[n]) + 1e-12)
+            for n in names
+        ])
+        consensus_with_ref = np.nanmean(Z_all, axis=1)
+        rho_ref = float(np.nan_to_num(spearmanr(consensus, consensus_with_ref).correlation))
+    else:
+        consensus_with_ref, rho_ref = None, None
+    log_info(f"共识拟时序完成（用 {len(consensus_names)} 个方法: "
+             f"{', '.join(consensus_names)}"
+             + (f"；已排除方向参考 {reference_method}" if reference_method else "")
+             + "）；方法间平均 rho="
+             f"{mean_rho:+.4f}，最低 {min_rho:+.4f}"
+             + (f"；含参考方法的共识与它 rho={rho_ref:+.4f}" if rho_ref is not None else ""))
 
     # ---- 6. 沿轨迹变化的基因 ------------------------------------------------
     genes_rows, gene_mat, gene_names, gene_rho = [], None, [], None
@@ -779,6 +801,14 @@ def run_05_trajectory(cfg: dict) -> dict:
         limitations.append(
             f"**方法间一致性偏低（平均 rho={mean_rho:+.3f}）**："
             "各算法对同一数据给出了差异较大的排序，此时不该报单一「轨迹」")
+    limitations.append(
+        f"**共识拟时序用的是 {len(consensus_names)} 个方法（{', '.join(consensus_names)}）"
+        + (f"，已排除方向参考 {reference_method}" if reference_method else "")
+        + "。** 共识是各方法 z-score 后的等权均值 —— z-score 只把尺度归一化到 1，"
+          "**不改变分布形状**，所以分辨率高（分布更极端）的方法在共识里权重更大，"
+          "这不是严格的等权平均"
+        + (f"；含参考方法的共识与它 rho={rho_ref:+.4f}（两者差多少本身是信息）"
+           if rho_ref is not None else ""))
 
     status = {
         "dataset_id": cfg["dataset_id"],
@@ -797,6 +827,11 @@ def run_05_trajectory(cfg: dict) -> dict:
             columns={"index": "method"})),
         "direction_reference_method": reference_method,
         "cross_validated_methods": cv_names,
+        # 共识**用了哪些方法**（审计 S7）：不含方向参考，与 cv_names 同口径。
+        "consensus_methods": consensus_names,
+        "consensus_excludes_direction_reference": bool(reference_method),
+        "consensus_vs_with_reference_rho": (round(rho_ref, 4)
+                                            if rho_ref is not None else None),
         "method_correlation_mean_offdiag": round(mean_rho, 4),
         "method_correlation_min_offdiag": round(min_rho, 4),
         "method_correlation_note": (

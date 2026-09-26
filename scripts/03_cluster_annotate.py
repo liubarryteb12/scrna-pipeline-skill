@@ -62,12 +62,26 @@ def score_celltypes(adata, sig) -> tuple:
     "T 细胞 0.31 vs 上皮 0.02"报成同一个结论，而它们完全不同。
     """
     celltypes = sig["celltypes"]
-    present, missing = {}, {}
+    # **签名基因必须在 `adata.raw` 的基因宇宙里找，不是 `adata.var_names`。**
+    # 本函数用 `use_raw=True` 打分（下一段的 `score_genes`），而 `adata` 此时
+    # 只剩 2000 HVG —— 用 `var_names` 过滤会把 CD3D/CD8A/CD14 这类**在数据里
+    # 真实存在、只是没进 HVG** 的 marker 判成"缺失"，签名被削到无法区分
+    # （实测簇 1/簇 3 的 T_cell 与 CD4_T 分数逐位相同、margin 恰为 0.0）。
+    # 同一个文件 `:385` 的 dotplot 已经用的是 `adata.raw.var_names`。
+    hvg_names = set(adata.var_names)
+    raw_names = set(adata.raw.var_names) if adata.raw is not None else hvg_names
+    present, missing_in_data, not_in_hvg = {}, {}, {}
     for ct, d in celltypes.items():
-        genes = [g for g in d.get("markers", []) if g in adata.var_names]
+        marks = list(d.get("markers", []))
+        genes = [g for g in marks if g in raw_names]
         if genes:
             present[ct] = genes
-        missing[ct] = [g for g in d.get("markers", []) if g not in adata.var_names]
+        miss = [g for g in marks if g not in raw_names]
+        if miss:
+            missing_in_data[ct] = miss
+        nh = [g for g in marks if g in raw_names and g not in hvg_names]
+        if nh:
+            not_in_hvg[ct] = nh
 
     if not present:
         return None, None, {"reason": "签名里的基因一个都不在数据里"}
@@ -100,7 +114,11 @@ def score_celltypes(adata, sig) -> tuple:
     diag = {
         "n_celltypes_scored": len(present),
         "celltypes": sorted(present.keys()),
-        "missing_markers": {k: v for k, v in missing.items() if v},
+        # **两个字段刻意分开**（审计 S2）：`missing_in_data` = 数据里真的没有，
+        # `not_in_hvg` = 数据里有、只是没进 2000 HVG。合并成一个字段会让
+        # "签名基因被 HVG 过滤削弱"看起来和"这批数据没测到这些基因"一样。
+        "missing_markers": {k: v for k, v in missing_in_data.items()},
+        "not_in_hvg": {k: v for k, v in not_in_hvg.items()},
         "n_clusters_low_margin": int((~assign["assignment_confident"]).sum()),
     }
     return per_cell, assign, diag
@@ -241,16 +259,36 @@ def try_celltypist(adata, cfg: dict, log=log_info):
         return None, info
 
 
+def load_celltype_mapping() -> dict:
+    """读 `assets/celltype_mapping.yml`：marker 类型 → CellTypist 标签列表。
+
+    文件不存在时返回空字典（退化成"全部 unmapped"，**不猜映射**）。
+    """
+    p = Path(__file__).resolve().parent.parent / "assets" / "celltype_mapping.yml"
+    if not p.exists():
+        return {}
+    with open(p, encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh) or {}
+    raw = doc.get("map") or {}
+    return {str(k): [str(x) for x in (v or [])] for k, v in raw.items()}
+
+
 def compare_annotations(assign: pd.DataFrame, ct_labels, adata, log=log_info) -> dict:
     """量化 marker 打分与 CellTypist 在**簇层面**的一致程度。
 
     簇层面的比较才有意义：marker 打分给的是每个簇一个标签，而
     CellTypist 给的是每个细胞一个标签。先按簇取众数再比。
+
+    **两个词表不相交，必须先过映射表再比。** 原来直接做字符串全等，
+    实测恒为 `0/10` —— 而逐簇看 `B_cell` ↔ `B cells`、`Platelet` ↔
+    `Megakaryocytes/platelets` 明明一致。**没有映射的簇不参与分母**，
+    单独列 `unmapped`：猜一个映射等于把"我没定义"伪装成"不一致"。
     """
     out = {"compared": False}
     if assign is None or ct_labels is None:
         return out
     try:
+        mapping = load_celltype_mapping()
         df = pd.DataFrame({
             "cluster": adata.obs["leiden"].astype(str).values,
             "celltypist": ct_labels.reindex(adata.obs_names).values,
@@ -262,22 +300,44 @@ def compare_annotations(assign: pd.DataFrame, ct_labels, adata, log=log_info) ->
                     .agg(lambda s: float(s.value_counts().iloc[0] / len(s))))
         own = dict(zip(assign["cluster"].astype(str), assign["assigned"]))
         common = sorted(set(own) & set(maj.index))
-        agree = [c for c in common if str(own[c]).lower() == str(maj[c]).lower()]
+
+        rows, mapped, unmapped = [], [], []
+        for c in common:
+            ours, theirs = str(own[c]), str(maj[c])
+            allowed = mapping.get(ours)
+            if allowed is None:
+                # 词表里没有这个 marker 类型的映射 —— 不参与分母
+                unmapped.append({"cluster": c, "marker_signature": ours,
+                                 "celltypist_majority": theirs})
+                agree = None
+            else:
+                agree = theirs in allowed
+                mapped.append(c)
+            rows.append({
+                "cluster": c, "marker_signature": ours,
+                "celltypist_majority": theirs,
+                "celltypist_purity": round(float(purity[c]), 3),
+                "agree": agree,
+            })
+
+        agree_n = sum(1 for r in rows if r["agree"] is True)
         out.update({
             "compared": True,
             "n_clusters": len(common),
-            "n_agree_exact": len(agree),
-            "agreement_frac": round(len(agree) / len(common), 3) if common else None,
-            "per_cluster": [
-                {"cluster": c, "marker_signature": str(own[c]),
-                 "celltypist_majority": str(maj[c]),
-                 "celltypist_purity": round(float(purity[c]), 3),
-                 "agree": str(own[c]).lower() == str(maj[c]).lower()}
-                for c in common
-            ],
+            "n_mapped": len(mapped),
+            "n_unmapped": len(unmapped),
+            "n_agree_mapped": agree_n,
+            # **分母是"有映射的簇"**，不是全部簇 —— 且字段名带 `mapped`，
+            # 避免读者把两个不同的分母混起来。
+            "agreement_frac_mapped": (round(agree_n / len(mapped), 3)
+                                      if mapped else None),
+            "unmapped": unmapped,
+            "mapping_source": "assets/celltype_mapping.yml",
+            "per_cluster": rows,
         })
-        log(f"两种注释在簇层面一致 {len(agree)}/{len(common)}"
-            f"（{out['agreement_frac']}）—— 不一致的簇值得人工看")
+        log(f"两种注释在簇层面一致 {agree_n}/{len(mapped)}"
+            f"（有映射的簇；{len(unmapped)} 个簇的词表无映射，不计入）"
+            "—— 不一致的簇值得人工看")
     except Exception as exc:  # noqa: BLE001
         out["reason"] = f"对比失败：{type(exc).__name__}: {exc}"
         log_warn(out["reason"])

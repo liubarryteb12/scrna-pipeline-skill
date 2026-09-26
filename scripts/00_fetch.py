@@ -139,30 +139,85 @@ def validate_counts(adata, cfg: dict) -> dict:
     **这是本步骤存在的理由。** 把已 normalize 的矩阵当计数喂进去，
     QC 指标失真、seurat_v3 HVG 前提被破坏、pseudobulk 的负二项模型不成立,
     而所有图和数字看起来都正常。
+
+    **抽查的是"跨全表的非零元素"，不是"前 200 个细胞"**（审计 S10）。
+    旧实现取 `X[:200, :]` —— 若数据按样本排序、前 200 个恰好来自某个
+    未归一化的样本，校验会给出 `is_counts: True` 而整体不是计数。
+    稀疏矩阵的零天然是整数，所以用非零值判整数性是**合理的**；
+    要修的是**抽样方式**：按行等距抽两批，两批结论一致才算数。
     """
     import numpy as np
     from scipy import sparse
 
     X = adata.X
-    sample = X[:min(200, X.shape[0]), :]
-    vals = sample.data if sparse.issparse(sample) else np.asarray(sample).ravel()
-    vals = vals[np.isfinite(vals)]
+    n_obs = int(X.shape[0])
+
+    def _vals_of(rows):
+        if rows.size == 0:
+            return np.array([])
+        sub = X[rows, :]
+        v = sub.data if sparse.issparse(sub) else np.asarray(sub).ravel()
+        return v[np.isfinite(v)]
+
+    def _strided(k: int = 200):
+        """跨全表等距抽 k 行 —— **主判据**。"""
+        if n_obs == 0:
+            return np.array([]), 0
+        step = max(1, n_obs // k)
+        rows = np.arange(0, n_obs, step)[:k]
+        return _vals_of(rows), int(rows.size)
+
+    def _contiguous(start: int, k: int = 200):
+        """从 `start` 起抽**连续** k 行 —— **交叉核对**。
+
+        两批必须抽法不同才有意义：若两批都是等距抽样，它们覆盖的是
+        同一批细胞，占比天然接近，`sampling_consistent` 就成了恒真的
+        摆设。连续块才能暴露"数据按样本拼接、各样本处理方式不同"——
+        那正是单看前 200 行会误判的场景。
+        """
+        if n_obs == 0:
+            return np.array([]), 0
+        rows = np.arange(start, min(start + k, n_obs))
+        return _vals_of(rows), int(rows.size)
+
+    vals, n_rows1 = _strided()
+    vals2, n_rows2 = _contiguous(n_obs // 2)
     if vals.size == 0:
-        return {"is_counts": False, "reason": "矩阵里没有有限值"}
+        return {"is_counts": False, "reason": "矩阵里没有有限值",
+                "n_cells_checked": 0}
 
     is_int = bool(np.allclose(vals, np.round(vals), atol=1e-8))
     min_v = float(vals.min())
     max_v = float(vals.max())
     frac_int = float(np.mean(np.isclose(vals, np.round(vals), atol=1e-8)))
 
-    ok = is_int and min_v >= 0
-    reason = ("非负整数 -> 判定为原始计数"
-              if ok else
-              f"**不是整数计数**（最小 {min_v:.4g}，最大 {max_v:.4g}，"
-              f"整数值占比 {frac_int:.1%}）—— 可能已经 normalize/log 过")
+    # 两批结论必须一致 —— 不一致说明数据内部不均匀（例如按样本拼接），
+    # 此时"是/不是计数"这个二值结论本身不可靠，要如实说出来。
+    frac_int2 = (float(np.mean(np.isclose(vals2, np.round(vals2), atol=1e-8)))
+                 if vals2.size else None)
+    consistent = (frac_int2 is None) or (abs(frac_int - frac_int2) < 0.01)
+
+    ok = is_int and min_v >= 0 and consistent
+    if not consistent:
+        reason = (f"**两批抽查结论不一致**（等距抽样整数值占比 {frac_int:.1%} vs "
+                  f"中段连续抽样 {frac_int2:.1%}）—— 数据可能按样本拼接且各样本"
+                  "处理方式不同，此时『是/不是计数』的二值判定不可靠")
+    elif ok:
+        reason = (f"非负整数 -> 判定为原始计数（跨 {n_obs} 个细胞等距抽 "
+                  f"{n_rows1} 行 + 中段连续抽 {n_rows2} 行，两批一致）")
+    else:
+        reason = (f"**不是整数计数**（最小 {min_v:.4g}，最大 {max_v:.4g}，"
+                  f"整数值占比 {frac_int:.1%}）—— 可能已经 normalize/log 过")
     return {"is_counts": ok, "reason": reason, "min": min_v, "max": max_v,
             "frac_integer": round(frac_int, 6),
-            "sampled_values": int(vals.size)}
+            "frac_integer_second_batch": (round(frac_int2, 6)
+                                          if frac_int2 is not None else None),
+            "sampling_consistent": consistent,
+            "sampling_note": ("第一批 = 跨全表等距抽样；第二批 = 从中段起连续抽样。"
+                              "两批抽法不同，占比若差 >1 个百分点即判为不一致"),
+            "n_cells_total": n_obs,
+            "n_cells_checked": int(n_rows1 + n_rows2),
+            "sampled_values": int(vals.size + vals2.size)}
 
 
 def run_00_fetch(cfg: dict) -> dict:
