@@ -52,3 +52,14 @@ jobs:
       # 见 tools/check_doc_refs.mjs 文件头的完整说明与两个逃生舱。
       - name: Check doc references point at real files
         run: node tools/check_doc_refs.mjs
+
+      # 门禁自己的自检（AGENTS 规则 30）。**没有自检的门禁只能证明
+      # "它没报错"，不能证明"它检查了"。** 判据 C（跨仓引用）的第一版就是
+      # 死代码：它写在 `if (!isA && !isB) continue` 之后，于是"带仓名前缀"
+      # 那条永远走不到、计数恒为 0，而报告里那行有 `if (nCheckedC)` 守卫，
+      # 连打印都不打印 —— 看起来跟"本仓没有跨仓引用"一模一样（E-64）。
+      # 自检的 11 个用例做过反向标定：把原缺陷注回去，它会红。
+      # 自检在临时目录里自建 scratch workspace（含两个真姊妹仓），
+      # 所以 CI 只 checkout 本仓库也能跑。
+      - name: Self-test the doc-refs gate itself
+        run: node tools/check_doc_refs.mjs --selftest

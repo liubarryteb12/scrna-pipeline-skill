@@ -1269,15 +1269,48 @@ E-63 的自检第一版有 9 个用例，**用例 8 自己另写了一遍路径�
 ### 29.3 自检必须接进 CI 与 pre-push —— 没人跑的自检是同一类缺陷
 
 写了 `--selftest` 却只在本地手敲，等于又造了一个"从未执行过的分支"。
-现在两处都接：
+现在三处都接：
 
 | 位置 | 内容 |
 |---|---|
-| `.github/workflows/scrna_analysis.yml` | 「静态检查（不装依赖）」那一步跑 `check_legend_convention.mjs --selftest` + `check_figures.mjs --selftest` |
+| `.github/workflows/scrna_analysis.yml`（本仓）/ `spatial-pipeline-skill/.github/workflows/spatial_analysis.yml` | 「静态检查（不装依赖）」那一步跑 `check_legend_convention.mjs --selftest` + `check_figures.mjs --selftest` |
+| `geo-normal-pipeline-skill/.github/workflows/geo_analysis.yml` | 同一步跑 `check_legend_convention.mjs --selftest`（geo 无 `check_figures.mjs`）|
 | `governance/hooks/pre-push.mjs` | 新增 `SELFTESTS` 表，在**所有**静态门禁之后跑，日志标签是 `（自检）` |
 
 **日志标签必须区分"带镜像目录"与"带 `--selftest`"** —— 两者都走 `extraArgs`，
 但一个是拿真实产物判、一个是拿合成用例判，长得一样就没法排查。
+
+### 29.4 判据的"通过数"必须能看见 0 —— 否则死代码与"没有这类输入"无法区分（E-64）
+
+`check_doc_refs.mjs` 补判据 C（跨仓引用）时，主体写在
+`if (!isA && !isB) continue` **之后** —— 而跨仓 token 正是"两条判据都不进"
+的那一类，于是**判据 C 的分支永远走不到**。更糟的是报告那行是
+`if (nCheckedC) console.log(...)` 守卫的：计数恒 0 时**连打印都不打印**，
+输出看起来与本仓没有跨仓引用**完全一样**。三仓复跑全绿、毫无异常迹象。
+
+**两条规则：**
+
+1. **新判据要放在早退分支之前** —— 分流顺序错了分支就是死代码，
+   而**死代码不报错、只是永远不执行**。
+2. **计数行不能加 `if (n)` 守卫** —— **0 也是信息**。"检查了 0 条"与
+   "根本没检查"必须在输出上长得不一样。
+
+### 29.5 门禁的"检查范围"要和"它守护的动作"对齐（E-65）
+
+`governance/hooks/pre-push.mjs` 的 `changesOf(repo)` 原来只读
+`git status --porcelain`（**只含未提交改动**）。而 pre-push 是 `git push`
+的钩子，**它唯一被调用的时刻就是"已经提交、还没推送"** —— 那时 porcelain
+为空，三仓全走 `无改动，跳过`，**[4/6] 静态门禁段一条都没跑**，
+而打印的是 `PRE-PUSH 通过（0 条提醒）。可以 push。`
+
+**这不是边角，是主路径**：正常情况下它每次都在空转，给出虚假的安心。
+修法是取并集 —— 除未提交改动外，再加
+`git log --name-only --pretty=format: @{upstream}..HEAD`（**已提交未推送**）。
+
+> **一个门禁段被整段跳过时，不能打印"通过"。** `无改动，跳过` 用的是
+> `ok()`（绿勾），它和"查过了没问题"在输出上一样。写门禁前先跑一次
+> "什么都没改"的路径 —— 如果它空转时也说通过，那它有改动时说的通过
+> 也不可信。**正确的提交顺序是：改完 → 跑 pre-push → 提交 → push。**
 
 **`SELFTESTS` 的接线也做了反向标定**：把 `check_figures.mjs` 自检里
 "全白判红"用例的条件改成 `false` → pre-push 输出
