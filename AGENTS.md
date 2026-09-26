@@ -213,18 +213,18 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 
 **规则：** 静态检查必须做**逐作用域分析**，不能靠写死的名字名单 —— `py_compile` 只编译，看不出未定义名字。
 
-**失败形态（E-61）：** 旧 `tools/check_py_syntax.mjs` 名单只有 **10 个名字**，而 `common.py` 导出 **74 个**，没列进去的照旧漏到 CI。实测 `spatial-pipeline-skill/scripts/03_spatial_domains.py` 漏 import `spot_radius_plot_units`，本地报"全部通过"，CI 跑 **25 分钟**到 H&E 叠图段才 `NameError`。**根因不是名单短了，而是判据的输入域与它要防的缺陷不匹配。** 现在 `tools/check_py_names.py` 用标准库 `symtable` 判三件事：未定义名字（引用却无绑定 → 必 `NameError`）、幽灵 import（`from common import X` 而 common 没有）、不安全构造（`import *` / `globals()` / `exec` / `eval` / `vars` / `locals` → **判红退出**）。
+**失败形态（E-61）：** 旧 `tools/check_py_syntax.mjs` 名单只有 **10 个名字**，而 `common.py` 导出 **74 个**，没列进去的照旧漏到 CI。实测 `spatial-pipeline-skill/scripts/03_spatial_domains.py` 漏 import `spot_radius_plot_units`，本地报"全部通过"，CI 跑 **25 分钟**到 H&E 叠图段才 `NameError`。**根因不是名单短了，而是判据的输入域与它要防的缺陷不匹配。** 现在 `tools/check_py_names.py` 用标准库 `symtable` 判**四件事**：未定义名字（引用却无绑定 → 必 `NameError`）、幽灵 import（`from common import X` 而 common 没有）、不安全构造（`import *` / `globals()` / `exec` / `eval` / `vars` / `locals` → **判红退出**）、**循环体里建了图但同一循环体内没有保存（E-70）**。
 
 **三个坑：** ①不安全构造必须用 AST 判 —— 第一版扫子串时**检查器把自己的源码判红**（需豁免时同行写 `# py-names: unsafe-ok —— <理由>`，故意要写一句话）；②行号必须按作用域定位 —— 第一版把 `plt` 指到**另一个函数**的同名变量，**指向错的行号比不指行号更糟**；③提示要扣掉 common 自己 import 的名字（否则会写出 `from common import np`）。
 
-**两仓该文件逐字节相同**（SHA256 `90D2ECEF11170306406C4FA356FD241189A2DFF5DC912ED7C060B8ADC783990E`，12530 字节），改一侧必须同步并比对哈希。标定：正向零命中；geo（纯 R）**不适用且不判红**；传错目录判红；反向逐类注入各自只响自己那条。
+**两仓该文件逐字节相同**（SHA256 `712AEA6995962ED70801EF9B39FCA3CF5749B026DB7E0EFF392AA1310A45D8EE`，17939 字节），改一侧必须同步并比对哈希。标定：正向零命中；geo（纯 R）**不适用且不判红**；传错目录判红；反向逐类注入各自只响自己那条；第三条判据另有 11 条合成用例 + 真仓库注入（`D:\tmp\_e70\calib_gate.py`，20 项全过）。
 
 **15.2：** 触发动作是**手工清理死 import** —— 扫描器正确报出 `plot_marker_dotplot`，删除时把同一行相邻的 `spot_radius_plot_units`（**有**调用点）一起删了。**扫描器没错，是删除这一步错了**：删 import 要逐名核对，扫描器输出是**名单**不是**待删行号**。
 
 > **"没有 Python 文件"是"不适用"，不是"失败"。**
 
 台账：governance/15_ERROR_LEDGER.md E-61
-完整原文（含全部实测证据与表格）：references/agents-detail.md#原规则-15
+完整原文（含全部实测证据与表格）：`references/agents-detail.md#原规则-15`
 
 ## 16. 每轮运行必须留下可追溯的运行清单（模块零）
 
@@ -245,7 +245,7 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 "没有"，那个 `None` 会被读成"查过了，装不上"（E-41）。
 
 台账：governance/15_ERROR_LEDGER.md 模块零（§0.2–§0.4）/ E-41
-完整原文（含九个函数的字段表与三种失败原因）：references/agents-detail.md#原规则-16
+完整原文（含九个函数的字段表与三种失败原因）：`references/agents-detail.md#原规则-16`
 
 ## 17. 虚拟敲除 / 过表达是保留框架，重点是"没做什么"（§1.7 / §1.8）
 
@@ -270,7 +270,7 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 > **名次会变，值不会** —— 当前 magnitude 最高是 `TYMS`（6.05 / 敏感度 0.94），而 5.41 / 0.81 / 1.84 三个值逐位未变；引用前看 `virtual_perturbation_status.json` 的 `top_by_effect`。
 
 台账：governance/15_ERROR_LEDGER.md §1.7 / §1.8（含 E-41 探针教训）
-完整原文（含全部实测证据与表格）：references/agents-detail.md#原规则-17
+完整原文（含全部实测证据与表格）：`references/agents-detail.md#原规则-17`
 
 ## 18. 笼统的 `except Exception` 会把代码 bug 记成环境问题
 
@@ -343,7 +343,7 @@ runner 的出网策略、换镜像、加超时 —— 而真正要改的只有�
 > **钉并行度能让拓扑稳定，但不足以让 ρ 稳定。**
 
 台账：见 governance/15_ERROR_LEDGER.md 中与随机性/不可复现相关的条目
-完整原文（含全部实测证据与表格）：references/agents-detail.md#原规则-20
+完整原文（含全部实测证据与表格）：`references/agents-detail.md#原规则-20`
 
 ---
 
@@ -475,7 +475,7 @@ PAL_CYCLE**（与 `axes.prop_cycle` 同源），需要就加显式图例。
 > **宽度受限的小面板，标题折行，不要删字；修好一个缺陷后要重跑一遍全部检查。**
 
 台账：governance/15_ERROR_LEDGER.md Q-26（含 E-48 / E-49 / E-51，均属 `savefig.bbox: standard` 下静默裁切同族）
-完整原文（含全部实测证据与表格）：references/agents-detail.md#原规则-25
+完整原文（含全部实测证据与表格）：`references/agents-detail.md#原规则-25`
 
 ## 26. native 崩溃绕过 `except`：`sc.pp.scrublet` 偶发 SIGSEGV（E-52，2026-09-25）
 
@@ -490,7 +490,7 @@ PAL_CYCLE**（与 `axes.prop_cycle` 同源），需要就加显式图例。
 > **"rerun 能过"不等于"没有问题"（重试率是可观测指标）；"本地复现不了"不等于"没问题"（k 按宿主 cache 拓扑选，设计如此）。不钉上界 = 把稳定性交给上游的发布节奏。**
 
 台账：governance/15_ERROR_LEDGER.md E-52（任务行 governance/02_TASKLIST.md V-02）
-完整原文（含全部实测证据与表格）：references/agents-detail.md#原规则-26
+完整原文（含全部实测证据与表格）：`references/agents-detail.md#原规则-26`
 
 ## 27. 步骤"没做成"必须传出来：返回值要接住、顶层 `status` 也要扫（E-56，2026-09-26）
 
@@ -503,28 +503,24 @@ PAL_CYCLE**（与 `axes.prop_cycle` 同源），需要就加显式图例。
 > **空元组/空字符串/空列表都是 falsy —— 凡"空值有语义"（顶层路径、根节点、默认分支）处，判据必须显式写 `if p else` 而不是 `if p`。顶层与嵌套是两个语义域，取值域重叠不等于可以共用判据（`tenifold.status` 可为 `timeout`/`no_candidates` 而内置引擎照样出结果，合并会让每个 job 都红，常年假红会训练人忽略告警）。标定必须用本次 CI 的 artifact，不能用工作区里可能陈旧的副本（`figure_review/scrna-pbmc3k` 内含 E-48 遗留的 `grn_status.json → regulon_vs_pseudotime.status = "failed"`，用它做正向标定会把真判据误判成误报）。**
 
 台账：governance/15_ERROR_LEDGER.md E-56（任务行 governance/02_TASKLIST.md R-03；标定脚本 `D:\tmp\_s1\calib_e56.py`：正向 + 反向 19 类注入 + 回退版对照）
-完整原文（含全部实测证据与表格）：references/agents-detail.md#原规则-27
+完整原文（含全部实测证据与表格）：`references/agents-detail.md#原规则-27`
 
 ## 28. 九条"看起来在算、其实没在算"的缺陷（E-58，2026-09-26）
 
-**规则：** 九条"看起来在算、其实没在算"的缺陷，共同点是**代码在跑、产物齐全、状态全绿，但那个量取不到它声称要取的信息**。复核审计严重项 S2–S10 时 **7 条读码确认成立、1 条（S8）被实测否证、1 条（S3）根因比审计写的更具体**。
+**规则：** 代码在跑、产物齐全、状态全绿，**但那个量取不到它声称要取的信息**。
+复核审计严重项 S2–S10：**7 条读码确认成立、1 条（S8）被实测否证、1 条（S3）根因比审计写的更具体**。
 
-**28.1 "恒为 0 / 恒为真"的量比没有这个量更糟。** `scripts/03_cluster_annotate.py` 的 `compare_annotations()` 原来做 `str(own[c]).lower() == str(maj[c]).lower()`：marker 词表来自 `assets/celltype_markers.yml`（`T_cell`/`Platelet`），CellTypist 词表来自模型（`Tcm/Naive helper T cells`/`Megakaryocytes/platelets`）—— **两套词表没有任何一个字符串相等**，于是 `n_agree_exact: 0 / agreement_frac: 0.0` 恒成立；而逐簇看 `B_cell`↔`B cells`、`Platelet`↔`Megakaryocytes/platelets`、`Monocyte`↔`Classical monocytes` 明显一致。**一个恒为 0 的量看起来像一个结论（"两条路完全不一致"），实际只是词表不相交。** 凡两套词表/坐标系/口径要对齐处，先跑一遍看它**能不能取到非平凡值**。处置：新增 `assets/celltype_mapping.yml` + `load_celltype_mapping()`；没映射的簇**不进分母**、单列 `unmapped`；字段改名带 `mapped`（`n_mapped`/`n_unmapped`/`n_agree_mapped`/`agreement_frac_mapped`）并**删除旧字段名**；消费侧分三层判（没对比 → 红；有对比但 `n_mapped == 0` → 红；有映射 → 报真一致率）。
+六条最常复发的形态（**完整现场、修法与实测数据见原文**）：
 
-**28.2 注释写着正确做法、下一行做了相反的事（三处）。** `scripts/01_qc.py:78` 注释"用细胞数反推期望双细胞率"，代码 `clip(5000/n*0.01, 0.05, 0.10)` 在 n>1000 时**恒被下界截断到 0.05**（那个行为从不发生）；`scripts/00_fetch.py:147` 注释"判断整个 `X` 是不是计数"，代码 `X[:min(200, X.shape[0]), :]` 只抽前 200 行；`scripts/04_pseudobulk_de.py` 注释"必须用 counts layer"，代码 `layers["counts"] if "counts" in layers else adata.X` 静默退回 log 值。后果**产物里完全看不见**：scrublet 阈值偏保守（pbmc3k n=2652 实测新式 **0.02122** vs 旧式 **0.05000**，**高估一倍以上**）；计数校验在按样本拼接时可能给出 `is_counts: True` 而整体不是计数 —— 而这是下游全部方法学的前提；喂 log 值给 DESeq2 不报错，只给错的离散度估计。写注释时问：**"这行代码真的会走到我说的那条路吗？"** 处置：S9 改 10x 经验式 `clip(0.008*n/1000.0, 0.01, 0.10)` 并把**旧公式的值一并记进 status**（`expected_doublet_rate_old_rule`）；S10 改为**抽两批且抽法必须不同**（等距抽样作主判据 + 中段连续抽样交叉核对），两批占比差 >1 个百分点即判 `sampling_consistent: False`；S6 无 counts 层时返回 `counts_source: "missing"`，调用侧判成独立状态 **`missing_counts`**。
-
-**28.3 检验家庭不能被任何"预过滤"缩小。** `scripts/06_communication.py:321` 原来 `if obs_score <= 0: continue` —— 零分组合根本不进 `rows`，`multipletests` 的分母成了"打分 > 0 的组合"。实测 pbmc3k 分母 **649 vs 1134**，**检验家庭缩小约 43%**，`p_adj_bh` 系统性偏小、`n_significant_bh` 上偏 —— 方向与紧邻注释担心的"校正组合数多导致假阳性"**相反**。处置：零分组合仍进 `rows`、`p_value` 记 **1.0**（零分观测本就无法被任何置换超越），另加 `tested` 布尔列。**分母必须是"被评估过的全部假设"。**
-
-**28.4 方向/符号不能靠数据行序决定。** `scripts/04_pseudobulk_de.py:169` 原来 `str(sub["group"].unique()[0])` 当分子 —— 取的是**第一次出现的取值**，而 `sub` 顺序来自 `meta.groupby(...)` 即 obs 行序：**重排细胞顺序会让全部 `log2FoldChange` 变号，而 `padj` 一个都不变**（方向翻转符号对称），产物看起来完全正常。同类：`05_trajectory.py:439-444` 的共识拟时序把 `cytotrace` 算进去了，而 `direction_source == "cytotrace_fallback"` 时 `cytotrace` 正是方向参考（`:417`）—— 同文件 `:414-425` 算一致性时**正确排除了参考**，算共识却没有，**参考方法既定了方向又参与共识，等于自己给自己投票**；产物证据 `trajectory_direction.csv` 四个方法原始 rho **全为负、全部被翻转**。处置：S5 分组水平按 `sorted()` **字典序**定死，分子/分母拆成显式变量，实际方向写进 `status["contrast_used"]` + `contrast_rule`；S7 共识改用 `consensus_names = cv_names if cv_names else names`，并**同时算含参考方法的共识**、把两者 rho 写进 `consensus_vs_with_reference_rho`。
-
-**28.5 审计报告也会错：落修法前先证伪。** 审计称 `scripts/07_grn.py:164` 的 `corr[top[:len(targets)]].mean()` 与 `targets` 错位，**实测证明不会**：`top = np.argsort(corr)[::-1][:N_TARGETS]` 按 corr **降序**，`corr[k] > 0` 过滤必然保留 `top` 的一个**前缀**，`top[:len(targets)]` 与 `[k for k in top if corr[k] > 0]` **恒等** —— 两万次随机对拍（含 `-inf` 自排除、含并列值、含三种尺度）**零次不等（`0/19944`）**。仍改成 `np.mean([w for _, w in pairs])`（等价更钝，不依赖"降序 → 前缀"），并在源码注释写明**审计前提不成立**。**"读码推断"不等于"跑一遍对拍"。**
-
-**28.6 marker 基因宇宙错位（S2）。** `scripts/03_cluster_annotate.py:71` 用 `adata.var_names` 过滤签名基因，而**同一函数下一段用 `use_raw=True` 打分** —— `adata` 只剩 2000 HVG，CD3D/CD8A/CD14 这类**真实存在、只是没进 HVG** 的 marker 被判"缺失"，签名被削到无法区分（实测簇 1/簇 3 的 `T_cell` 与 `CD4_T` 分数逐位相同、margin 恰为 **0.0**）；**同文件 `:385` 的 dotplot 已经用的是 `adata.raw.var_names`**。处置：改用 `raw_names = set(adata.raw.var_names) if adata.raw is not None else hvg_names`，诊断拆成 `missing_markers`（真的没有）vs `not_in_hvg`（有、没进 HVG）—— 合并会让"签名被 HVG 削弱"和"这批数据没测到"看起来一样。
-
-> **方向/符号来自显式排序，不来自数据行序（`unique()[0]`、`head(1)`、`groupby` 首元素都不行），且要把实际用到的方向写进产物。**
+- **28.1 "恒为 0 / 恒为真"的量比没有这个量更糟。** 两套词表（marker 表 vs CellTypist 模型表）逐字符串比较，**没有任何一个字符串相等** ⇒ `agreement_frac: 0.0` 恒成立，读起来像"两条路完全不一致"。**凡两套词表/坐标系/口径要对齐处，先跑一遍看它能不能取到非平凡值。**
+- **28.2 注释写着正确做法、下一行做了相反的事（三处）。** `01_qc.py:78` 的期望双细胞率公式在 n>1000 时**恒被下界截断到 0.05**（实测高估一倍以上：`0.05000` vs `0.02122`）；`00_fetch.py:147` 注释说"判断整个 `X`"、代码只抽前 200 行；`04_pseudobulk_de.py` 注释说"必须用 counts layer"、代码静默退回 log 值。**写注释时问："这行代码真的会走到我说的那条路吗？"**
+- **28.3 检验家庭不能被任何"预过滤"缩小。** `if obs_score <= 0: continue` 让 `multipletests` 的分母从 **1134 缩到 649（约 43%）** ⇒ `p_adj_bh` 系统性偏小，**方向与紧邻注释担心的相反**。**分母必须是"被评估过的全部假设"。**
+- **28.4 方向/符号不能靠数据行序决定。** `sub["group"].unique()[0]` 当分子 ⇒ **重排细胞顺序会让全部 `log2FoldChange` 变号，而 `padj` 一个都不变**；共识拟时序把方向参考 `cytotrace` 也算进去（**参考方法自己给自己投票**）。**方向/符号来自显式排序，且要把实际用到的方向写进产物。**
+- **28.5 审计报告也会错：落修法前先证伪。** 审计称 `07_grn.py:164` 错位，**两万次随机对拍零次不等（0/19944）** —— **"读码推断"不等于"跑一遍对拍"。**
+- **28.6 marker 基因宇宙错位（S2）。** 用 `adata.var_names`（只剩 2000 HVG）过滤签名基因，**同一函数下一段却用 `use_raw=True` 打分** ⇒ 真实存在但没进 HVG 的 marker 被判"缺失"。诊断要拆 `missing_markers`（真的没有）vs `not_in_hvg`（有、没进 HVG）—— **合并会让"签名被 HVG 削弱"和"这批数据没测到"看起来一样。**
 
 台账：governance/15_ERROR_LEDGER.md E-58（任务行 governance/02_TASKLIST.md R-03；标定脚本 `D:\tmp\_s2\calib_s2_s10.py`：每条配"回退版必须抓不到"对照，34 项全过）
-完整原文（含全部实测证据与表格）：references/agents-detail.md#原规则-28
+完整原文（含全部实测证据与表格）：`references/agents-detail.md#原规则-28`
 
 ## 29. 门禁要带内建自检，自检必须被反向标定，且必须接进 CI 与 pre-push（E-62 / E-63，2026-09-26）
 
@@ -567,4 +563,16 @@ PAL_CYCLE**（与 `axes.prop_cycle` 同源），需要就加显式图例。
 > **正向标定（干净产物）看不出这三形；反向标定必须逐个把原缺陷注回去，且判红必须伴随非空 FAIL 摘要。** 本仓这次是正向 37 项 + 反向 6 类注入（调用点退回裸 `nan` / 去掉 `is not None` 守卫 / 产出端退回裸 `round` / 去掉状态字段 / `finite_round` 不再挡 nan / 消费端不再用状态判红）—— **第一轮有 3 类注回去却全绿**，说明那 3 条判据当时压根不存在，补上才 6/6。
 
 台账：governance/15_ERROR_LEDGER.md E-69（任务行 governance/02_TASKLIST.md R-03）
-完整原文（含全部实测证据与表格）：references/agents-detail.md#原规则-30
+完整原文（含全部实测证据与表格）：`references/agents-detail.md#原规则-30`
+
+## 31. 循环里建的图必须在循环体内保存（E-70，2026-09-26）
+
+**规则：`for` 里建的图，`save_fig` 必须在同一个循环体里 —— 缩进错一格不报错，只少出图。**
+
+现场在姊妹仓库 `spatial-pipeline-skill/scripts/07_spatial_communication.py`：给 top3 配体受体对画图的循环，外层几行加了 4 空格而循环体 6 行（含 `save_fig`）留在原缩进 ⇒ 跑到 `for` 外面，循环建 3 张图一张没保存、只出最后一张（E-68 基线 76 → 74 张）；**数据侧 top3 完全正确**（`n_z_defined=62 / n_z_undefined=0`）。四套门禁全绿，只有跨 artifact 比对图名集合才看得见。
+
+**本仓为什么也要写**：`tools/check_py_names.py` 两仓逐字节相同，第三条判据加在本仓就等于加在空间仓；而 `check_fig_names.mjs` 的账目判据是 `if (deficit > declared)`，**把 `DYNAMIC_FIG_BASES` 槽位当上限用**，看不见"槽位没填满"。
+
+判据：`For` / `AsyncFor` / `While` 的**同作用域**子树里建了图（`subplots` / `figure` / `sc.pl.*`）却没有保存调用（`save_fig` / `savefig` / `close` / 本文件内含保存调用的帮助函数）⇒ 判红。**已知局限：跨模块的保存帮助函数仍判红。**
+
+台账：governance/15_ERROR_LEDGER.md E-70（任务行 governance/02_TASKLIST.md R-04h）

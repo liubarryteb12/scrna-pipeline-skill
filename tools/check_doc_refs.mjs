@@ -190,6 +190,7 @@ function scanDocs(root, DOCS, siblings) {
   let nCheckedC = 0
   let nExempt = 0
   let nStripped = 0
+  let nAnchored = 0
   let nXrepoSkipped = 0
 
   for (const doc of DOCS) {
@@ -226,7 +227,28 @@ function scanDocs(root, DOCS, siblings) {
       // 中间带冒号的（`references/methods.md`）不受影响 —— 正则锚在 `$`。
       const stripped = tok.replace(/:(?:L)?\d+(?:\s*[-,]\s*\d+)*$/, '')
       if (stripped !== tok) nStripped++
-      const probe = stripped
+
+      // ---- 再剥掉 Markdown 锚点（E-71）-------------------------------------
+      // `references/agents-detail.md#原规则-28` 是三仓 AGENTS.md 精简之后的
+      // **既定指针风格**（规则正文归档进 references/agents-detail.md，AGENTS.md
+      // 只留精简版 + 指针），但整串拿去 `existsSync` 必然为假 —— 与上面
+      // "行号后缀"**逐字同形**，是同一个坑的第二个入口。
+      //
+      // 实测**两个方向**的后果都出现过（`spatial-pipeline-skill/AGENTS.md`）：
+      //   - L582 → **假阳性判红**（文件明明存在，读者照做会白跑一趟）；
+      //   - L264 → **静默豁免**：它靠 ±2 行窗口里另一句**无关的**"删掉"命中了
+      //     逃生舱标记，于是**从来没被真正检查过** —— 那条引用的"通过"与
+      //     "文件存不存在"没有任何关系（正是 E-64「静默豁免会让检查退化成
+      //     没有检查」的同族）。
+      //
+      // **已知局限（故意不查，写在文件里而不是假装没有）：锚点本身的有效性
+      // 不做校验。** 锚点是标题 slug，中文标题的 slug 规则随渲染器而变
+      // （GitHub 把空格换成 `-`、剥掉标点，别的渲染器不一样），按某一个渲染器
+      // 的规则去判会引入**新的假阳性** —— 而假阳性会让人把门禁关掉（E-29 同族）。
+      // 这里只保证"**锚点前面的那个文件真实存在**"。
+      const noAnchor = stripped.replace(/#[^#]*$/, '')
+      if (noAnchor !== stripped) nAnchored++
+      const probe = noAnchor
 
       // ---- 逃生舱的窗口先算出来，**判据 A/B/C 共用** ----------------------
       // 窗口是 **±2 行**，不是 ±1。
@@ -334,7 +356,7 @@ function scanDocs(root, DOCS, siblings) {
       }
     })
   }
-  return { problems, nCheckedA, nCheckedB, nCheckedC, nExempt, nStripped, nXrepoSkipped }
+  return { problems, nCheckedA, nCheckedB, nCheckedC, nExempt, nStripped, nAnchored, nXrepoSkipped }
 }
 
 // ---- 报告 -------------------------------------------------------------------
@@ -354,6 +376,10 @@ function report(nDocs, r) {
   }
   if (r.nExempt) console.log(`  逃生舱（前后两行内标了"已删"或"第三方包"）  ${r.nExempt} 条豁免`)
   if (r.nStripped) console.log(`  带行号的引用（剥掉 \`:275-279\` 后缀后按文件判存在性）  ${r.nStripped} 条`)
+  // **这一行不加 `if (r.nAnchored)` 守卫。** 它和判据 A/B/C 一样是**覆盖率计数**
+  // （"有多少条带锚点的引用真的被查了"），不是"豁免了多少条"；0 也是信息，
+  // 加了守卫就与 E-64 那条死代码自己把自己藏起来的形态完全一样。
+  console.log(`  带锚点的引用（剥掉 \`#原规则-NN\` 后按文件判存在性，锚点本身不校验）  ${r.nAnchored} 条`)
 
   if (r.problems.length === 0) {
     console.log(`\n全部 ${total} 条引用都指向真实存在的文件。`)
@@ -527,7 +553,44 @@ function selftest() {
         ok ? '' : `buf=${JSON.stringify(buf.slice(0, 200))}`])
     }
 
-    // ---- 用例 11：无文档 → 调用方应报"没东西可查"（不静默通过）--------------
+    // ---- 用例 11：带锚点的引用指向**存在**的文件 → 不判红（E-71 回归）-------
+    // 这一条就是 E-71 的回归：把 `const noAnchor = ...` 改回 `const noAnchor = stripped`
+    // （即不剥锚点）会让它红 —— 因为整串 `references/methods.md#some-anchor`
+    // 拿去 `existsSync` 必然为假。
+    {
+      const { r } = run('# probe\n归档：`references/methods.md#原规则-20`。\n')
+      const ok = r.problems.length === 0 && r.nCheckedA === 1 && r.nAnchored === 1
+      cases.push(['回归 3：带锚点的引用剥掉锚点后按文件判存在性（E-71）', ok,
+        `problems=${r.problems.length} A=${r.nCheckedA} anchored=${r.nAnchored}`])
+    }
+
+    // ---- 用例 12：剥锚点**不能把死链接洗白** --------------------------------
+    // 剥后缀这件事的风险是"剥过头"：如果连文件名也一起剥掉了，
+    // 死链接就会变成"没东西可查"而静默通过。这条盯住那个方向。
+    {
+      const { r } = run('# probe\n归档：`references/missing.md#原规则-20`。\n')
+      const ok = codes(r) === 'A'
+      cases.push(['剥掉锚点后，锚点前的文件不存在仍然判红', ok, `codes=${codes(r)}`])
+    }
+
+    // ---- 用例 13：报告里"带锚点的引用"那一行**计数为 0 也打印** -------------
+    // 与用例 10 同一条理由：0 也是信息，不能加守卫把它藏起来。
+    {
+      const lonely = join(tmp, 'lonely3', 'me')
+      mk(join(lonely, 'AGENTS.md'), '# probe\n本仓：`scripts/01_qc.py`。\n')
+      mk(join(lonely, 'scripts', '01_qc.py'), 'pass\n')
+      const r = scanDocs(lonely, listDocs(lonely), buildSiblings(lonely))
+      const realLog = console.log
+      let buf = ''
+      console.log = (...a) => { buf += a.join(' ') + '\n' }
+      try { report(1, r) } finally { console.log = realLog }
+      const ok = buf.includes('判据 C') && buf.includes('0 条通过')
+        && buf.includes('带锚点的引用') && buf.includes('0 条')
+      cases.push(['回归 4：带锚点计数为 0 时那一行照样打印（E-64 同族）', ok,
+        ok ? '' : `buf=${JSON.stringify(buf.slice(0, 300))}`])
+    }
+
+    // ---- 用例 14：无文档 → 调用方应报"没东西可查"（不静默通过）--------------
     {
       const empty = join(tmp, 'empty', 'me')
       mk(join(empty, 'notes.txt'), 'x\n')
@@ -547,7 +610,7 @@ function selftest() {
     console.error(`\n自检未通过（${bad}/${cases.length} 个用例失败）`)
     return 1
   }
-  console.log(`自检通过（${cases.length} 个用例，含 2 条 E-64 回归）`)
+  console.log(`自检通过（${cases.length} 个用例，含 2 条 E-64 回归 + 3 条 E-71 回归）`)
   return 0
 }
 
