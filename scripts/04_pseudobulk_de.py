@@ -33,7 +33,8 @@ import scanpy as sc  # noqa: E402
 from scipy import sparse  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed, write_json)
+                    log_warn, parse_args, record_step, result_status_of,
+                    save_fig, set_seed, write_json)
 
 # 一个 (样本, 细胞类型) 组合至少要有这么多细胞才拿去做拟bulk
 MIN_CELLS_PER_PSEUDOBULK = 10
@@ -208,8 +209,13 @@ if __name__ == "__main__":
     cfg = load_config(args.config)
     t0 = time.time()
     try:
-        run_04_pseudobulk_de(cfg)
-        record_step(cfg, "pseudobulk_de", "ok", time.time() - t0)
+        res = run_04_pseudobulk_de(cfg)
+        # E-56：接住返回值。本步骤有 4 条早退路径（`not_configured` /
+        # `package_missing` / `column_missing` / `no_usable_pseudobulk` /
+        # `no_celltype_testable`），全都不抛异常。
+        record_step(cfg, "pseudobulk_de", "ok", time.time() - t0,
+                    result_status=result_status_of(res))
     except Exception as e:  # noqa: BLE001
-        record_step(cfg, "pseudobulk_de", "failed", time.time() - t0, message=str(e))
+        record_step(cfg, "pseudobulk_de", "failed", time.time() - t0,
+                    message=str(e), result_status="failed")
         raise

@@ -24,7 +24,8 @@ import numpy as np  # noqa: E402
 import scanpy as sc  # noqa: E402
 
 from common import (ensure_dirs, load_config, log_info, log_warn,  # noqa: E402
-                    parse_args, record_step, save_fig, set_seed, write_json,
+                    parse_args, record_step, result_status_of, save_fig,
+                    set_seed, write_json,
                     PAL, W_DOUBLE, W_ONE_HALF, mm,)
 
 
@@ -246,8 +247,11 @@ if __name__ == "__main__":
     cfg = load_config(args.config)
     t0 = time.time()
     try:
-        run_02_integrate(cfg)
-        record_step(cfg, "integrate", "ok", time.time() - t0)
+        res = run_02_integrate(cfg)
+        # E-56：接住返回值，别把"跑完了但没做成"记成 ok。
+        record_step(cfg, "integrate", "ok", time.time() - t0,
+                    result_status=result_status_of(res))
     except Exception as e:  # noqa: BLE001
-        record_step(cfg, "integrate", "failed", time.time() - t0, message=str(e))
+        record_step(cfg, "integrate", "failed", time.time() - t0,
+                    message=str(e), result_status="failed")
         raise

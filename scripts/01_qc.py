@@ -26,8 +26,8 @@ import numpy as np  # noqa: E402
 import scanpy as sc  # noqa: E402
 
 from common import (ensure_dirs, load_config, log_info, log_warn,  # noqa: E402
-                    parse_args, record_step, save_fig, set_seed, write_json,
-                    W_DOUBLE, W_SINGLE, mm, PAL,)
+                    parse_args, record_step, result_status_of, save_fig,
+                    set_seed, write_json, W_DOUBLE, W_SINGLE, mm, PAL,)
 
 # 血红蛋白基因（红细胞污染）与核糖体基因的前缀
 HB_PREFIXES = ("HBA", "HBB", "HBD", "HBE", "HBG", "HBM", "HBQ", "HBZ")
@@ -288,8 +288,13 @@ if __name__ == "__main__":
     cfg = load_config(args.config)
     t0 = time.time()
     try:
-        run_01_qc(cfg)
-        record_step(cfg, "qc", "ok", time.time() - t0)
+        res = run_01_qc(cfg)
+        # E-56：接住返回值。本步骤的早退路径（`not_done` / `heuristic_only` /
+        # `unknown_mode`）是 `write_json` + `return status`，不抛异常 ——
+        # 写死 "ok" 会让 `state.json` 与自述状态打架。
+        record_step(cfg, "qc", "ok", time.time() - t0,
+                    result_status=result_status_of(res))
     except Exception as e:  # noqa: BLE001
-        record_step(cfg, "qc", "failed", time.time() - t0, message=str(e))
+        record_step(cfg, "qc", "failed", time.time() - t0, message=str(e),
+                    result_status="failed")
         raise

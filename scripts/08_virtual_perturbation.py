@@ -111,7 +111,8 @@ from scipy.stats import spearmanr  # noqa: E402
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, PAL, parse_args, probe_r_packages,
                     record_cross_language, record_decision, record_step,
-                    save_fig, set_seed, write_json, W_ONE_HALF, W_SINGLE, mm,)
+                    result_status_of, save_fig, set_seed, write_json,
+                    W_ONE_HALF, W_SINGLE, mm,)
 
 # 候选基因没有外部靶基因表时，用调控子按簇特异性排序取前 N 个
 DEFAULT_TOP_N = 20
@@ -1120,9 +1121,12 @@ if __name__ == "__main__":
     cfg = load_config(args.config)
     t0 = time.time()
     try:
-        run_08_virtual_perturbation(cfg)
-        record_step(cfg, "virtual_perturbation", "ok", time.time() - t0)
+        res = run_08_virtual_perturbation(cfg)
+        # E-56：接住返回值。`no_candidates` / `not_configured` / `disabled`
+        # 都是早退路径，不抛异常 —— 不接住就会记成 ok。
+        record_step(cfg, "virtual_perturbation", "ok", time.time() - t0,
+                    result_status=result_status_of(res))
     except Exception as e:  # noqa: BLE001
         record_step(cfg, "virtual_perturbation", "failed", time.time() - t0,
-                    message=str(e))
+                    message=str(e), result_status="failed")
         raise

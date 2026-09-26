@@ -150,7 +150,7 @@ CellTypist 用预训练的 logistic 回归模型（免疫图谱）给每个细�
 
 **一个踩过的坑（值得记下来）：** 第一版把 `celltypist.models_path` 当成
 `pathlib.Path` 用了（`models_path / model_name`），而它其实是 **`str`**
-（`models.py:19` 是 `os.path.join(...)`）—— 抛 `TypeError`。
+（celltypist **包内** `models.py:19` 是 `os.path.join(...)`）—— 抛 `TypeError`。
 那个 `TypeError` 被笼统的 `except Exception` 接住，于是状态里写成
 **「模型拿不到 —— CI 可能无外网」**。**一个纯本地代码 bug 被记成了网络问题**，
 下一个人会去查 runner 的出网策略。现在失败被拆成三类分别记原因：

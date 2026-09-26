@@ -39,7 +39,8 @@ import yaml  # noqa: E402
 from scipy import sparse  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, place_labels, record_step, save_fig,
+                    log_warn, parse_args, place_labels, record_step,
+                    result_status_of, save_fig,
                     set_seed, write_json, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, PAL,)
 
 # 每个调控子保留多少个共表达靶基因
@@ -436,8 +437,12 @@ if __name__ == "__main__":
     cfg = load_config(args.config)
     t0 = time.time()
     try:
-        run_07_grn(cfg)
-        record_step(cfg, "grn", "ok", time.time() - t0)
+        res = run_07_grn(cfg)
+        # E-56：接住返回值。`no_tfs_in_data` / `no_regulons` 是早退路径，
+        # 不抛异常 —— 不接住就会记成 ok。
+        record_step(cfg, "grn", "ok", time.time() - t0,
+                    result_status=result_status_of(res))
     except Exception as e:  # noqa: BLE001
-        record_step(cfg, "grn", "failed", time.time() - t0, message=str(e))
+        record_step(cfg, "grn", "failed", time.time() - t0,
+                    message=str(e), result_status="failed")
         raise

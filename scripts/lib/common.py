@@ -192,13 +192,94 @@ def read_state(cfg: dict) -> dict:
     return read_json(state_path(cfg)) or {"steps": []}
 
 
+# ---------------------------------------------------------------------------
+# 步骤自述状态的翻译（E-56）
+# ---------------------------------------------------------------------------
+# 步骤函数有一条"跑完了、但结果是『没做成』"的返回路径：它们
+# `write_json(状态文件, status)` + `log_warn(...)` + `return status`，
+# **不抛异常**。旧编排器写死 `record_step(cfg, sid, "ok", ...)` 并丢弃返回值 ——
+# 于是 `state.json` 记 `ok`、验收记绿，而这一步什么也没产出。
+# 这是 E-48 事故**未修完的另一半**。
+STEP_ABORT_VALUES = (
+    # 通用崩溃
+    "failed", "error", "fail",
+    # 05 轨迹：配置的根簇不在簇列表里 / 上游没产出 leiden / 成功方法不足 2 种
+    "bad_root", "missing_clusters", "insufficient_methods",
+    # 08 虚拟敲除：候选基因没有一个满足最小靶基因数
+    "no_candidates",
+    # 07 GRN：TF 一个都不在数据里 / 没有 TF 找到足够多的正相关靶
+    "no_tfs_in_data", "no_regulons",
+    # 06 通讯：数据库里没有一对配体受体同时在数据里 / 打分全 0
+    "no_pairs_in_data", "no_signal",
+    # 04 拟bulk：聚合不出可用拟bulk / 没有一个细胞类型可检验 / 配置的列不存在
+    "no_usable_pseudobulk", "no_celltype_testable", "column_missing",
+)
+
+# **设计如此地没做**（配置关掉了 / 输入不支持 / 环境缺包）—— 只可见、不阻断。
+STEP_SKIP_VALUES = (
+    "disabled", "not_configured", "not_applicable", "not_run",
+    "not_applied", "not_done", "not_available", "not_possible",
+    "heuristic_only", "package_missing", "unavailable", "needs_reference",
+)
+
+# 上面两个集合**只管步骤函数顶层返回值**。嵌套字段里的同一批词不能照搬：
+# `08_virtual_perturbation.py` 的 `tenifold.status` 可能是 `timeout` /
+# `no_candidates`，而内置引擎照样出了结果（顶层 `ok`）；`annotation.celltypist`
+# 的 `model_unavailable`、`liana` 的 `api_not_found` 也只是"这个可选能力没成"。
+# 把它们判红会让每个 job 都红 —— 假阳性比假阴性更危险（台账元规则 ④）。
+
+
+def result_status_of(res) -> str:
+    """步骤函数**返回值**里自述的 `status`（E-56）。
+
+    为什么需要它：步骤函数有一条"跑完了、但结果是『没做成』"的返回路径 ——
+    `05_trajectory.py` 的 `bad_root` / `insufficient_methods`、
+    `08_virtual_perturbation.py` 的 `no_candidates`、`07_grn.py` 的
+    `no_tfs_in_data` 都是 `write_json(...)` + `log_warn(...)` + `return status`，
+    **不抛异常**。编排器只要不接住这个返回值，`record_step` 就会记 `ok`，
+    验收记绿 —— 而这一步什么也没产出。
+
+    返回 `"ok"` 的两种情形：① 返回的 dict 里没有 `status` 键（如
+    `00_fetch.py` 返回的 `info`）；② 返回的不是 dict。两者都表示
+    "函数正常跑完、没有自述失败"，与调用方的 `except` 分支互补。
+    """
+    if isinstance(res, dict):
+        st = res.get("status")
+        return str(st) if st is not None else "ok"
+    return "ok"
+
+
+def classify_step_result(result_status: str) -> str:
+    """把一个步骤自述状态归成三类：`"ok"` / `"abort"` / `"skip"`（E-56）。
+
+    - `"ok"`    —— 成功（含 `None` / 空）。
+    - `"abort"` —— **语义上是「这一步没做成」**，判红（`severity="required"`）。
+    - `"skip"`  —— **设计如此地没做**（配置关了 / 环境缺包），可见不阻断。
+    - 未登记的取值也归 `"skip"` —— 宁可只可见也不判红。判据的原则是
+      **只把确知是失败的判红**：一个没见过的词有可能是新加的"设计如此"，
+      判红会让 job 变红、让人开始忽略告警（台账元规则 ④ 假阳性更危险）。
+    """
+    v = str(result_status or "").strip().lower()
+    if not v or v == "ok":
+        return "ok"
+    if v in STEP_ABORT_VALUES:
+        return "abort"
+    return "skip"
+
+
 def record_step(cfg: dict, step_id: str, status: str, seconds: float = None,
-                message: str = "", required: bool = True) -> None:
+                message: str = "", required: bool = True,
+                result_status: str = None) -> None:
     st = read_state(cfg)
     st.setdefault("steps", [])
     st["steps"] = [s for s in st["steps"] if s.get("id") != step_id]
     entry = {"id": step_id, "status": status, "required": bool(required),
              "message": message}
+    if result_status is not None:
+        # 步骤函数自己返回的 status —— 与 `status`（编排器记的"有没有崩"）
+        # 是**两件事**：`status="ok"` + `result_status="bad_root"` 完全可能，
+        # 那正是 E-56 要让它显形的那种组合。
+        entry["result_status"] = str(result_status)
     if seconds is not None:
         entry["seconds"] = round(float(seconds), 1)
     st["steps"].append(entry)

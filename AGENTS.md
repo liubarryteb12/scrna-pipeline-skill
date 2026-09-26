@@ -410,7 +410,7 @@ Part 3 因此只在共同基因上建参考谱。
 path = ctm.models_path / info["model"]     # TypeError: str / str
 ```
 
-而它其实是 **`str`**（`models.py:19` 是 `os.path.join(data_path, "models")`）。
+而它其实是 **`str`**（celltypist **包内** `models.py:19` 是 `os.path.join(data_path, "models")`）。
 这个 `TypeError` 被下面那个笼统的 `except Exception` 接住，于是状态里
 写成：
 
@@ -430,7 +430,7 @@ runner 的出网策略、换镜像、加超时 —— 而真正要改的只有�
 | 下载没抛异常但文件仍不在 | `model_unavailable` | 名字不在模型清单里 |
 
 第 3 类必须单独查：`download_models` 内部把每个模型的下载异常
-**吞掉只打日志**（`models.py:512-517`），所以"下载失败"并不总是抛出来 ——
+**吞掉只打日志**（celltypist **包内** `models.py:512-517`），所以"下载失败"并不总是抛出来 ——
 只看有没有异常会把"清单里没这个名字"漏成"下载成功"。
 
 **规则：`except Exception` 里不要写结论，写事实。**
@@ -939,6 +939,88 @@ modules 里），**同进程两份 OpenMP 运行时**是上游有记录的崩溃
    遇到宿主相关的间歇失败，先找"哪个量在运行期按机器选"。
 
 台账：`governance/15_ERROR_LEDGER.md` E-52；任务行 `governance/02_TASKLIST.md` V-02。
+
+## 27. 步骤"没做成"必须传出来：返回值要接住、顶层 `status` 也要扫（E-56，2026-09-26）
+
+### 27.1 现象：一条已存在但从未生效的判据
+
+`main_analysis.py` 的嵌套失败扫描本意是"任何 `*status.json` 里写了失败就判红"，
+但写成 `if p and str(v).lower() in NESTED_FAILED_VALUES`。`_iter_nested_status(d)`
+在**顶层**调用时 `path` 是**空元组** —— falsy —— 于是**顶层 `status` 一个都扫不到**。
+
+而本仓有 6 处代码正是以"写顶层非 ok 状态 + 正常 `return`"的方式失败：
+
+| 位置 | 取值 |
+|---|---|
+| `scripts/05_trajectory.py:275-279` | `bad_root` |
+| `scripts/05_trajectory.py:313-317` | `missing_clusters` |
+| `scripts/05_trajectory.py:363-370` | `insufficient_methods` |
+| `scripts/07_grn.py:352-355` | `no_tfs_in_data` |
+| `scripts/08_virtual_perturbation.py:901-911` | `no_candidates` |
+| `scripts/04_pseudobulk_de.py:178-180` | `no_celltype_testable` |
+
+**结果：这一步什么也没产出，`state.json` 记 `ok`、`acceptance.json` 记绿。**
+而且 `insufficient_methods` / `bad_root` / `missing_clusters` / `no_candidates`
+这四个词**连 `NESTED_FAILED_VALUES = ("failed", "error", "fail")` 都不在** ——
+即使 `if p` 修好，顶层这四个也照样漏。
+
+### 27.2 第二处同病根：返回值被丢弃
+
+`run_all` 的步骤循环把 `fn(cfg)` 的返回值**直接丢弃**，写死
+`record_step(cfg, sid, "ok", ...)`。步骤函数的"跑完了、但结果是『没做成』"
+路径是 `write_json(状态文件, status)` + `log_warn(...)` + `return status`，
+**不抛异常** → `except` 分支根本不进。
+
+同一病根还在 **9 个步骤脚本各自的 `__main__` 块**里（独立运行时同样丢弃
+返回值、无条件记 `ok`）—— 即"编排器跑"和"单独跑"两条路径**都**把失败记成成功。
+
+**这是 E-48 的另一半。** E-48 当时的修法是"让嵌套失败可见"，但只覆盖了
+"写进嵌套字段的失败"：写进**顶层**的失败与"返回值里的失败"都没被覆盖。
+E-48 的教训是"异常被降级成一个没人读的字段"，本条是它的两个变体：
+**字段写在没人扫的位置**，和**结果压根没被记下来**。
+
+### 27.3 处置
+
+`scripts/lib/common.py`：
+
+- 两个**分开的**取值集合：`STEP_ABORT_VALUES`（判红）与 `STEP_SKIP_VALUES`
+  （可见不阻断，只作文档用途）。前者含通用 `failed`/`error`/`fail` 加上表
+  六处的具体取值，以及 07 的 `no_regulons`、06 的 `no_pairs_in_data`/`no_signal`、
+  04 的 `no_usable_pseudobulk`/`column_missing`。
+- `result_status_of(res) -> str`：dict 且带 `status` 键则取之，否则 `"ok"`。
+- `classify_step_result(v) -> str`：`"ok"` / `"abort"` / `"skip"`。
+  **未登记的取值归 `"skip"`** —— 只把确知是失败的判红（假阳性比假阴性更危险）。
+- `record_step(..., result_status: str = None)`：`entry["result_status"]` 与
+  `entry["status"]` **分开存**。后者是编排器记的"有没有崩"，前者是步骤自述的
+  "做成了没有" —— `status="ok"` + `result_status="bad_root"` 正是要显形的组合。
+  默认 `None` → 不写这个键，向后兼容。
+
+`scripts/main_analysis.py`：步骤循环 `res = fn(cfg)` → `record_step(...,
+result_status=result_status_of(res))`；`except` 分支加 `result_status="failed"`；
+步骤验收循环新增"步骤 X 自述状态"检查；嵌套扫描去掉 `if p`，改
+`key = ".".join(p) + ".status" if p else "status"`（照抄姊妹仓 spatial 的写法，
+`spatial-pipeline-skill/scripts/main_analysis.py:380-398` 本来就是对的）。
+9 个步骤脚本的 `__main__` 块同步改造。
+
+### 27.4 四条规则
+
+1. **"让失败可见"的修法要覆盖失败的所有承载位置。** 修完要问："这个失败还可能
+   被记在哪里？"—— 返回值、顶层字段、嵌套字段、日志、退出码。E-48 只修了
+   嵌套字段一处，另外两处照旧漏了。
+2. **`if p` 在"空路径 = 顶层"的语义下必然滤掉顶层。** 空元组/空字符串/空列表
+   都是 falsy，而写的时候看起来完全合理。凡"空值有语义"的地方（顶层路径、
+   根节点、默认分支），判据必须显式写 `if p else` 而不是 `if p`。
+3. **顶层与嵌套是两个语义域，取值域重叠不等于可以共用判据。** `tenifold.status`
+   可以是 `timeout`/`no_candidates` **而内置引擎照样出了结果（顶层 `ok`）**；
+   `annotation.celltypist` 的 `model_unavailable`、`liana` 的 `api_not_found`
+   同理。合并两个集合会让**每个 job 都红**，而常年假红会训练人忽略告警。
+4. **标定必须用本次 CI 的 artifact，不能用工作区里可能陈旧的副本。**
+   `figure_review/scrna-pbmc3k` 是旧 run 的产物，内含 E-48 遗留的
+   `grn_status.json → regulon_vs_pseudotime.status = "failed"` ——
+   用它做正向标定会把真判据误判成误报。
+
+台账：`governance/15_ERROR_LEDGER.md` E-56；任务行 `governance/02_TASKLIST.md` R-03。
+标定脚本：`D:\tmp\_s1\calib_e56.py`（正向 + 反向 19 类注入 + 回退版对照）。
 
 
 

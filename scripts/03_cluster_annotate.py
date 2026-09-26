@@ -35,7 +35,7 @@ import scanpy as sc  # noqa: E402
 import yaml  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed, write_json, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, plot_marker_dotplot, build_marker_dotplot_figure, PAL,)
+                    log_warn, parse_args, record_step, result_status_of, save_fig, set_seed, write_json, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, plot_marker_dotplot, build_marker_dotplot_figure, PAL,)
 
 
 def load_signatures(cfg: dict) -> dict:
@@ -582,8 +582,11 @@ if __name__ == "__main__":
     cfg = load_config(args.config)
     t0 = time.time()
     try:
-        run_03_cluster_annotate(cfg)
-        record_step(cfg, "cluster_annotate", "ok", time.time() - t0)
+        res = run_03_cluster_annotate(cfg)
+        # E-56：接住返回值。本步骤 `not_possible`（打分不可行）是早退路径。
+        record_step(cfg, "cluster_annotate", "ok", time.time() - t0,
+                    result_status=result_status_of(res))
     except Exception as e:  # noqa: BLE001
-        record_step(cfg, "cluster_annotate", "failed", time.time() - t0, message=str(e))
+        record_step(cfg, "cluster_annotate", "failed", time.time() - t0,
+                    message=str(e), result_status="failed")
         raise

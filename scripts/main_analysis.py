@@ -25,12 +25,13 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts" / "lib"))
 
-from common import (capture_versions, init_manifest, load_config,  # noqa: E402
-                    log_error, log_info, log_warn, manifest_path,
+from common import (capture_versions, classify_step_result, init_manifest,  # noqa: E402
+                    load_config, log_error, log_info, log_warn, manifest_path,
                     manifest_summary, named_tools_note, parse_args,
                     probe_named_tools, read_json, read_manifest, read_state,
                     record_decision, record_human_review, record_input,
-                    record_params, record_step, set_orchestrated, write_json)
+                    record_params, record_step, result_status_of,
+                    set_orchestrated, write_json)
 
 # (步骤 id, 模块文件, 函数名, 是否必需, 中文名)
 STEPS = [
@@ -140,6 +141,13 @@ def has_file(p: Path) -> bool:
 
 # 嵌套 status 里，哪些取值算"崩了"。其余（`not_applied` / `not_done` /
 # `not_configured` / `skipped` …）都是**设计如此地没做**，只可见、不阻断。
+#
+# **注意这个集合只管嵌套字段，不要和 `common.STEP_ABORT_VALUES` 合并**：
+# 顶层返回值里的 `bad_root` / `insufficient_methods` 是"这一步没做成"，
+# 而嵌套字段里同名或近义的值往往只是"某个可选能力没成"——内置引擎照样出了
+# 结果（`08_virtual_perturbation.py` 的 `tenifold.status` 可以是 `timeout`
+# 或 `no_candidates`，顶层仍是 `ok`）。判红会让每个 job 都红，
+# 反而没人看（台账元规则 ④：假阳性比假阴性更危险）。
 NESTED_FAILED_VALUES = ("failed", "error", "fail")
 
 
@@ -273,12 +281,21 @@ def run_all(cfg: dict, only: list = None) -> int:
         t0 = time.time()
         try:
             fn = load_step_fn(mfile, fn)
-            fn(cfg)
-            record_step(cfg, sid, "ok", time.time() - t0, required=required)
+            # **返回值必须接住**（E-56）。步骤函数有一条"跑完了、但结果是
+            # 『没做成』"的返回路径（`bad_root` / `insufficient_methods` /
+            # `no_candidates` / `no_tfs_in_data` / `no_usable_pseudobulk` …），
+            # 它们是 `write_json` + `log_warn` + `return status`，**不抛异常**。
+            # 旧代码写死 `record_step(..., "ok", ...)` 并丢弃返回值 ——
+            # 于是 `state.json` 记 `ok`、验收记绿，而这一步什么也没产出。
+            # 这是 E-48 事故**未修完的另一半**。
+            res = fn(cfg)
+            record_step(cfg, sid, "ok", time.time() - t0, required=required,
+                        result_status=result_status_of(res))
         except Exception as e:  # noqa: BLE001
             msg = f"{type(e).__name__}: {e}"
             record_step(cfg, sid, "failed", time.time() - t0,
-                        message=msg, required=required)
+                        message=msg, required=required,
+                        result_status="failed")
             if required:
                 log_error(f"{label} 失败（必需）: {msg}")
                 failed_required.append((sid, label, msg))
@@ -325,6 +342,28 @@ def run_all(cfg: dict, only: list = None) -> int:
             ok = True
         checks.append({"item": f"步骤 {label}", "ok": ok,
                        "required": required, "detail": status})
+
+        # ---- 步骤函数自己返回的 status 也要看（E-56）-----------------------
+        #
+        # `run_all` 现在把 `fn(cfg)` 的返回值记进了 `result_status`。**光记不读
+        # 等于没记** —— 这正是 E-48 的形态（`except` 把异常降级成一个没人读的
+        # 字段）。`bad_root` / `insufficient_methods` / `no_candidates` /
+        # `no_tfs_in_data` / `no_usable_pseudobulk` 都是"步骤跑完了、但结果是
+        # 『没做成』"：不抛异常、`state.json` 记 `ok`、验收记绿，而这一步
+        # 什么也没产出 —— 最容易读成成功的一种。
+        rs = st.get("result_status")
+        if rs is None or str(rs).lower() == "ok":
+            continue
+        verdict = classify_step_result(rs)
+        abort = (verdict == "abort")
+        checks.append({
+            "item": f"步骤 {label} 自述状态 = {rs}",
+            "ok": not abort,
+            "required": abort,
+            "detail": (f"**步骤跑完了但结果是失败**：{sid} 返回 status={rs!r}"
+                       if abort else
+                       f"设计如此地没做（{sid} 返回 status={rs!r}），可见不阻断"),
+        })
 
     for fname, desc, required in REQUIRED_FILES:
         ok = has_file(res_dir / fname)
@@ -459,16 +498,28 @@ def run_all(cfg: dict, only: list = None) -> int:
     #
     # 结构上这和"`_content_overflow()` 打了 WARN 没人读"是同一个错误：
     # `except` 把异常降级成了一个**没人读的字段**。这里把它读出来。
+    #
+    # **E-56：这里以前写着 `if p`，把顶层路径滤掉了。** 顶层调用
+    # `_iter_nested_status(d)` 时 `path` 是空元组 —— **falsy** —— 所以
+    # `p and ...` 恒为假，**顶层 `status` 一个都扫不到**。而
+    # `pseudobulk_status.json` / `trajectory_status.json` 这些文件的失败
+    # 恰恰写在**顶层**（`05_trajectory.py` 的 `bad_root` /
+    # `insufficient_methods` 整份文件就只有顶层一个 `status`）。姊妹仓库
+    # spatial 的同构判据用 `key = ".".join(path) + ".status" if path else "status"`
+    # 把顶层写成 `"status"` 而不是丢掉 —— 这里照抄那个写法。
     for stf in sorted(res_dir.glob("*status.json")):
         d = read_json(stf)
         if not isinstance(d, dict):
             continue
-        bad = [(".".join(p), str(r)[:200])
-               for p, v, r in _iter_nested_status(d)
-               if p and str(v).lower() in NESTED_FAILED_VALUES]
+        bad = []
+        for p, v, r in _iter_nested_status(d):
+            if str(v).lower() not in NESTED_FAILED_VALUES:
+                continue
+            key = ".".join(p) + ".status" if p else "status"
+            bad.append((f"{stf.name} → {key}", str(r)[:200]))
         for where, why in bad:
             checks.append({
-                "item": f"{stf.name} 内嵌 {where} = failed",
+                "item": f"{where} = failed",
                 "ok": False, "required": True,
                 "detail": f"**内嵌失败**：{why or '(无 reason)'}",
             })

@@ -25,7 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
 from common import (ensure_dirs, load_config, log_info, log_warn,  # noqa: E402
-                    parse_args, record_step, set_seed, write_json)
+                    parse_args, record_step, result_status_of, set_seed, write_json)
 
 # 硬门禁：低于/高于这些值的输入不做分析
 MIN_CELLS = 50
@@ -258,9 +258,13 @@ if __name__ == "__main__":
     cfg = load_config(args.config)
     t0 = __import__("time").time()
     try:
-        run_00_fetch(cfg)
-        record_step(cfg, "fetch", "ok", __import__("time").time() - t0)
+        res = run_00_fetch(cfg)
+        # E-56：接住返回值。本步骤的返回 dict 没有 `status` 键（它写的是
+        # `dataset_info.json`），`result_status_of` 会给出 "ok" —— 与其他步骤
+        # 保持同一种记法，将来加了 status 键也自动生效。
+        record_step(cfg, "fetch", "ok", __import__("time").time() - t0,
+                    result_status=result_status_of(res))
     except Exception as e:  # noqa: BLE001
         record_step(cfg, "fetch", "failed", __import__("time").time() - t0,
-                    message=str(e))
+                    message=str(e), result_status="failed")
         raise

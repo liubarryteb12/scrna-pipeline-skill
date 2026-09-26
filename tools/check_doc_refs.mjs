@@ -138,6 +138,7 @@ const problems = []
 let nCheckedA = 0
 let nCheckedB = 0
 let nExempt = 0
+let nStripped = 0
 
 for (const doc of DOCS) {
   const lines = readFileSync(join(ROOT, doc), 'utf8').split(/\r?\n/)
@@ -155,14 +156,34 @@ for (const doc of DOCS) {
 
       let isA = false
       let isB = false
-      if (PREFIXES.some(p => tok.startsWith(p))) isA = true
-      else if (!tok.includes('/') && BARE_SRC.test(tok)) isB = true
+
+      // ---- 先剥掉"行号后缀"再判存在性（E-57）-----------------------------
+      // 「真实文件 + 行号」是本仓库三仓文档的**既定引用风格**
+      // （`scripts/05_trajectory.py:275-279` 让读者直接去源码定位），
+      // 但整串拿去 `existsSync` 必然为假。
+      //
+      // 而且它**在两条判据下错得相反**（实测）：
+      //   - 带仓库前缀的 `scripts/…py:275-279` → 走判据 A → **假阳性**；
+      //   - 裸文件名的 `01_qc.py:226` / `models.py:19` → `BARE_SRC` 要求以
+      //     `.py` 结尾，`:19` 结尾不匹配 → **两条判据都不进、完全不被检查**。
+      // 假阳性会训练人忽略告警；盲区则让"指向第三方包源码却没写包名"的引用
+      // 一直躺着 —— 而那正是这条判据存在的理由（文件头已论证过）。
+      //
+      // 所以**两条判据统一**先剥后缀再判存在性，报告里仍打印**原文**。
+      // 只剥末尾的行号：`:275` / `:275-279` / `:L275` / `:275,278`。
+      // 中间带冒号的（`references/methods.md`）不受影响 —— 正则锚在 `$`。
+      const stripped = tok.replace(/:(?:L)?\d+(?:\s*[-,]\s*\d+)*$/, '')
+      if (stripped !== tok) nStripped++
+      const probe = stripped
+
+      if (PREFIXES.some(p => probe.startsWith(p))) isA = true
+      else if (!probe.includes('/') && BARE_SRC.test(probe)) isB = true
       if (!isA && !isB) continue
 
       // 判据 B 只按 basename 找；判据 A 按完整相对路径找
       const found = isA
-        ? (existsSync(join(ROOT, tok)) || relPaths.has(tok))
-        : basenames.has(tok)
+        ? (existsSync(join(ROOT, probe)) || relPaths.has(probe))
+        : basenames.has(probe)
       if (found) { isA ? nCheckedA++ : nCheckedB++; continue }
 
       // 没找到 —— 看逃生舱。窗口是 **±2 行**，不是 ±1。
@@ -192,6 +213,7 @@ console.log(`文档引用检查：${DOCS.length} 份文档`)
 console.log(`  判据 A（带仓库目录前缀的路径）  ${nCheckedA} 条通过`)
 console.log(`  判据 B（裸源码/配置文件名）     ${nCheckedB} 条通过`)
 if (nExempt) console.log(`  逃生舱（前后两行内标了"已删"或"第三方包"）  ${nExempt} 条豁免`)
+if (nStripped) console.log(`  带行号的引用（剥掉 \`:275-279\` 后缀后按文件判存在性）  ${nStripped} 条`)
 
 if (problems.length === 0) {
   console.log(`\n全部 ${total} 条引用都指向真实存在的文件。`)
