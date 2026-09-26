@@ -1170,6 +1170,7 @@ def fix_dotplot_legends(fig, size_title=None, cbar_title=None):
     :returns: `dict(size=bool, colorbar=bool)` —— 各自是否成功转换
     """
     import numpy as np
+    import matplotlib.pyplot as plt
     from matplotlib.axes import Axes
     from matplotlib.colorbar import Colorbar
     from matplotlib.cm import ScalarMappable

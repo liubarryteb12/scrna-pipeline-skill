@@ -220,6 +220,11 @@ jobs:
       - name: 静态检查（不装依赖）
         run: |
           node tools/check_py_syntax.mjs
+          # **未定义名字 / 幽灵 import 的真正作用域分析。** `check_py_syntax.mjs`
+          # 只认一份写死的名字名单，漏掉名单外的名字时本地全绿、CI 跑 25 分钟
+          # 才在运行到那一步时炸（E-61：`spot_radius_plot_units` 漏 import）。
+          # 这个用标准库 `symtable` 逐作用域判定，覆盖**任意**名字。
+          python tools/check_py_names.py .
           node tools/check_artifact_paths.mjs
           # 图例必须在图框外右侧、纵向排列（规则 26，用户约定 v2）。
           # 既有检查器全都看不见图例位置 —— 图例压在数据点上的图，

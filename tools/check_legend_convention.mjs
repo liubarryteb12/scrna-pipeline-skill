@@ -38,9 +38,40 @@
  * 交给人工终审。**静默豁免会让检查退化成没有检查，过度判死会让
  * 合法写法过不去** —— 两者都要避免，所以边界写在这里。
  *
+ * ── E-62：Python 侧曾把注释当代码（已修，附 `--selftest`）────────
+ *
+ * 修复前 `scanPy()` 直接把**原始源码**喂给 `calls()`，而 `calls()` 用
+ * `src.indexOf(name)` 找调用点、靠**括号配平**取实参文本。注释里出现的
+ * `fig.legend(` 因此有两个方向的错：
+ *
+ *   ① **假阳性**：注释里的 `fig.legend(...)` 被当成真调用去判 `loc`；
+ *   ② **假阴性**：注释里那个括号**不配平**时，`calls()` 一路吞到文件尾，
+ *      它后面**所有真调用永不被检查** —— 门禁照样打绿。
+ *
+ * 实测最小复现（`--selftest` 用例 F）：注释里同时出现 `fig.legend(` 与
+ * 字样 `loc="outside right center"`，紧随其后的真调用缺 `loc` —— **放行**。
+ * 这不是假想：本仓 `03_spatial_domains.py` 的注释在说明这个检查器时
+ * 恰好写出了 `fig.legend(`，于是它自己的真调用（L134）从未被检查过。
+ *
+ * 修法：`blankNonCode()` 先把**注释与三引号字符串**逐字符换成空格
+ * （保留换行，故行号与偏移都不变），再交给 `calls()`。单引号/双引号
+ * 字符串**保留内容**，因为 `loc="outside ..."` 正是靠它判的。
+ *
+ * 教训（与 E-61 同一条）：**检查器自己也要被检查** —— 所以本文件带
+ * `--selftest`，把"故意塞一个错"的用例写进代码里，不靠临时脚本。
+ *
+ * ── 已知盲区（不修，写在这里）───────────────────────────────
+ *
+ * `fig.legend(**legend_kw)` 这类**经 kwargs 转发**的调用，纯文本检查器
+ * 看不见 `loc`/`ncol`。跨函数数据流分析成本高且会引入新的假阴性，
+ * 所以约定 v2 的两个关键参数应当在 helper 里**焊死**（`fig.legend(
+ * loc="outside right center", ncol=1, **legend_kw)`），把可变部分留给
+ * 调用方 —— 这样检查器看得见，调用方也无法静默覆盖约定。
+ *
  * 用法:
  *   node tools/check_legend_convention.mjs            # 扫本仓库
  *   node tools/check_legend_convention.mjs --verbose  # 列出全部调用
+ *   node tools/check_legend_convention.mjs --selftest # 只跑内建标定用例
  */
 
 import { readFileSync, readdirSync, existsSync } from "node:fs";
@@ -48,12 +79,75 @@ import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const VERBOSE = process.argv.includes("--verbose");
+const SELFTEST = process.argv.includes("--selftest");
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const scriptsDir = join(repoRoot, "scripts");
 const libDir = join(scriptsDir, "lib");
 
 /**
+ * 把**注释**与**三引号字符串**的字符换成空格（保留 `\n`，故偏移/行号不变）。
+ *
+ * 单引号/双引号字符串**原样保留** —— `loc="outside right center"` 的内容
+ * 是判据本身，抹掉就没法判了。
+ *
+ * 为什么要抹注释：`calls()` 靠 `indexOf` + 括号配平取实参，注释里的
+ * `fig.legend(` 会被当调用；括号不配平时还会一路吞掉后面的真调用（E-62）。
+ * 为什么要抹三引号字符串：文档字符串里成片的代码示例不是被执行的调用。
+ *
+ * @param {string} src
+ * @returns {string} 与 src **等长**的字符串
+ */
+function blankNonCode(src) {
+  const a = src.split("");
+  const n = src.length;
+  const blank = (from, to) => {
+    for (let j = from; j < to; j++) if (a[j] !== "\n") a[j] = " ";
+  };
+  let i = 0;
+  while (i < n) {
+    const ch = src[i];
+    if (ch === "#") {
+      let j = i;
+      while (j < n && src[j] !== "\n") j++;
+      blank(i, j);
+      i = j;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      const t = src.substr(i, 3);
+      if (t === '"""' || t === "'''") {
+        let j = i + 3;
+        while (j < n && src.substr(j, 3) !== t) {
+          if (src[j] === "\\") j++;
+          j++;
+        }
+        j = Math.min(n, j + 3);
+        blank(i, j);
+        i = j;
+        continue;
+      }
+      // 单/双引号字符串：跳过但**不抹**，内容要留给判据。
+      let j = i + 1;
+      while (j < n && src[j] !== ch && src[j] !== "\n") {
+        if (src[j] === "\\") j++;
+        j++;
+      }
+      i = Math.min(n, j + 1);
+      continue;
+    }
+    i++;
+  }
+  return a.join("");
+}
+
+/**
  * 收集 src 里所有 `name(` 调用（括号配平、跨行）。
+ *
+ * **必须传 `blankNonCode()` 处理过的源码** —— 否则注释里的调用点会污染
+ * 结果（E-62）。行号与实参文本仍按原样返回，因为抹白是等长的。
+ *
+ * @param {string} src 已抹掉注释与三引号字符串的源码
+ * @param {string} name 如 `"fig.legend"`
  * @returns {{line:number,text:string}[]}
  */
 function calls(src, name) {
@@ -106,27 +200,82 @@ function scanR(file) {
   });
 }
 
-function scanPy(file) {
-  const src = readFileSync(file, "utf8");
-  for (const c of calls(src, "fig.legend")) {
+/**
+ * 扫一段 Python 源码，返回它的问题与备注（不写全局，方便 `--selftest`）。
+ * @param {string} src
+ * @param {string} label 报错前缀（通常是文件名）
+ */
+function scanPySource(src, label) {
+  const code = blankNonCode(src);
+  const probs = [];
+  const nts = [];
+  for (const c of calls(code, "fig.legend")) {
     const hasNcol = /ncol\s*=/.test(c.text);
     const outside = /loc\s*=\s*["']outside/.test(c.text);
-    if (VERBOSE) notes.push(`${basename(file)}:${c.line}  fig.legend  ncol=${hasNcol} outside=${outside}`);
+    if (VERBOSE) nts.push(`${label}:${c.line}  fig.legend  ncol=${hasNcol} outside=${outside}`);
     if (!outside) {
-      problems.push(`${basename(file)}:${c.line}  fig.legend 缺 loc="outside right center"` +
-                    `  —— 框内图例会压住数据点`);
+      probs.push(`${label}:${c.line}  fig.legend 缺 loc="outside right center"` +
+                 `  —— 框内图例会压住数据点`);
     } else if (!hasNcol) {
-      problems.push(`${basename(file)}:${c.line}  fig.legend 缺 ncol=1` +
-                    `  —— 多图例默认会横排，必须显式纵向单列`);
+      probs.push(`${label}:${c.line}  fig.legend 缺 ncol=1` +
+                 `  —— 多图例默认会横排，必须显式纵向单列`);
     }
   }
-  for (const c of calls(src, "ax.legend")) {
-    if (VERBOSE) notes.push(`${basename(file)}:${c.line}  ax.legend`);
+  for (const c of calls(code, "ax.legend")) {
+    if (VERBOSE) nts.push(`${label}:${c.line}  ax.legend`);
     if (/loc\s*=\s*["']outside/.test(c.text)) {
-      problems.push(`${basename(file)}:${c.line}  ax.legend 用了 loc="outside ..."` +
-                    `  —— 只对 fig.legend 有效，运行期必然 ValueError`);
+      probs.push(`${label}:${c.line}  ax.legend 用了 loc="outside ..."` +
+                 `  —— 只对 fig.legend 有效，运行期必然 ValueError`);
     }
   }
+  return { probs, nts };
+}
+
+function scanPy(file) {
+  const r = scanPySource(readFileSync(file, "utf8"), basename(file));
+  problems.push(...r.probs);
+  notes.push(...r.nts);
+}
+
+// ── 内建标定（E-62 教训：检查器自己也要被检查）────────────────────
+//
+// 每个用例 = 一段源码 + 期望的问题条数。**必须包含反向用例**：
+// 只跑"干净源码不报错"看不出假阴性，只跑"脏源码报错"看不出假阳性。
+if (SELFTEST) {
+  const OK = 'fig.legend(loc="outside right center", ncol=1)';
+  const CASES = [
+    ["基线：正确写法", [OK], 0],
+    ["真缺陷：缺 loc", ["fig.legend(ncol=1)"], 1],
+    ["真缺陷：缺 ncol", ['fig.legend(loc="outside right center")'], 1],
+    ["真缺陷：ax.legend 用 outside", ['ax.legend(loc="outside right center")'], 1],
+    ["假阳性回归：注释里有违规写法", [`# ${'fig.legend(loc="top")'}`, OK], 0],
+    ["假阳性回归：注释里有 fig.legend( 字样", ['# 见 `fig.legend(` 的说明', OK], 0],
+    ["假阳性回归：docstring 里有违规写法",
+     ['def f():\n    """\n    ' + 'fig.legend(loc="top")\n    """\n', OK], 0],
+    ["假阴性回归：注释里的 `fig.legend(` 不得吞掉后面的真缺陷",
+     ['# 见 `fig.legend(` 的说明', "fig.legend(ncol=1)"], 1],
+    ["假阴性回归：注释里带 loc 字样也不得吞掉后面的真缺陷",
+     ['# 判据是 `fig.legend(` 里的 loc="outside right center" 与 ncol=1',
+      "fig.legend(ncol=1)"], 1],
+    ["假阴性回归：注释里的括号不配平",
+     ["# 早期写法 fig.legend( 已废弃", OK], 0],
+  ];
+  let bad = 0;
+  console.log("check_legend_convention.mjs 自检（内建标定用例）");
+  for (const [name, lines, want] of CASES) {
+    const { probs } = scanPySource(lines.join("\n") + "\n", "case.py");
+    const ok = probs.length === want;
+    if (!ok) bad++;
+    console.log(`  ${ok ? "[ok]" : "[FAIL]"} ${name}  期望 ${want} 条，实际 ${probs.length} 条`);
+    if (!ok) probs.forEach((p) => console.log(`         ${p}`));
+  }
+  console.log("");
+  if (bad > 0) {
+    console.error(`[FAIL] 自检 ${bad}/${CASES.length} 个用例不通过 —— 检查器本身有问题。`);
+    process.exit(1);
+  }
+  console.log(`  自检通过（${CASES.length} 个用例，含 4 条假阳性/假阴性回归）`);
+  process.exit(0);
 }
 
 const rFiles = [];
