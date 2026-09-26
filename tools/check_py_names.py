@@ -25,6 +25,13 @@ is not defined`，后续 04–08 步全没跑。
 
 顺带查**幽灵 import**：`from common import X` 而 common 里没有 X。
 
+**第三条判据（2026-09-26 加，台账 E-70）：循环体里建了图、却没在同一个
+循环体里保存。** 这一条不是"名字"问题，而是**缩进错位**问题 —— 而
+`python -m py_compile` 只做编译，缩进变化仍然合法，三套图门禁也全都是绿的
+（实测：spatial `07_spatial_communication.py` 因为给 `for` 那一行加了缩进、
+循环体留在原缩进，3 张图只落盘 1 张，CI + 验收 79 项 + 静态门禁全绿）。
+所以判据必须**结构级**（AST），不能扫文本。
+
 用法: python tools/check_py_names.py <repo_root>
 退出码 1 表示发现问题。
 """
@@ -173,6 +180,102 @@ def module_level_defined_of(path: Path) -> set:
     return names
 
 
+# 建图 / 保存调用的尾段名字。用尾段而不是全名，是为了同时认
+# `plt.subplots` / `plt.figure` / `fig.savefig` / `plt.close` / `save_fig`。
+MAKE_FIG_TAILS = {"subplots", "figure"}
+SAVE_FIG_TAILS = {"save_fig", "savefig", "close"}
+SC_PL_PREFIX = "sc.pl."
+
+
+def dotted_name(node) -> str | None:
+    """把 `a.b.c(...)` 还原成 `"a.b.c"`；`f(...)` 还原成 `"f"`。"""
+    if not isinstance(node, ast.Call):
+        return None
+    parts = []
+    cur = node.func
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        parts.append(cur.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+def walk_same_scope(node):
+    """遍历子树，但**不进入嵌套的 def / lambda / class** —— 那是另一个作用域，
+    在它里面保存 figure 也算"这个循环体保存了"（例如循环里调 `def draw(...)`）。"""
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        yield cur
+        for child in ast.iter_child_nodes(cur):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                  ast.Lambda, ast.ClassDef)):
+                continue
+            stack.append(child)
+
+
+def save_helper_names(tree) -> set:
+    """**本文件里**「函数体内部含保存调用」的函数名集合。
+
+    没有这一条就会**误报**：`for` 里 `plt.subplots()` 之后调 `_draw(i)`，
+    而 `_draw` 内部 `save_fig(...)` —— 循环其实每次都保存了，但
+    `walk_same_scope` 不下潜到嵌套 `def`，看不见它。
+    **误报会让门禁被关掉**（E-64 首版把 `releases/` 当姊妹仓、E-61 把行号
+    指向另一段正确代码，都是同一类"指错地方"）。
+
+    这只是**同文件一层**的近似：跨模块的保存帮助函数仍然看不见
+    （那种写法本仓库没有；出现时门禁会判红，把保存挪进循环体即可）。
+    """
+    out = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call):
+                nm = dotted_name(sub)
+                if nm and nm.rsplit(".", 1)[-1] in SAVE_FIG_TAILS:
+                    out.add(node.name)
+                    break
+    return out
+
+
+def figure_loops_without_save(path: Path):
+    """返回 `[(建图行号, 循环行号), ...]`：循环体建了图但同一循环体内没有保存。
+
+    **为什么这是一个真缺陷而不是风格问题。** 循环体建图、`save_fig` 掉到循环外时：
+      · 循环跑了 N 次，**只有最后一次迭代留下的变量值**被那一次 save 落盘；
+      · 于是产物里**少 N-1 张图**，而图名看上去完全合规；
+      · 前 N-1 个 figure 没有被关闭（句柄泄漏）。
+    `figures:dynamic` 验收项只要求"每组 ≥1 张"（槽位是上限不是精确值），
+    `check_figures.mjs` 只查有没有墨 —— **没有一条既有判据看得见它**。
+    """
+    src = path.read_text(encoding="utf-8")
+    tree = ast.parse(src, filename=str(path))
+    helpers = save_helper_names(tree)
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            continue
+        makes, saves, mk_line = 0, 0, 0
+        for sub in walk_same_scope(node):
+            if not isinstance(sub, ast.Call):
+                continue
+            nm = dotted_name(sub)
+            if nm is None:
+                continue
+            tail = nm.rsplit(".", 1)[-1]
+            if tail in MAKE_FIG_TAILS or nm.startswith(SC_PL_PREFIX):
+                makes += 1
+                mk_line = mk_line or sub.lineno
+            if tail in SAVE_FIG_TAILS or tail in helpers:
+                saves += 1
+        if makes and not saves:
+            out.append((mk_line, node.lineno))
+    return out
+
+
 def main() -> int:
     repo = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
     files = list(iter_py(repo))
@@ -257,11 +360,25 @@ def main() -> int:
                         failed += 1
                         print(f"  {rel}:{node.lineno}  import 了 common 里不存在的 {nm}")
 
+    # 判据 3（E-70）：循环体建图但不在同一循环体内保存。
+    #
+    # **为什么不能扫文本**：`for ui, r in ...:` 多缩进 4 个空格、循环体留在
+    # 原缩进时，源码里 `save_fig(cfg, f"03-07-02-unit{ui}-{pair_slug}", fig)`
+    # 这个**字符串一字不改**，只是归属的块变了。只有 AST 能看见归属。
+    for f in files:
+        rel = f.relative_to(repo).as_posix()
+        for mk_line, loop_line in figure_loops_without_save(f):
+            failed += 1
+            print(f"  {rel}:{mk_line}  循环体里建了图，但同一个循环体内没有保存"
+                  f"（循环在 L{loop_line}）")
+            print("      循环跑 N 次只会落盘最后一张，其余 figure 未关闭 —— "
+                  "把 save_fig/close 挪进循环体")
+
     n = len(files)
     if failed:
-        print(f"\n{n} 个文件里发现 {failed} 处未定义名字 / 幽灵 import")
+        print(f"\n{n} 个文件里发现 {failed} 处未定义名字 / 幽灵 import / 循环建图未保存")
         return 1
-    print(f"未定义名字检查通过（{n} 个文件，逐作用域分析）")
+    print(f"静态结构检查通过（{n} 个文件：逐作用域名字 + 幽灵 import + 循环建图保存）")
     return 0
 
 
