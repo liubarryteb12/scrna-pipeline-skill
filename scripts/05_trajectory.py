@@ -44,6 +44,14 @@ from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: 
 # 校正后的统一方向：**值越大越晚**
 N_MODULES = 6
 MIN_GENES_FOR_MODULES = 200
+# **M7（R-03 裁决）**：分支段的最小细胞数。低于这个数的段，其中位拟时序
+# 由极少数细胞决定（实测有 11 个细胞的段），不该和 700+ 细胞的段并列展示。
+# 取 30 是常见的小样本下限：再少的话中位数对单个细胞的进出就敏感了。
+MIN_CELLS_PER_SEGMENT = 30
+# **M5（R-03 裁决）**：山脊图至少要有这么多个簇真的画出来才落盘。
+# 空坐标系**有墨**（有轴线、有刻度），所以 `check_figures.mjs` 的
+# 空白/糊死/贴边三条判据全绿 —— 空图能一路混过所有门禁。
+MIN_RIDGE_GROUPS = 2
 
 
 # ============================================================================
@@ -215,17 +223,34 @@ def orient(raw: dict, reference: np.ndarray, convention: dict):
         if convention.get(name) == "earlier":
             vv = -vv
         r_before = spearmanr(vv, reference).correlation
-        flipped = False
-        if r_before < 0:
+        # **L6（R-03 裁决）**：原来只判 `r_before < 0` 才翻转，于是
+        # `r_before == 0`（**与参考完全无关**）时 `flipped=False` —— 等价于
+        # "随机选一个方向"然后当成有方向的结果用。`spearmanr` 在输入是
+        # 常数列（某个方法退化）时正好返回 `nan`/`0`，而 `nan < 0` 为假，
+        # 也会走到"不翻转"这条路上。
+        #
+        # 修法：把"方向无法判定"显式标出来（`flipped=None`），而不是让它
+        # 伪装成"判断过、结论是不用翻"。下游按 `direction_decided` 决定
+        # 是否把这个方法算进共识 —— 见 `consensus` 段。
+        _decidable = bool(np.isfinite(r_before) and abs(r_before) > 0)
+        flipped = None
+        if _decidable and r_before < 0:
             vv = -vv
             flipped = True
+        elif _decidable:
+            flipped = False
         r_after = spearmanr(vv, reference).correlation
         out[name] = vv
         rows.append({
             "method": name,
             "raw_convention": convention.get(name, "?"),
             "rho_vs_reference_before_flip": round(float(r_before), 4),
-            "flipped": bool(flipped),
+            "flipped": flipped,
+            "direction_decided": _decidable,
+            "direction_note": (
+                None if _decidable else
+                f"与参考的相关 rho={r_before!r} —— **方向无法判定**，"
+                f"该方法的拟时序方向未做校正，不应被当成有方向的结果"),
             "rho_vs_reference_after_flip": round(float(r_after), 4),
         })
     return out, rows
@@ -400,9 +425,16 @@ def run_05_trajectory(cfg: dict) -> dict:
 
     corrected, direction_rows = orient(raw_pt, reference, convention)
     pd.DataFrame(direction_rows).to_csv(res_dir / "trajectory_direction.csv", index=False)
+    _n_undecided = 0
     for r in direction_rows:
-        log_info(f"  方向 {r['method']:10} rho={r['rho_vs_reference_after_flip']:+.4f}"
-                 f"{'（已翻转）' if r['flipped'] else ''}")
+        if r["flipped"] is None:
+            _n_undecided += 1
+            log_warn(f"  方向 {r['method']:10} "
+                     f"rho={r['rho_vs_reference_before_flip']:+.4f} —— "
+                     f"**无法判定方向**（L6），该方法的拟时序不做方向校正")
+        else:
+            log_info(f"  方向 {r['method']:10} rho={r['rho_vs_reference_after_flip']:+.4f}"
+                     f"{'（已翻转）' if r['flipped'] else ''}")
 
     # ---- 5. 交叉验证矩阵 ----------------------------------------------------
     names = [n for n in ("dpt", "palantir", "scfates", "cytotrace") if n in corrected]
@@ -468,7 +500,17 @@ def run_05_trajectory(cfg: dict) -> dict:
              + (f"；含参考方法的共识与它 rho={rho_ref:+.4f}" if rho_ref is not None else ""))
 
     # ---- 6. 沿轨迹变化的基因 ------------------------------------------------
+    #
+    # **M4（R-03 裁决）**：整段包在一个 `except Exception` 里只 `log_warn`。
+    # 后果不是"少一个文件"，而是**一个看起来正常的 0**：
+    # `n_genes_along_trajectory: len(genes_rows)` 静默变成 0、顶层 `status`
+    # 仍是 `ok`、`trajectory_genes.csv` 不存在也没有任何检查 ——
+    # 读者无法区分"这批数据里没有沿轨迹变化的基因"和"这一段崩了"。
+    # 这正是 E-48 的形态：`except` 把异常降级成一个**没人读的字段**。
+    # 修法：写**嵌套** `status["along_trajectory"]`（顶层保持 `ok`，
+    # 因为后面还有模块/图等步骤能出结果），让崩了这件事在产物里可见。
     genes_rows, gene_mat, gene_names, gene_rho = [], None, [], None
+    along_status = {"status": "not_run", "reason": None}
     try:
         src = adata.raw.to_adata() if adata.raw is not None else adata
         X = src.X
@@ -493,9 +535,16 @@ def run_05_trajectory(cfg: dict) -> dict:
                        "direction": "increases" if rho[i] > 0 else "decreases"}
                       for i in order[:200]]
         pd.DataFrame(genes_rows).to_csv(res_dir / "trajectory_genes.csv", index=False)
+        along_status = {"status": "ok", "reason": None,
+                        "n_expressed": int(len(idx)),
+                        "n_reported": int(len(genes_rows))}
         log_info(f"沿轨迹变化基因：表达基因 {len(idx)} 个，报前 {len(genes_rows)} 个")
     except Exception as e:  # noqa: BLE001
-        log_warn(f"沿轨迹基因分析失败: {type(e).__name__}: {e}")
+        along_status = {"status": "failed",
+                        "reason": f"{type(e).__name__}: {e}",
+                        "n_expressed": None, "n_reported": 0}
+        log_warn(f"沿轨迹基因分析失败: {type(e).__name__}: {e}"
+                 f"（已记进 trajectory_status.json 的 along_trajectory.status）")
 
     modules_rows = []
     if gene_mat is not None and gene_mat.shape[1] >= MIN_GENES_FOR_MODULES:
@@ -574,6 +623,12 @@ def run_05_trajectory(cfg: dict) -> dict:
             log_warn(f"基因模块分析失败: {type(e).__name__}: {e}")
 
     # ---- 7. 多条件拟时序分布比较（Kolmogorov-Smirnov）-----------------------
+    #
+    # **M2（R-03 裁决）**：原来是裸 `ks_2samp` 落盘，**没有任何多重检验校正**
+    # —— 而同一个仓库的 `06_communication.py:350` 与 `07_grn.py:243-254`
+    # 都做了 BH。三处口径不一致，读者无法判断哪些 `p_value` 可比。
+    # 两两比较的检验家庭是 `C(k,2)`，k 个条件时增长很快（k=6 → 15 对），
+    # 不校正就是把"做了 15 次检验"当成"做了 1 次"。
     ks_rows = []
     design = cfg.get("design") or {}
     group_key = design.get("group_key")
@@ -595,23 +650,68 @@ def run_05_trajectory(cfg: dict) -> dict:
                         "median_a": round(float(np.median(a_)), 4),
                         "median_b": round(float(np.median(b_)), 4),
                     })
+            # **BH 校正**（与 06/07 同口径）。`multipletests` 不可用时退化成
+            # 不校正但**显式记 `p_adj_available: False`** —— 静默不校正会让
+            # 读者以为 `p_value` 就是可用的判据（同 E-58 防复发②：注释与
+            # 代码行为必须一致）。
+            p_adj_available = False
+            if ks_rows:
+                try:
+                    from statsmodels.stats.multitest import multipletests
+                    _pv = [r["p_value"] for r in ks_rows]
+                    _rej, _padj, _, _ = multipletests(_pv, method="fdr_bh")
+                    for r, padj, rej in zip(ks_rows, _padj, _rej):
+                        r["p_adj_bh"] = float(padj)
+                        r["significant_bh"] = bool(rej)
+                    p_adj_available = True
+                except Exception as e:  # noqa: BLE001
+                    log_warn(f"KS 的 BH 校正失败（{type(e).__name__}: {e}）—— "
+                             f"只报原始 p_value，状态里会记 p_adj_available=False")
             if ks_rows:
                 pd.DataFrame(ks_rows).to_csv(res_dir / "trajectory_ks_by_group.csv",
                                              index=False)
-                log_info(f"多条件 KS 检验：{len(ks_rows)} 对比较")
+                n_sig = sum(1 for r in ks_rows if r.get("significant_bh"))
+                log_info(f"多条件 KS 检验：{len(ks_rows)} 对比较，"
+                         + (f"BH 校正后显著 {n_sig} 对"
+                            if p_adj_available else
+                            "**未做 BH 校正**（statsmodels 不可用）"))
     else:
+        p_adj_available = False
         log_info("未配置 design.group_key，跳过多条件拟时序分布比较")
 
     # ---- 8. 分支点 ----------------------------------------------------------
+    #
+    # **M7（R-03 裁决）**：原来每段都无条件写进 `trajectory_segments.csv`。
+    # 产物证据：某轮的段 2 只有 **11 个细胞**，`median_pseudotime = -0.0918`
+    # 与其余 5 段（|median| >= 0.196）明显不同 —— 11 个细胞的"中位拟时序"
+    # 没有意义，但它和 748 个细胞的那段在 CSV 里长得**一模一样**，读者会
+    # 把它当同等可信的结论。这和 spatial 规则 8 的"NNLS 给一个看起来像
+    # 答案、但不含信息的解"是同一形态。
+    # 修法：加最小细胞数守卫，并把 `is_reliable` 显式写进表 —— **保留
+    # 小段而不是丢掉**（它可能是真的小分支，删掉等于隐藏信息），但让
+    # 不可靠这件事在数据里可见，而不是只活在读者脑补里。
     branch_rows = []
+    n_unreliable_segments = 0
     if seg is not None:
         per_seg = pd.DataFrame({"seg": seg, "consensus": consensus}) \
             .groupby("seg", observed=True)["consensus"] \
             .agg(["mean", "median", "count"]).reset_index()
         for _, r in per_seg.iterrows():
-            branch_rows.append({"segment": r["seg"], "n_cells": int(r["count"]),
-                                "median_pseudotime": round(float(r["median"]), 4)})
+            n_c = int(r["count"])
+            reliable = n_c >= MIN_CELLS_PER_SEGMENT
+            if not reliable:
+                n_unreliable_segments += 1
+            branch_rows.append({"segment": r["seg"], "n_cells": n_c,
+                                "median_pseudotime": round(float(r["median"]), 4),
+                                "is_reliable": bool(reliable),
+                                "min_cells_note": ("" if reliable else
+                                                   f"n<{MIN_CELLS_PER_SEGMENT}，"
+                                                   "中位数不可靠")})
         pd.DataFrame(branch_rows).to_csv(res_dir / "trajectory_segments.csv", index=False)
+        if n_unreliable_segments:
+            log_warn(f"分支段里有 {n_unreliable_segments} 段细胞数 < "
+                     f"{MIN_CELLS_PER_SEGMENT}，已在 trajectory_segments.csv 里"
+                     f"标 is_reliable=false")
 
     # ---- 9. 图：拟时序三联 -> **单图原则拆分（D-006）** ----------------------
     # 拆成三张独立单图（S2 拟时序方法对照链）：
@@ -747,6 +847,15 @@ def run_05_trajectory(cfg: dict) -> dict:
     # **山脊图（ridgeline）**（差距清单 #20，文献范式）：箱线只给分位数，
     # 山脊图给每个簇的**分布形状**（双峰=该簇跨两个状态）。
     # 手写 KDE + 垂直错开（不引 ggridges/seaborn 新依赖）。
+    #
+    # **M5（R-03 裁决）**：`save_fig` 原来在循环**之后**、`try` 之内 ——
+    # 循环体里的 `continue`（某簇细胞数 < 10）不会阻止落盘，所以**所有簇
+    # 都被跳过时照样写出一张空图**。空坐标轴**有墨**（轴线 + 刻度），
+    # `check_figures.mjs` 的空白/糊死/贴边三条判据全绿 ⇒ 空图混过所有门禁。
+    # 修法：统计真的画了几条曲线，不够就**不落盘**并把原因写进状态 ——
+    # 让"这张图为什么没有"在 `trajectory_status.json` 里看得见。
+    n_ridge_drawn = 0
+    ridge_skip_reason = None
     try:
         from scipy.stats import gaussian_kde
         fig_r, ax_r = plt.subplots(figsize=(W_ONE_HALF, mm(72)))
@@ -764,14 +873,23 @@ def run_05_trajectory(cfg: dict) -> dict:
             ax_r.fill_between(grid, ri + dens, ri, color=PAL["primary"],
                              alpha=0.45)
             ax_r.plot(grid, ri + dens, "-", lw=0.7, color=PAL["primary"])
-        ax_r.set_yticks(range(len(order)))
-        ax_r.set_yticklabels(order, fontsize=6)
-        ax_r.set_xlabel("consensus pseudotime (higher = later)")
-        ax_r.set_ylabel("cluster")
-        ax_r.set_title("Pseudotime density per cluster (ridgeline) - KDE per cluster, offset vertically")
-        save_fig(cfg, "02-05-05-unit2-pseudotime-ridgeline", fig_r)
+            n_ridge_drawn += 1
+        if n_ridge_drawn < MIN_RIDGE_GROUPS:
+            ridge_skip_reason = (
+                f"只有 {n_ridge_drawn} 个簇的细胞数 >= 10（需要 >= "
+                f"{MIN_RIDGE_GROUPS} 个）—— 落盘会是空图，故不落盘")
+            log_warn(f"山脊图跳过：{ridge_skip_reason}")
+            plt.close(fig_r)
+        else:
+            ax_r.set_yticks(range(len(order)))
+            ax_r.set_yticklabels(order, fontsize=6)
+            ax_r.set_xlabel("consensus pseudotime (higher = later)")
+            ax_r.set_ylabel("cluster")
+            ax_r.set_title("Pseudotime density per cluster (ridgeline) - KDE per cluster, offset vertically")
+            save_fig(cfg, "02-05-05-unit2-pseudotime-ridgeline", fig_r)
     except Exception as e:  # noqa: BLE001
-        log_warn(f"山脊图失败: {type(e).__name__}: {e}")
+        ridge_skip_reason = f"{type(e).__name__}: {e}"
+        log_warn(f"山脊图失败: {ridge_skip_reason}")
 
     # ---- 10. 每细胞拟时序落盘（供 07_grn 做 regulon×拟时序）-----------------
     cell_df = pd.DataFrame({"cell": adata.obs_names.astype(str),
@@ -843,6 +961,17 @@ def run_05_trajectory(cfg: dict) -> dict:
                              round(float(np.nanmax(consensus)), 4)],
         "pseudotime_by_cluster": df_to_records(per_cluster),
         "n_genes_along_trajectory": len(genes_rows),
+        # **M4（R-03 裁决）**：`n_genes_along_trajectory` 为 0 时，读者
+        # 分不清"数据里没有"和"这段崩了"。下面这个嵌套 status 把两者分开。
+        "along_trajectory": along_status,
+        # **M5**：山脊图没落盘时，这里必须说明为什么。
+        "ridgeline": ({"status": "ok", "n_groups_drawn": n_ridge_drawn}
+                      if ridge_skip_reason is None else
+                      {"status": "skipped", "reason": ridge_skip_reason,
+                       "n_groups_drawn": n_ridge_drawn}),
+        # **M7**：分支段里有多少段细胞数不足。
+        "n_unreliable_segments": n_unreliable_segments,
+        "min_cells_per_segment": MIN_CELLS_PER_SEGMENT,
         "n_modules": len(modules_rows),
         "scfates_segments": int(len(set(seg))) if seg is not None else 0,
         "scfates_milestones": int(len(set(mil))) if mil is not None else 0,
@@ -850,6 +979,19 @@ def run_05_trajectory(cfg: dict) -> dict:
             {"n_terminal_states": int(fate_probs.shape[1]),
              "shape": list(fate_probs.shape)} if fate_probs is not None else None),
         "ks_by_group": ks_rows,
+        # **M2**：KS 的 p 值分辨率与校正状态必须显式落盘 —— 只给一串
+        # `p_value` 而不说"校没校正、下限是多少"，读者会把它当成可用的
+        # 判据（spatial 侧同问题记在 `p_value_resolution`，口径对齐）。
+        "ks_by_group_note": {
+            "p_adj_available": p_adj_available,
+            "correction": "fdr_bh" if p_adj_available else None,
+            "n_pairs": len(ks_rows),
+            "note": ("两两 KS 检验的家庭是全部条件对；"
+                     "`p_adj_bh` 是 BH 校正后的值，判显著性看它"
+                     if p_adj_available else
+                     "**本轮未做 BH 校正**（statsmodels 不可用），"
+                     "`p_value` 是未校正值，不能直接当判据"),
+        },
         "scvelo": {
             "status": "not_done",
             "reason": ("RNA 速率需要 spliced/unspliced 两套计数矩阵。本流水线的输入是"

@@ -40,8 +40,8 @@ import yaml  # noqa: E402
 from scipy import sparse  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, result_status_of,
-                    save_fig, set_seed,
+                    log_warn, parse_args, read_json, record_step,
+                    result_status_of, save_fig, set_seed,
                     write_json, W_DOUBLE, W_ONE_HALF,)
 
 N_PERMUTATIONS = 200
@@ -272,6 +272,20 @@ def run_06_communication(cfg: dict) -> dict:
     lookup = set(var_names)
     log_info(f"表达矩阵（全基因集）: {X.shape[0]} 细胞 x {X.shape[1]} 基因")
 
+    # **L7（R-03 裁决）**：打分是"两个均值相乘"，而均值的**量纲**由上游的
+    # 标准化决定 —— `log1p(counts / total * target_sum)`。`target_sum` 不写
+    # 进 status 的话，读者无法复现这个分数的量级：换一个 `target_sum`，
+    # 全部 score 会整体平移，而 `p_value` / `n_significant_bh` 几乎不变。
+    # 从 `integration_status.json` 读真实值（而不是再写一遍配置常量 ——
+    # 配置可能被改过，产物里记的才是**实际用的**）。
+    _integ = read_json(res_dir / "integration_status.json") or {}
+    target_sum = _integ.get("target_sum")
+    norm_note = ("表达量来自 `adata.raw`，是 `log1p(counts / 每细胞总计数 * "
+                 f"target_sum)` 且 `target_sum={target_sum}`"
+                 if target_sum is not None else
+                 "**未能从 integration_status.json 读到 target_sum** —— "
+                 "本表的 score 量级无法复现")
+
     present = []
     for pr in pairs:
         lig = [g for g in pr.get("ligand", []) if g in lookup]
@@ -352,6 +366,16 @@ def run_06_communication(cfg: dict) -> dict:
                     "ligand": ",".join(pr["ligand"]), "receptor": ",".join(pr["receptor"]),
                     "score": round(obs_score, 5), "null_mean": round(float(null.mean()), 5),
                     "p_value": round(p, 5), "n_permutations": N_PERMUTATIONS,
+                    # **M3（R-03 裁决）**：置换 p 值的最小分辨率是
+                    # `1/(N+1)`。N=200 时它等于 0.004975 —— 也就是说
+                    # `p` **永远取不到 0.001 这种值**，能取到的只有
+                    # {1/201, 2/201, ...} 这 201 个离散值。不写出来，
+                    # 读者会把 `p_value = 0.004975` 当成一个连续量的估计，
+                    # 而它其实是"所有 200 次置换都没超过观测值"这个
+                    # 上限档位。落盘成显式字段，读者一眼能看到分辨率。
+                    "p_value_resolution": round(1.0 / (N_PERMUTATIONS + 1), 8),
+                    "p_value_at_floor": bool(
+                        abs(p - 1.0 / (N_PERMUTATIONS + 1)) < 1e-12),
                     "tested": True,
                 })
 
@@ -442,6 +466,14 @@ def run_06_communication(cfg: dict) -> dict:
         "n_pairs_in_database": len(pairs),
         "n_pairs_usable": len(present),
         "n_genes_used": int(X.shape[1]),
+        # **L7（R-03 裁决）**：分数的量纲来源。缺了它，读者换了
+        # `target_sum` 也看不出 score 为什么整体变了。
+        "target_sum": target_sum,
+        "score_scale_note": norm_note,
+        "score_definition": ("`mean(配体基因在 sender 的表达) × "
+                             "mean(受体基因在 receiver 的表达)` —— "
+                             "**两个均值相乘，不是几何平均、不是最大值**；"
+                             "量纲随上面的 target_sum 整体缩放"),
         "gene_set_note": ("用的是**全基因集**（adata.raw），不是 HVG 子集。"
                           "配体/受体基因大多是低表达的细胞因子/趋化因子，"
                           "几乎不进 HVG —— 实测在 HVG 子集上 38 对里只有 3 对可用，"
@@ -457,6 +489,19 @@ def run_06_communication(cfg: dict) -> dict:
                            f"{n_evaluated} 个，`p_adj_bh` 系统性偏小"
                            "（审计 S4）"),
         "n_permutations": N_PERMUTATIONS,
+        # **M3（R-03 裁决）**：置换检验的 p 值分辨率。N=200 时最小非零
+        # p 是 1/201 ≈ 0.004975，`p` 只能取 201 个离散值。原来 status 里
+        # 有 `n_permutations` 但**从不提下限**，7 条 limitations 也没有一条
+        # 说这件事 —— 于是"所有置换都没超过观测值"这个上限档位
+        # （`p = 0.004975`）在读者眼里与一个精确的小 p 值没有区别。
+        "p_value_resolution": round(1.0 / (N_PERMUTATIONS + 1), 8),
+        "p_value_note": (f"置换检验的 p 只能取 1/(N+1) 的整数倍 —— "
+                         f"N={N_PERMUTATIONS} 时最小非零值是 "
+                         f"{1.0 / (N_PERMUTATIONS + 1):.6f}，共 "
+                         f"{N_PERMUTATIONS + 1} 个离散档位。"
+                         f"`p_value_at_floor=True` 表示该组合的观测分数"
+                         f"一次都没被置换超越，它是**分辨率上限**而不是"
+                         f"一个精确估计"),
         "top_pairs": df_to_records(res.head(15)),
         "liana": liana_info,
         "liana_vs_builtin": liana_cmp,
@@ -473,6 +518,16 @@ def run_06_communication(cfg: dict) -> dict:
             "表达量是稳态丰度，不等于蛋白水平，也不等于分泌量",
             "自建打分是启发式，不是 LIANA 的 consensus rank aggregate",
             "置换检验打乱的是细胞标签，保留了每种细胞类型的细胞数",
+            # **M3（R-03 裁决）**：这一条原来缺失 —— `n_permutations` 在
+            # status 里有，但"p 值因此只能取 201 个离散值"这件事从没写出来。
+            # 上限档位（所有置换都没超过观测值）与一个精确的小 p 值在
+            # CSV 里长得一样。
+            (f"**置换检验的 p 值有分辨率下限**：N={N_PERMUTATIONS} 时最小非零"
+             f"值是 1/{N_PERMUTATIONS + 1} ≈ "
+             f"{1.0 / (N_PERMUTATIONS + 1):.6f}，全表只有 "
+             f"{N_PERMUTATIONS + 1} 个可能的 p 值。"
+             f"`p_value_at_floor` 标出的组合是"
+             f"**分辨率上限**，不要当成精确估计"),
             f"**内置库只有 {len(pairs)} 对**（免疫为主），远少于 CellChatDB 的数千对；"
             "覆盖不全时『没找到显著通讯』是假阴性，不是真的没有通讯",
             ("LIANA 用的是它自带的 consensus 资源（CellChatDB + CellPhoneDB 等），"

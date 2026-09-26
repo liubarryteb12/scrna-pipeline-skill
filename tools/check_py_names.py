@@ -63,11 +63,15 @@ def scope_first_use(path: Path) -> dict:
     """返回 {(作用域名, 名字): 该作用域内首次引用行号}。
 
     **必须按作用域定位，不能全文件找首次出现。** 第一版在整棵 AST 上找
-    `n.id == nm` 的第一个 `Name`，于是 `plt` 被报成 `common.py:859` ——
-    那是**另一个函数**（`plot_marker_dotplot`）里的 `plt`，而那个函数
-    自己 `import matplotlib.pyplot as plt`（L847），行号指向一处**没问题
-    的代码**。真正有问题的在 `fix_dotplot_legends` 的 L1086。
+    `n.id == nm` 的第一个 `Name`，于是 `plt` 被报成某个**别的函数**里的
+    `plt` —— 那个函数自己 `import matplotlib.pyplot as plt`，行号指向一处
+    **没问题的代码**。
     指向错的行号比不指行号更糟：下一个人会去读一段正确的代码然后困惑。
+
+    （2026-09-26 更正：这段注释原来带**具体的文件名与行号**。写具体行号时
+    它是对的，但行号会随代码改动失效，而失效的引用与指向错的行号是同一类
+    毛病 —— 下一个人照着去翻，会翻到别的东西。所以改成不写死行号。
+    两仓的这份文件逐字节相同，写死行号在另一仓必然错。）
     """
     tree = ast.parse(path.read_text(encoding="utf-8"))
     out = {}

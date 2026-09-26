@@ -1,0 +1,224 @@
+# QC 基因集合 —— 血红蛋白（红细胞污染）与核糖体基因
+#
+# **为什么是精确基因名而不是前缀**（审计 M15，R-03 裁决）：
+# `01_qc.py` 原来用 `var_names.str.startswith(("HBA","HBB",...))` 判断
+# 血红蛋白基因。前缀匹配会**误收**：
+#   - `HBEGF`（heparin-binding EGF-like growth factor）以 `HBE` 开头
+#     → 被算进 `pct_counts_hb`，而这个基因与红细胞毫无关系；
+#   - `RPSA`（ribosomal protein SA 的旧名，实为层粘连蛋白受体前体）
+#     以 `RPS` 开头 → 被算进核糖体比例。
+# 后果不是报错，而是**指标本身偏了**：`pct_counts_hb` 偏大 → 按它过滤会
+# 误删真细胞；`pct_counts_ribo` 偏大 → 同样的阈值删掉更多细胞。
+# 两者都"看起来正常"，因为百分比的量级没有变。
+#
+# 前缀匹配的诱因是"基因名列表太长，写前缀省事" —— 但省下的那点篇幅，
+# 换来的是一个**没人能复核的指标定义**。这里把列表写全。
+#
+# 维护说明：本文件是 QC 指标的**定义**，改动它等于改动 `pct_counts_hb` /
+# `pct_counts_ribo` 的语义 —— 改完必须重跑并对比分布，不能只看图变没变。
+
+# 人（Homo sapiens）。HGNC 的 HBA/HBB 基因家族全名：
+#   血红蛋白 α 簇：HBA1 HBA2 HBM HBA@（HBA@ 是旧占位符，不在现代注释里）
+#   血红蛋白 β 簇：HBB HBD HBE1 HBG1 HBG2 HBBP1
+#   血红蛋白 θ/ζ：HBQ1 HBZ
+# `HBE1` 与 `HBE2`（后者是已废弃名）要写全名 —— 写 `HBE` 前缀就会收 HBEGF。
+human_hb_genes:
+  - HBA1
+  - HBA2
+  - HBB
+  - HBD
+  - HBE1
+  - HBG1
+  - HBG2
+  - HBM
+  - HBQ1
+  - HBZ
+  - HBBP1        # β 簇假基因，仍随红细胞污染一起变化
+
+# 小鼠（Mus musculus）。注意小鼠基因名首字母大写：
+#   Hba-a1 Hba-a2 Hbb-b1 Hbb-b2 Hbb-bh1 Hbb-bh2 Hbb-bt Hbe1 Hbg1 Hbg2 Hbq1 Hbz
+mouse_hb_genes:
+  - Hba-a1
+  - Hba-a2
+  - Hbb-b1
+  - Hbb-b2
+  - Hbb-bh1
+  - Hbb-bh2
+  - Hbb-bs
+  - Hbb-bt
+  - Hbe1
+  - Hbg1
+  - Hbg2
+  - Hbq1
+  - Hbz
+
+# 核糖体蛋白基因。前缀 `RP` 看似干净，但 `RPSA`（ribosomal protein SA）
+# 实际上编码 67 kDa 层粘连蛋白受体前体，功能上不是核糖体组分；
+# `RPLP0`/`RPLP1`/`RPLP2` 是酸性核糖体磷蛋白，随核糖体一起变化，保留。
+# 人：RPS1..RPS29 + RPL1..RPL41 家族（去掉已废弃的 RPSA/RPLP0 歧义项）。
+# 这里列的是**常用且明确属于核糖体**的那批；未列出的 RP* 基因会被漏掉，
+# 所以下面 `ribo_prefix_fallback` 记录了"漏掉"的规模，让读者能判断影响。
+human_ribo_genes:
+  - RPS2
+  - RPS3
+  - RPS3A
+  - RPS4X
+  - RPS4Y1
+  - RPS5
+  - RPS6
+  - RPS7
+  - RPS8
+  - RPS9
+  - RPS10
+  - RPS11
+  - RPS12
+  - RPS13
+  - RPS14
+  - RPS15
+  - RPS15A
+  - RPS16
+  - RPS17
+  - RPS18
+  - RPS19
+  - RPS20
+  - RPS21
+  - RPS23
+  - RPS24
+  - RPS25
+  - RPS26
+  - RPS27
+  - RPS27A
+  - RPS28
+  - RPS29
+  - RPL3
+  - RPL4
+  - RPL5
+  - RPL6
+  - RPL7
+  - RPL7A
+  - RPL8
+  - RPL9
+  - RPL10
+  - RPL10A
+  - RPL11
+  - RPL12
+  - RPL13
+  - RPL13A
+  - RPL14
+  - RPL15
+  - RPL17
+  - RPL18
+  - RPL18A
+  - RPL19
+  - RPL21
+  - RPL22
+  - RPL23
+  - RPL23A
+  - RPL24
+  - RPL26
+  - RPL27
+  - RPL27A
+  - RPL28
+  - RPL29
+  - RPL30
+  - RPL31
+  - RPL32
+  - RPL34
+  - RPL35
+  - RPL35A
+  - RPL36
+  - RPL36A
+  - RPL37
+  - RPL37A
+  - RPL38
+  - RPL39
+  - RPL40
+  - RPL41
+  - RPLP0
+  - RPLP1
+  - RPLP2
+# 注意：**`RPSA` 不在这里**。它编码 67 kDa 层粘连蛋白受体前体，不是核糖体
+# 组分，而旧前缀规则 `RPS*` 把它算进了 `pct_counts_ribo`（审计 M15 点名的
+# 误收之一）。移除它会**让 `pct_counts_ribo` 比历史产物略小** —— 这个变化
+# 是刻意的，`qc_status.json` 的 `qc_gene_sets.prefix_extra_genes` 会把
+# "旧前缀会多收哪些基因"列出来，方便对比历史产物时解释差异。
+
+# 小鼠核糖体基因（Rps*/Rpl*，首字母大写）
+mouse_ribo_genes:
+  - Rps2
+  - Rps3
+  - Rps3a1
+  - Rps4x
+  - Rps5
+  - Rps6
+  - Rps7
+  - Rps8
+  - Rps9
+  - Rps10
+  - Rps11
+  - Rps12
+  - Rps13
+  - Rps14
+  - Rps15
+  - Rps15a
+  - Rps16
+  - Rps17
+  - Rps18
+  - Rps19
+  - Rps20
+  - Rps21
+  - Rps23
+  - Rps24
+  - Rps25
+  - Rps26
+  - Rps27
+  - Rps27a
+  - Rps28
+  - Rps29
+  - Rpl3
+  - Rpl4
+  - Rpl5
+  - Rpl6
+  - Rpl7
+  - Rpl7a
+  - Rpl8
+  - Rpl9
+  - Rpl10
+  - Rpl10a
+  - Rpl11
+  - Rpl12
+  - Rpl13
+  - Rpl13a
+  - Rpl14
+  - Rpl15
+  - Rpl17
+  - Rpl18
+  - Rpl18a
+  - Rpl19
+  - Rpl21
+  - Rpl22
+  - Rpl23
+  - Rpl23a
+  - Rpl24
+  - Rpl26
+  - Rpl27
+  - Rpl27a
+  - Rpl28
+  - Rpl29
+  - Rpl30
+  - Rpl31
+  - Rpl32
+  - Rpl34
+  - Rpl35
+  - Rpl35a
+  - Rpl36
+  - Rpl36a
+  - Rpl37
+  - Rpl37a
+  - Rpl38
+  - Rpl39
+  - Rpl41
+  - Rplp0
+  - Rplp1
+  - Rplp2
+  - Rpsa

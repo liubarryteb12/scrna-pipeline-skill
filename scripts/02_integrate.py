@@ -122,7 +122,18 @@ def run_02_integrate(cfg: dict) -> dict:
     work = adata[:, adata.var["highly_variable"]].copy()
 
     # ---- 3. PCA -------------------------------------------------------------
-    sc.tl.pca(work, svd_solver="arpack", random_state=cfg["analysis"]["seed"])
+    # **M13（R-03 裁决）**：原来没传 `n_comps`，于是算的是 scanpy 的默认 50 个，
+    # 而状态文件里报的是 `cfg["reduce"]["n_pcs"]`（配置 40）—— **报的数和
+    # 算的数不是一个数**。第 41–50 个 PC 算了却从不被报告或使用，白算；
+    # 更糟的是读者拿 `n_pcs=40` 去核对 `pca_variance_ratio_top10` 时会以为
+    # 两者同源。修法：把配置值真正传进去，两者从此必然一致。
+    # 配置值可能超过数据维度（小数据集 / 少 HVG）—— scanpy 会直接抛错。
+    # 夹到 `min(n_obs, n_vars)` 并把**实际算的个数**记进状态（不是配置值）。
+    n_comps_max = int(min(work.n_obs, work.n_vars))
+    n_comps = min(int(cfg["reduce"]["n_pcs"]), n_comps_max)
+    n_comps_clamped = n_comps != int(cfg["reduce"]["n_pcs"])
+    sc.tl.pca(work, n_comps=n_comps, svd_solver="arpack",
+              random_state=cfg["analysis"]["seed"])
     import matplotlib.pyplot as plt
     # **不用 `sc.pl.pca_variance_ratio`。** 实测它出的图有三个问题：
     #
@@ -154,7 +165,10 @@ def run_02_integrate(cfg: dict) -> dict:
     save_fig(cfg, "02-02-02-unit1-pca-variance-ratio", fig)
     log_info(f"PCA 方差比图: 标出 {len(ticks)} 个刻度（共 {n_pc} 个 PC）")
 
-    var_ratio = work.uns["pca"]["variance_ratio"]
+    # **L1（R-03 裁决）**：这里原来又写了一遍
+    # `var_ratio = work.uns["pca"]["variance_ratio"]` —— 与上面那次赋值完全
+    # 相同，是死代码。删掉（不删的代价不是性能，是读者会以为"这里重新读了
+    # 一次，说明中间可能变过"）。
     log_info(f"PC1-{min(10, len(var_ratio))} 方差解释: "
              f"{', '.join(f'{v:.3f}' for v in var_ratio[:10])}")
 
@@ -191,7 +205,12 @@ def run_02_integrate(cfg: dict) -> dict:
             log_warn(integ_record["reason"])
     elif method == "combat":
         sc.pp.combat(work, key=batch_key)
-        sc.tl.pca(work, svd_solver="arpack", random_state=cfg["analysis"]["seed"])
+        # M13：重跑 PCA 时**必须带同样的 `n_comps`** —— 否则 ComBat 分支算 50 个、
+        # 非 ComBat 分支算 40 个，两条路径的 `n_pcs` 语义不同而状态文件
+        # 报的是同一个配置值。
+        sc.tl.pca(work, n_comps=n_comps, svd_solver="arpack",
+                  random_state=cfg["analysis"]["seed"])
+        var_ratio = work.uns["pca"]["variance_ratio"]
         integ_record["status"] = "ok"
         integ_record["note"] = "ComBat 后重跑了 PCA（ComBat 直接改 X，X_pca 已失效）"
         log_info(integ_record["note"])
@@ -231,11 +250,23 @@ def run_02_integrate(cfg: dict) -> dict:
         "hvg_fallback": hvg_fallback,
         "n_top_genes_requested": n_top,
         "target_sum": target_sum,
-        "n_pcs": int(cfg["reduce"]["n_pcs"]),
+        # **M13（R-03 裁决）**：原来这里写的是配置值，而实际算的是 scanpy
+        # 默认 50 —— **报的数和算的数不是一个数**。现在报实际值，并在被
+        # 数据维度夹住时显式说明（"我按你说的做了"和"我改小了"必须能区分）。
+        "n_pcs": int(n_comps),
+        "n_pcs_requested": int(cfg["reduce"]["n_pcs"]),
+        "n_pcs_clamped": bool(n_comps_clamped),
         "pca_variance_ratio_top10": [round(float(v), 5) for v in var_ratio[:10]],
         "pca_cumvar_top10": [round(float(v), 5) for v in np.cumsum(var_ratio[:10])],
         "integration": integ_record,
         "use_rep": use_rep,
+        # **M11 配套**：批次混合图的产出与否取决于有没有 `batch_key`，
+        # 而 `CONDITIONAL_FIGURES` 的判据需要一个能读的字段。以前这个
+        # 条件只写在代码的 `if batch_key and ...` 里，验收层看不见 ——
+        # 于是没有批次的数据集上这张图"声明了但没产出"会被判红。
+        # 落盘成显式布尔值，判据就自愈了：哪天配了 batch_key，这张图
+        # 立刻自动变成必需。
+        "has_batch_key": bool(batch_key and batch_key in work.obs.columns),
         "status": "ok",
     }
     write_json(res_dir / "integration_status.json", status)

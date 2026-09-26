@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -24,21 +25,36 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
-import yaml
-
 # ============================================================================
-# 确定性
+# 确定性 —— **必须在 import numpy / scanpy / numba 之前执行**
 # ============================================================================
-# **必须在 import scanpy/numba 之前设。** numba 在首次 JIT 时读这些环境变量
-# 决定线程数，晚设无效。Part 1 的教训：浮点末位分叉有两个独立来源 ——
-# 线程调度（多线程归约的求和顺序）和 OpenBLAS 运行期按 CPU 型号选 SIMD 内核。
-# 这里两个都钉住。
+# numba 在**首次 JIT 时**读这些环境变量决定线程数与线程层，晚设无效；
+# OpenBLAS 在**运行期**按 CPU 型号选 SIMD 内核，也在 import 时定型。
+# Part 1 的教训：浮点末位分叉有两个独立来源 —— 线程调度（多线程归约的
+# 求和顺序）和 OpenBLAS 运行期按 CPU 型号选 SIMD 内核。这里都钉住。
+#
+# **M22（R-03 裁决）**：这一段原来写在 `import numpy as np` **之后**，
+# 而注释自己写着"必须在 import scanpy/numba 之前设" —— **注释陈述的行为
+# 与代码实际行为相反**（同 E-58 防复发②：S6 的"必须用 counts layer"、
+# S9 的"用细胞数反推"、S10 的"判断整个 X"三处都是同一形态）。
+# 本机直跑时这一层是**唯一**一层防护（CI 里 workflow 另有 job 级 env），
+# 所以它失效时 CI 看不出来。同时补上原来**缺失**的 `NUMBA_NUM_THREADS`
+# 与 `NUMBA_THREADING_LAYER`（AGENTS 规则 20.3 点名过；CI workflow 里
+# 设了、common.py 里没设 ⇒ 本地直跑与 CI 不等价）。
+#
+# 顺序上必须放在所有第三方 import 之前 —— 下面 `import numpy as np` 等
+# 一律排在这一段之后。`import os` 是标准库、不触发这些库的初始化，可以
+# 留在原位（文件头）。
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
-           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
+           "NUMBA_NUM_THREADS"):
     os.environ.setdefault(_v, "1")
+os.environ.setdefault("NUMBA_THREADING_LAYER", "workqueue")
 os.environ.setdefault("OPENBLAS_CORETYPE", "Haswell")
 os.environ.setdefault("PYTHONHASHSEED", "0")
+
+import numpy as np  # noqa: E402  —— 必须排在上面那段 env 之后
+import yaml  # noqa: E402
 
 
 # ============================================================================
@@ -142,14 +158,50 @@ def set_seed(cfg: dict) -> int:
     return seed
 
 
+def _scrub_nonfinite(obj):
+    """把 `NaN` / `Infinity` 递归换成 `None`，并返回 `(新对象, 命中数)`。
+
+    **M9（R-03 裁决）**：`json.dump` 默认 `allow_nan=True`，会把 `NaN` /
+    `Infinity` **原样写进文件** —— 那不是合法 JSON，`node`/`jq`/R 侧读者
+    一律解析失败。而 Python 自己 `json.load` 读得回来，所以**本地看不出来**
+    （M17 的 `score_margin: NaN` 就是这么落盘的）。
+
+    换成 `None`（JSON `null`）而不是删键：**"这个量算不出来"本身是信息**，
+    删掉它读者只会以为没这个字段。同时把命中数报出来，让它可见。
+    """
+    if isinstance(obj, dict):
+        out, hits = {}, 0
+        for k, v in obj.items():
+            nv, h = _scrub_nonfinite(v)
+            out[k], hits = nv, hits + h
+        return out, hits
+    if isinstance(obj, (list, tuple)):
+        out, hits = [], 0
+        for v in obj:
+            nv, h = _scrub_nonfinite(v)
+            out.append(nv)
+            hits += h
+        return (out if isinstance(obj, list) else tuple(out)), hits
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None, 1
+    return obj, 0
+
+
 def write_json(path, obj) -> None:
+    """写 JSON。**保证写出的是合法 JSON**（M9）—— 非有限浮点先换成 `null`。
+
+    用了 `allow_nan=False` 作为**兜底断言**：即使 `_scrub_nonfinite` 漏了
+    某个非有限值（如藏在自定义对象里），`json.dump` 会抛 `ValueError`
+    而不是**悄悄写出一个非法文件**。宁可这一轮失败，也不要下游读者解析失败。
+    """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
     def default(o):
         if isinstance(o, (np.integer,)):
             return int(o)
         if isinstance(o, (np.floating,)):
-            return float(o)
+            f = float(o)
+            return None if not math.isfinite(f) else f
         if isinstance(o, (np.bool_,)):
             return bool(o)
         if isinstance(o, np.ndarray):
@@ -158,18 +210,49 @@ def write_json(path, obj) -> None:
             return str(o)
         return str(o)
 
+    clean, n_nonfinite = _scrub_nonfinite(obj)
+    if n_nonfinite:
+        log_warn(f"write_json: {path} 有 {n_nonfinite} 个 NaN/Infinity，"
+                 f"已写成 null（非法 JSON 会让 node/jq/R 读者解析失败）")
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump(obj, fh, ensure_ascii=False, indent=2, default=default)
+        json.dump(clean, fh, ensure_ascii=False, indent=2,
+                  default=default, allow_nan=False)
 
 
 def read_json(path):
+    """读 JSON。文件不存在 → `None`；**内容坏了 → 抛异常**（M8）。
+
+    原实现 `except Exception: return None` 把两种完全不同的情况混成一个
+    `None`：① 这轮没这个文件（正常，可选步骤没跑）；② **文件在、但内容是
+    坏的**（写坏了 / 截断了 / 上次运行留下的半截文件）。
+
+    ② 的后果不是"少一条数据"，而是**静默丢掉一条检查** ——
+    消费点 `main_analysis.py` 写的是 `d = read_json(...)` / `if not d: continue`，
+    所以一个损坏的 `*_status.json` 会让那条验收项**直接消失**，报告里
+    看不出少了什么。这比"报错"糟得多（E-62/E-63/E-64 同一形态：
+    假阴性把自己藏了起来）。
+
+    所以：**不存在 → None；存在但解析失败 → 抛**。需要"坏也当没有"的
+    调用点显式用 `read_json_or_none()`，让意图在调用处可见。
+    """
     p = Path(path)
     if not p.exists():
         return None
+    with open(p, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def read_json_or_none(path):
+    """`read_json` 的宽容版：**任何**失败都返回 `None`，但会 `log_warn`。
+
+    只给"这一步的可选产物、坏了大不了当没跑"的调用点用。判据产物
+    （`*_status.json` 等）一律用 `read_json` —— 坏掉必须炸出来。
+    """
     try:
-        with open(p, encoding="utf-8") as fh:
-            return json.load(fh)
-    except Exception:
+        return read_json(path)
+    except Exception as e:  # noqa: BLE001
+        log_warn(f"read_json_or_none: {path} 存在但解析失败"
+                 f"（{type(e).__name__}: {e}）—— 当作不存在处理")
         return None
 
 
@@ -217,6 +300,10 @@ STEP_ABORT_VALUES = (
     #   离散度估计全错而产物看起来正常。
     "no_usable_pseudobulk", "no_celltype_testable", "column_missing",
     "missing_counts",
+    # 04 拟bulk（审计 M1）：样本与分组不是一对一 —— 旧实现对每个样本取
+    # `iloc[0]` 当分组，混了分组的样本被静默归到第一个细胞的组，
+    # DESeq2 照样给出完整差异表而分组标签是错的。**契约被破坏要判红。**
+    "mixed_group",
 )
 
 # **设计如此地没做**（配置关掉了 / 输入不支持 / 环境缺包）—— 只可见、不阻断。
@@ -224,6 +311,11 @@ STEP_SKIP_VALUES = (
     "disabled", "not_configured", "not_applicable", "not_run",
     "not_applied", "not_done", "not_available", "not_possible",
     "heuristic_only", "package_missing", "unavailable", "needs_reference",
+    # 审计 M19/M20：**部分成功**。子集被跳过（细胞类型重复不足 / 某个
+    # 可选能力没成）但主体产出了结果。它必须与 `ok` **长得不一样** ——
+    # 否则"7 个里成了 2 个"和"7 个全成"在状态文件里无法区分。
+    # 登记为 skip 而不是 abort：跳过本身是设计如此，判红会让每个 job 都红。
+    "partial",
 )
 
 # 上面两个集合**只管步骤函数顶层返回值**。嵌套字段里的同一批词不能照搬：
@@ -545,8 +637,19 @@ def _manifest_append(cfg: dict, key: str, entry) -> None:
 
 
 def _norm_pkg(name: str) -> str:
-    """PEP 503 归一化：包名大小写与 -/_/. 不敏感。"""
-    return str(name).strip().lower().replace("_", "-").replace(".", "-")
+    """PEP 503 归一化：包名大小写与 -/_/. 不敏感，且**连续分隔符折叠成一个**。
+
+    **L19（R-03 裁决）**：原实现是
+        `lower().replace("_", "-").replace(".", "-")`
+    —— 只做了"换字符"，没做"折叠"。PEP 503 的规范式是
+    `re.sub(r"[-_.]+", "-", name).lower()`，即 `foo__bar` 与 `foo-bar`
+    是**同一个发行版**，而原实现给出 `foo--bar` 与 `foo-bar` 两个不同的串。
+    后果是"同一个包被数成两个"：`key_versions` 里出现两条键，
+    去重统计偏大，而**没有任何地方会因此报错** —— 只会让
+    `n_versions >= 20` 这条验收在一个依赖很少的环境里**假通过**
+    （少一个真包、多一条重复键，净效果抵消）。
+    """
+    return re.sub(r"[-_.]+", "-", str(name).strip().lower())
 
 
 # R 包名允许的字符（CRAN 规范：字母开头，只含字母数字点）。
@@ -600,6 +703,15 @@ def probe_r_packages(pkgs) -> dict:
         'cat("RVERSION\\t", as.character(getRversion()), "\\n", sep = "")\n'
     )
     try:
+        # **L10（R-03 裁决）**：这里用 `capture_output=True`（管道），而
+        # `capture_versions` 的 docstring 说"管道捕获输出在受限沙箱里会
+        # EPERM"。两句话曾经并列在同一份文件里、互相矛盾。
+        #
+        # 事实是：**那条约束只对 Python 包成立**（`pip freeze` 有等价的
+        # 非子进程替代，所以没必要冒 EPERM 的险）；而问 R 包**只能**起
+        # `Rscript`，它的答案只从 stdout 出来。所以这里必须捕获，
+        # 并且在捕获失败时把失败**如实写进 reason**，而不是返回一个
+        # 会被读成"R 说没装"的 None。两条通道的取舍不同，不是自相矛盾。
         p = subprocess.run([rscript, "-e", expr], capture_output=True,
                            text=True, timeout=180)
     except (OSError, subprocess.SubprocessError) as e:  # noqa: BLE001
@@ -641,7 +753,16 @@ def capture_versions(cfg: dict, key_packages=None, extra: dict = None) -> dict:
     """
     from importlib import metadata as _md
 
+    # 枚举失败**必须落盘**，不能只打一条 WARN（R-03 裁决 L12）。
+    #
+    # 旧写法 `except Exception as exc: log_warn(...)` 是 E-48 的形态：异常被
+    # 降级成一行日志，而日志没有人读。后果是 `versions` 变成空字典（或只枚举
+    # 到一半），验收项「版本记录非空」却仍然可能通过 —— 因为它的判据是
+    # `n_versions >= 20`，一个**魔数**：既没人知道 20 从哪来，也不区分
+    # "枚举了 96 个包"与"枚举器半路抛异常前凑够了 21 个"。
+    # 现在把"枚举成功没有"本身记成结构化字段，验收直接读它。
     full = {}
+    enum_error = None
     try:
         for d in _md.distributions():
             try:
@@ -651,7 +772,8 @@ def capture_versions(cfg: dict, key_packages=None, extra: dict = None) -> dict:
             if n:
                 full[_norm_pkg(n)] = d.version
     except Exception as exc:
-        log_warn(f"枚举已安装包失败（{exc}）—— versions 会不完整")
+        enum_error = f"{type(exc).__name__}: {exc}"
+        log_warn(f"枚举已安装包失败（{enum_error}）—— versions 会不完整")
 
     key = {}
     for p in (key_packages if key_packages is not None else KEY_PACKAGES):
@@ -671,6 +793,17 @@ def capture_versions(cfg: dict, key_packages=None, extra: dict = None) -> dict:
     m["versions"] = dict(sorted(full.items()))
     m["key_versions"] = key
     m["n_packages"] = len(full)
+    # `versions_enumeration`: "ok" / "failed"。**与 `n_packages` 分开** ——
+    # 计数是个下界，"枚举成功"是个事实，二者不能互相替代。
+    m["versions_enumeration"] = "failed" if enum_error else "ok"
+    if enum_error:
+        m["versions_enumeration_error"] = enum_error
+    # 关键工具解析率：**这才是"版本记录有没有用"的判据**（L12）。
+    # `n_packages` 只看"装了 96 个包"，而 `key_versions` 里 14 个是 null
+    # 完全不影响它 —— 实测基线 artifact 就是 n_versions=96 而 key 里
+    # 只有 8/22 解析出来。真正的风险是"关键工具一个都没记上，而验收全绿"。
+    m["n_key_resolved"] = sum(1 for v in key.values() if v)
+    m["n_key_total"] = len(key)
     m["python"] = sys.version.split()[0]
     if r_probe is not None:
         # R 环境单独记一段：`key_versions` 是平铺的 name→version，
@@ -799,9 +932,21 @@ def manifest_summary(cfg: dict) -> dict:
         return {"present": False}
     ins = m.get("inputs") or []
     miss = [i for i in ins if i.get("status") == "missing"]
+    key = m.get("key_versions") or {}
     return {
         "present": True,
         "n_versions": len(m.get("versions") or {}),
+        # **"枚举成功"与"枚举到多少个"是两件事**（L12）。前者是事实，
+        # 后者是下界 —— 枚举器半路抛异常时 `n_versions` 仍可能非零。
+        "versions_enumeration": m.get("versions_enumeration", "unknown"),
+        "versions_enumeration_error": m.get("versions_enumeration_error"),
+        # 关键工具的解析率。`n_versions = 96` 但 `key_versions` 里 22 个只有
+        # 8 个解析出来，是基线 artifact 的真实状态 —— 只看 `n_versions`
+        # 完全看不见这件事。
+        "n_key_resolved": m.get("n_key_resolved",
+                                sum(1 for v in key.values() if v)),
+        "n_key_total": m.get("n_key_total", len(key)),
+        "key_unresolved": sorted(k for k, v in key.items() if not v),
         "n_inputs": len(ins),
         "inputs_missing": sorted(i.get("label") or "?" for i in miss),
         "inputs_missing_required": sorted(
@@ -952,6 +1097,31 @@ def mm(*vals: float):
 W_SINGLE = mm(89)      # 单栏
 W_ONE_HALF = mm(136)   # 单栏半（Nature 允许 120-136 mm）
 W_DOUBLE = mm(183)     # 双栏（= 满版宽）
+
+
+def grid_figsize(n_cols: int, n_rows: int, *,
+                 col_mm: float = 11.4, row_mm: float = 8.6,
+                 min_w_mm: float = 136.0, max_w_mm: float = 183.0,
+                 min_h_mm: float = 60.0, max_h_mm: float = 200.0):
+    """按"列数 x 行数"算热图尺寸，**全程用毫米**，且**高度也封顶**。
+
+    **L3 / L4（R-03 裁决）**：原来的写法是
+
+        figsize=(min(W_DOUBLE, max(W_ONE_HALF, 0.45 * len(cols) + 3)),
+                 max(3.0, 0.32 * len(rows) + 1.6))
+
+    宽度是 `mm()` 出来的**英寸**值（被 `W_DOUBLE` 封顶），高度是**裸英寸、
+    且不封顶**。两个单位混在同一个元组里，而 matplotlib 两个都收 ——
+    **单位混用不会报错**，它只是把"装不装得进一页"变成一个没人检查的
+    猜测。实测：24 个簇时高度 `0.32*24+1.6 = 9.28` 英寸 = **236 mm**，
+    超过 A4 的可用高度，投稿时被排版工具缩放或裁掉。
+
+    行/列的上限之外**不再线性增长**：超过一页就只能靠缩字号或拆图，
+    线性拉长只会把图拉出页面。
+    """
+    w_mm = min(max_w_mm, max(min_w_mm, col_mm * max(1, n_cols) + 20.0))
+    h_mm = min(max_h_mm, max(min_h_mm, row_mm * max(1, n_rows) + 14.0))
+    return (mm(w_mm), mm(h_mm))
 
 
 def _content_overflow(fig) -> dict:
@@ -1133,196 +1303,21 @@ def build_marker_dotplot_figure(frac_df, z_df, *, group_label, title,
     cb = fig.colorbar(sm, cax=cax, orientation="horizontal")
     cax.text(0.0, 1.9, "Mean Expression", transform=cax.transAxes,
              ha="left", va="bottom", fontsize=7.5)
-    cb.set_ticks([-1, 0, 1])
+    # **L11（R-03 裁决）**：刻度原来写死 `[-1, 0, 1]`，而色标上限是
+    # `vmax = max(1.5, p95|z|)`（见 `plot_marker_dotplot`）。p95|z| > 1.5
+    # 时（数据里有少数强 marker 时很常见），真实的红端是 ±2.5 甚至 ±3，
+    # 而刻度只标到 ±1 —— **色标看起来只有中间一小段有数据、两端"空着"**，
+    # 读者会以为红/蓝端对应的是"极端值"，实际上 1 就已经是饱和色。
+    # 按 `sm.norm.vmax` 生成刻度，让刻度与色标实际范围对得上。
+    _vmax = float(sm.norm.vmax)
+    if not math.isfinite(_vmax) or _vmax <= 0:
+        _vmax = 1.0
+    _vmax = round(_vmax, 1)
+    cb.set_ticks([-_vmax, 0.0, _vmax])
     cb.set_ticklabels(["Low", "Mid", "High"])
     cb.ax.tick_params(labelsize=7, top=False, bottom=True,
                       labeltop=False, labelbottom=True)
     return fig, size_handles
-
-
-def fix_dotplot_legends(fig, size_title=None, cbar_title=None):
-    """
-    把 `sc.pl.dotplot` 的**整条图例列**整理成约定 v2 的样子：
-    点大小图例竖排、色标竖排、两者上下排列互不重叠。
-
-    **为什么必须后处理。** scanpy 的 `DotPlot` 没有暴露图例方向参数
-    （`legend()` 只收 `width` / `show_size_legend` / `colorbar_title`）：
-
-    * `_plot_size_legend()` 把示例点画在 **x 轴**上 —— 横排；
-    * `_plot_colorbar()` 把色标**硬编码** `orientation="horizontal"` —— 横排。
-
-    两个都要转竖排（用户约定 v2"纵向单列节约图幅"），而且**必须一起做**：
-    只转一个，另一个还横着占着原来的宽度，两块会互相挤压或重叠
-    （实测只转 size 图例时，colorbar 与它文字交叠 4 处）。
-
-    **三处实测毛病，分别对应三个动作：**
-
-    1. **size 图例的刻度标签被换行堆成两列**（`100/80/60` 挤在一起）——
-       scanpy 给这块 axes 的宽度是按"横排一行点"算的，竖排后标签要单独占
-       左侧一列，原宽度不够。→ 加宽 axes，并给刻度标签留出明确宽度。
-    2. **colorbar 横向**。→ 找到 Colorbar 对象，竖向重建。
-    3. **两块图例重叠**。→ 上下重新分区：size 在上、colorbar 在下，
-       各自 `set_position` 不相交。
-
-    :param fig: dotplot 所在的 figure
-    :param size_title: 点大小图例标题（不传则保留原样）
-    :param cbar_title: 色标标题（不传则保留原样）
-    :returns: `dict(size=bool, colorbar=bool)` —— 各自是否成功转换
-    """
-    import numpy as np
-    import matplotlib.pyplot as plt
-    from matplotlib.axes import Axes
-    from matplotlib.colorbar import Colorbar
-    from matplotlib.cm import ScalarMappable
-    from matplotlib.colors import Normalize
-
-    done = {"size": False, "colorbar": False}
-
-    # ---- 0. 定图例列的 x 位置 -------------------------------------------
-    # **必须放在主图右侧、画布内**。主图（含 y 轴标签的那个）右缘一般在
-    # x≈0.70（左边留给行标签）；图例列取主图右缘 + 一点间距。
-    # 实测踩过：直接写 `1.0 - 宽度` 会把两块图例**推出画布右缘**——
-    # size 刻度标签 6 个被裁、与色标文字重叠 5 处。
-    main_ax = None
-    for ax in fig.axes:
-        if any(t.get_text() for t in ax.get_xticklabels()) \
-                and ax.get_position().width > 0.4:
-            main_ax = ax
-            break
-    leg_x = 0.80 if main_ax is None else min(0.94, main_ax.get_position().x1 + 0.055)
-
-    # ---- 1. 点大小图例：横排 -> 纵排 ------------------------------------
-    for ax in fig.axes:
-        if done["size"]:
-            break
-        # 大小图例的判据：有 x 刻度标签、**没有** y 刻度标签、含散点
-        if ax.get_yticklabels() and any(t.get_text() for t in ax.get_yticklabels()):
-            continue
-        colls = [c for c in ax.collections if hasattr(c, "get_sizes")]
-        if not colls:
-            continue
-        labels = [t.get_text() for t in ax.get_xticklabels()]
-        if not labels or not all(labels):
-            continue
-        # 只认"看起来像百分比数字"的刻度，避免误伤其它图
-        try:
-            [float(s) for s in labels]
-        except ValueError:
-            continue
-        sizes = colls[0].get_sizes()
-        if len(sizes) != len(labels):
-            continue
-
-        n = len(sizes)
-        pos = ax.get_position()
-        # **竖排后这块 axes 要"又高又窄"**：高度按点数给，宽度给刻度标签留
-        # 足够列宽 —— 原宽度是按横排算的，标签会换行堆叠（实测 `100/80/60`
-        # 挤成两列）。x 位置用上面算好的 `leg_x`（主图右侧、画布内）。
-        need_h = min(max(0.030 * n + 0.06, 0.20), 0.50)
-        need_w = 0.055
-        ax.set_position([leg_x, pos.y1 - need_h, need_w, need_h])
-
-        ax.clear()
-        ys = np.arange(n)
-        # 点贴近轴右缘、刻度标签在其左 —— 一行读作"标签 — 点"。
-        # （标签不能放右侧：图例列在最右，再往右就出画布。）
-        ax.scatter(np.full(n, 0.62), ys, s=sizes, color="gray",
-                   edgecolor="black", linewidth=0.5, zorder=100)
-        ax.set_xlim(0.0, 1.0)
-        ax.set_ylim(-0.8, n - 0.2)
-        ax.set_yticks(ys)
-        ax.set_yticklabels(labels, fontsize="small")
-        ax.set_xticks([])
-        ax.tick_params(axis="x", bottom=False, labelbottom=False)
-        ax.tick_params(axis="y", left=False, labelleft=True, pad=1)
-        for sp in ax.spines.values():
-            sp.set_visible(False)
-        if size_title:
-            ax.set_title(size_title, fontsize="small", pad=4, loc="left")
-        done["size"] = True
-
-    # ---- 2. 色标：横向 -> 纵向 -------------------------------------------
-    # **先 draw 一次**（scanpy 是绘制时才把色标挂上去的，不 draw 找不到）。
-    #
-    # **色标轴的判据是"含 QuadMesh"，不是"含 Colorbar 对象"。** 实测踩过：
-    # `Colorbar` 实例**不在** `ax.get_children()` 里（它挂在 figure 上），
-    # 轴里能看到的只有色标本体的 `QuadMesh` 和边框 `_ColorbarSpine`。
-    # 按类名找 Colorbar 永远返回 False —— helper 空转、图保持横向。
-    fig.canvas.draw()
-    src_cbar = None
-    for ax in fig.axes:
-        kinds = {type(c).__name__ for c in ax.get_children()}
-        if "QuadMesh" in kinds and any(n.startswith("_ColorbarSpine") for n in kinds):
-            src_cbar = ax
-            break
-
-    if src_cbar is not None:
-        cax = src_cbar
-        # 色标的 norm/cmap 要从**产生它的 mappable** 取。轴的 children 里只有
-        # QuadMesh 本身，而 QuadMesh 带着创建时的 norm/cmap —— 从它读回。
-        qm = next(c for c in cax.get_children() if type(c).__name__ == "QuadMesh")
-        norm = getattr(qm, "norm", None) or Normalize()
-        cmap = getattr(qm, "cmap", None) or plt.get_cmap("Reds")
-        # 横向色标的刻度在 x 轴上；竖向要挂到 y 轴
-        tick_vals = [t for t in cax.get_xticks()]
-        old_title = cbar_title
-        if old_title is None:
-            old_title = cax.get_title()
-
-        cax.clear()
-        spos = cax.get_position()
-        # **竖向色标要"窄而高"**，放在 size 图例正下方、同一列（`leg_x`）
-        cax.set_position([leg_x + 0.012, spos.y0, 0.030, min(0.16, spos.y0)])
-        sm = ScalarMappable(norm=norm, cmap=cmap)
-        cb_new = Colorbar(cax, mappable=sm, orientation="vertical")
-        # **刻度必须重新算，不能照抄横向时的 x 刻度。** 两个原因：
-        # ① 横向时 x 轴的数值范围是 norm 的全程，竖向 y 轴也一样，但
-        #    `get_xticks()` 返回的是"当时渲染出的位置"，直接 set_ticks 会
-        #    和竖轴的实际范围错位；
-        # ② 实测照抄会出现**镜像 + 叠字**（从上往下 1.0→0.0，且两位小数
-        #    挤在一起）。正确做法：按竖轴范围取 3 个等距点，`set_yticks`。
-        lo, hi = norm.vmin, norm.vmax
-        new_ticks = list(np.linspace(lo, hi, 3)) if np.isfinite([lo, hi]).all() else []
-        if new_ticks:
-            cb_new.set_ticks(new_ticks)
-            cb_new.ax.set_yticklabels([f"{v:.1f}" for v in new_ticks],
-                                      fontsize="small")
-        cax.tick_params(labelsize="small")
-        if old_title:
-            cax.set_title(old_title, fontsize="small", pad=4, loc="left")
-        done["colorbar"] = True
-
-    # ---- 3. 收口：两块上下排列，不相交 ------------------------------------
-    # set_position 之后 constrained layout 会在下一帧重排，这里强制立即执行
-    # 一次并做最终夹紧，保证两块不交叠（用户明确要求"变了后也不能重叠"）。
-    # 判据同上：色标轴看 QuadMesh，size 图例轴看"y 刻度是数字"。
-    fig.canvas.draw()
-    size_ax = cbar_ax = None
-    for ax in fig.axes:
-        kinds = {type(c).__name__ for c in ax.get_children()}
-        labs = [t for t in ax.get_yticklabels() if t.get_text()]
-        if "QuadMesh" in kinds:
-            cbar_ax = ax
-        elif labs:
-            try:
-                [float(t.get_text()) for t in labs]
-                size_ax = ax
-            except ValueError:
-                pass
-    if size_ax is not None and cbar_ax is not None:
-        sp, cp = size_ax.get_position(), cbar_ax.get_position()
-        top = max(sp.y1, cp.y1)
-        gap = 0.02
-        h_size, h_cbar = sp.height, cp.height
-        if h_size + h_cbar + gap > top:
-            scale = (top - gap) / (h_size + h_cbar)
-            h_size *= scale
-            h_cbar *= scale
-        size_ax.set_position([sp.x0, top - h_size, sp.width, h_size])
-        cbar_ax.set_position([cp.x0, top - h_size - gap - h_cbar, cp.width, h_cbar])
-        fig.canvas.draw()
-
-    return done
 
 
 def place_labels(ax, xs, ys, texts, fontsize=7, pad_px=2.0,
@@ -1512,30 +1507,41 @@ def save_fig(cfg: dict, name: str, fig=None, tight: bool = False) -> list:
     return written
 
 
-def annotate_commit(cfg: dict) -> str:
-    """把 commit 短哈希写进文件名后缀，便于把图与代码版本对上。"""
-    sha = os.environ.get("GITHUB_SHA", "")
-    return sha[:7] if sha else "local"
-
-
 # ============================================================================
 # 小工具
 # ============================================================================
-def fmt_bytes(n: float) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} GB"
-
-
-def require_pkg(name: str, hint: str = "") -> None:
-    try:
-        __import__(name)
-    except ImportError as e:
-        extra = f"（{hint}）" if hint else ""
-        raise RuntimeError(f"缺少依赖 {name}{extra}: {e}") from e
-
+#
+# **2026-09-26 删除三个零调用点的函数（R-03 裁决 L8 / L9）。**
+#
+# 删掉的是 `fix_dotplot_legends`（~180 行）、`annotate_commit`、`fmt_bytes`、
+# `require_pkg` —— 四个名字在全仓库的**唯一**出现处就是它们的 `def` 行
+# （逐个 grep 确认，见台账 E-66）。
+#
+# 为什么删而不是留着：
+#
+# * `fix_dotplot_legends` 是给 `sc.pl.dotplot` 的后处理链用的。E-36 当时写
+#   「保留给仍在用 scanpy 路径的图」，但那个前提**已经不存在了** ——
+#   `03_cluster_annotate.py` 改成手绘 `build_marker_dotplot_figure` 之后，
+#   全仓 `sc.pl.*` 只剩 `05_trajectory.py` 的 `sc.pl.paga`，没有一处会产出
+#   scanpy 的 DotPlot。**保留一个"等以后有人用"的函数，等于留一段没人跑过
+#   的代码**：它下次被调用时，scanpy 的内部结构（`_plot_size_legend` /
+#   `_plot_colorbar` 的 axes 布局）早已变过好几版，而没有任何门禁能发现。
+#   真要再走 scanpy 路径，应当照当时的版本重写并当场标定，而不是复活这段。
+# * `annotate_commit` 想做的是「把 commit 短哈希写进图名后缀」，但 geo 仓
+#   那件事是**由 workflow 的 shell 做的**（`geo_analysis.yml` 的
+#   "Write versioned copies of the figures" 步骤），scrna/spatial 两仓的
+#   workflow 里根本没有对应步骤 —— 所以它不是"还没接线"，是**接线方式选错了
+#   层**。留一个永远返回 `"local"`（CI 外）或 `sha[:7]`（CI 内）却没人调的
+#   函数，只会让下一个人以为图名里已经有版本号。
+# * `fmt_bytes` / `require_pkg` 同理：前者没有任何日志/状态文件用到字节数，
+#   后者在本仓被 `importlib.metadata` 与 `probe_r_packages` 取代（geo 侧的
+#   R 版 `require_pkg` 仍在用，那是**另一份代码**，不受此处影响）。
+#
+# 同一条教训的另一面写在 AGENTS 规则 15.1：判据的输入域要和它要防的缺陷
+# 匹配。这里反过来 —— **没有判据覆盖的代码，删除比保留安全**。
+#
+# 注意：`spatial-pipeline-skill/scripts/lib/common.py` 里 `fix_dotplot_legends`
+# 与 `require_pkg` **同样零调用点**，但那是 R-04 的范围，本次不动。
 
 def df_to_records(df) -> list:
     """DataFrame -> JSON 安全的 records（NaN 变 None）。"""

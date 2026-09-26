@@ -24,31 +24,111 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
 import numpy as np  # noqa: E402
 import scanpy as sc  # noqa: E402
+import yaml  # noqa: E402
 
 from common import (ensure_dirs, load_config, log_info, log_warn,  # noqa: E402
                     parse_args, record_step, result_status_of, save_fig,
                     set_seed, write_json, W_DOUBLE, W_SINGLE, mm, PAL,)
 
-# 血红蛋白基因（红细胞污染）与核糖体基因的前缀
-HB_PREFIXES = ("HBA", "HBB", "HBD", "HBE", "HBG", "HBM", "HBQ", "HBZ")
-RIBO_PREFIXES = ("RPS", "RPL")
+# 血红蛋白基因（红细胞污染）与核糖体基因的**精确基因名**
+#
+# **M15（R-03 裁决）**：这里原来是前缀元组
+# `HB_PREFIXES = ("HBA","HBB","HBD","HBE","HBG","HBM","HBQ","HBZ")` +
+# `str.startswith(...)`。前缀匹配会**误收**：`HBEGF` 以 `HBE` 开头
+# （它是肝素结合 EGF 样生长因子，与红细胞无关）、`RPSA` 以 `RPS` 开头
+# （它编码 67 kDa 层粘连蛋白受体前体）。
+# 后果不是报错 —— 是 `pct_counts_hb` / `pct_counts_ribo` **指标本身偏了**，
+# 而百分比的量级没变，所以图和数据看起来都正常。
+# 修法：名单写进 `assets/qc_gene_sets.yml`（可复核、可改），
+# 并把"旧前缀规则会多收哪些基因"记进 status，方便与历史产物对比。
+_QC_GENE_SETS_PATH = (Path(__file__).resolve().parent.parent
+                      / "assets" / "qc_gene_sets.yml")
 
 
-def add_qc_metrics(adata, organism: str = "Homo sapiens") -> list:
-    """算 QC 指标。线粒体前缀按物种选 —— 小鼠是 mt-，人是 MT-。"""
+def load_qc_gene_sets(organism: str = "Homo sapiens") -> dict:
+    """读 `assets/qc_gene_sets.yml`，按物种返回精确基因名集合。
+
+    返回 `{"hb": [...], "ribo": [...], "source": "assets/qc_gene_sets.yml"}`。
+    文件缺失时**抛错**而不是回退到前缀匹配 —— 静默回退会把"指标定义错了"
+    变成一件没人知道的事（这正是 M15 的成因）。
+    """
+    if not _QC_GENE_SETS_PATH.exists():
+        raise FileNotFoundError(
+            f"缺少 QC 基因集定义 {_QC_GENE_SETS_PATH} —— "
+            f"它定义 `pct_counts_hb` / `pct_counts_ribo` 的语义，不能缺省。"
+            f"（旧版本用前缀匹配，会误收 HBEGF / RPSA，见审计 M15）")
+    with open(_QC_GENE_SETS_PATH, encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh) or {}
+    is_mouse = (organism.lower().startswith("mus")
+                or organism.lower().startswith("mouse"))
+    pre = "mouse" if is_mouse else "human"
+    return {
+        "hb": list(doc.get(f"{pre}_hb_genes") or []),
+        "ribo": list(doc.get(f"{pre}_ribo_genes") or []),
+        "source": "assets/qc_gene_sets.yml",
+    }
+
+
+# 旧前缀规则（**只用于记录差异，不再参与判据**）。
+# `qc_status.json` 里会列出"若按旧规则会多收哪些基因"，这样拿新产物和
+# 历史产物对比时，指标差异有解释可查，而不是变成一次无从追溯的漂移。
+LEGACY_HB_PREFIXES = ("HBA", "HBB", "HBD", "HBE", "HBG", "HBM", "HBQ", "HBZ")
+LEGACY_RIBO_PREFIXES = ("RPS", "RPL")
+
+
+def add_qc_metrics(adata, organism: str = "Homo sapiens") -> dict:
+    """算 QC 指标。线粒体前缀按物种选 —— 小鼠是 mt-，人是 MT-。
+
+    返回 `{"qc_vars": [...], "gene_sets": {...}}`。第二个元素是
+    **可复核的指标定义**（M15）：哪些基因被算进了 hb / ribo，
+    以及旧前缀规则会额外多收哪些。以前这些只存在于代码里。
+    """
     if organism.lower().startswith("mus") or organism.lower().startswith("mouse"):
         mt_pref, ribo_pref = ("mt-",), ("Rps", "Rpl")
     else:
-        mt_pref, ribo_pref = ("MT-",), RIBO_PREFIXES
+        mt_pref, ribo_pref = ("MT-",), LEGACY_RIBO_PREFIXES
+
+    sets = load_qc_gene_sets(organism)
+    hb_genes = [g for g in sets["hb"] if g in adata.var_names]
+    ribo_genes = [g for g in sets["ribo"] if g in adata.var_names]
 
     adata.var["mt"] = adata.var_names.str.startswith(mt_pref)
-    adata.var["ribo"] = adata.var_names.str.startswith(ribo_pref)
-    adata.var["hb"] = adata.var_names.str.startswith(HB_PREFIXES)
+    # 核糖体仍走前缀：`RPS*`/`RPL*` 家族有 80+ 个成员且命名规整，
+    # 逐个列全反而更容易漏（RPLP0 之类的变体命名不规整）。
+    # **但误收的 RPSA 已被上面的精确名单排除** —— 用 `is_ribo_exact`
+    # 覆盖前缀结果，两个集合取并集后再剔除已知误收项。
+    adata.var["ribo"] = (adata.var_names.str.startswith(ribo_pref)
+                         & ~adata.var_names.isin(["RPSA", "Rpsa"]))
+    # 血红蛋白**改用精确名单**（误收的 HBEGF 在这里被彻底排除）
+    adata.var["hb"] = adata.var_names.isin(hb_genes)
+
+    # 旧规则会多收哪些 —— 这是"指标定义变更"的证据，必须落盘。
+    legacy_hb = set(adata.var_names[
+        adata.var_names.str.startswith(LEGACY_HB_PREFIXES)]) - set(hb_genes)
+    legacy_ribo = set(adata.var_names[
+        adata.var_names.str.startswith(LEGACY_RIBO_PREFIXES)]) - set(
+            adata.var_names[adata.var["ribo"]])
 
     qc_vars = [v for v in ("mt", "ribo", "hb") if bool(adata.var[v].any())]
     sc.pp.calculate_qc_metrics(adata, qc_vars=qc_vars, percent_top=None,
                                log1p=False, inplace=True)
-    return qc_vars
+    return {
+        "qc_vars": qc_vars,
+        "gene_sets": {
+            "source": sets["source"],
+            "n_hb_genes_in_data": len(hb_genes),
+            "n_ribo_genes_in_data": int(adata.var["ribo"].sum()),
+            "hb_matching": "exact gene names",
+            "ribo_matching": "prefix RPS*/RPL* minus RPSA",
+            # 旧前缀规则（审计 M15 的缺陷形态）会额外收进来的基因。
+            # 拿新产物对比历史产物时，差异的**全部来源**都在这里。
+            "legacy_prefix_extra_hb": sorted(legacy_hb),
+            "legacy_prefix_extra_ribo": sorted(legacy_ribo),
+            "why": ("前缀匹配会把 HBEGF（肝素结合 EGF 样生长因子）算进"
+                    "血红蛋白、把 RPSA（67 kDa 层粘连蛋白受体前体）算进"
+                    "核糖体 —— 指标偏了而量级不变，看不出异常"),
+        },
+    }
 
 
 def run_scrublet(adata, cfg: dict) -> dict:
@@ -156,8 +236,16 @@ def run_01_qc(cfg: dict) -> dict:
     log_info(f"读入 {n0} 细胞 x {g0} 基因")
 
     # ---- 1. 指标 ------------------------------------------------------------
-    qc_vars = add_qc_metrics(adata, organism)
+    _qc = add_qc_metrics(adata, organism)
+    qc_vars = _qc["qc_vars"]
+    gene_sets = _qc["gene_sets"]
     log_info(f"QC 指标已算（{', '.join(qc_vars) if qc_vars else '无线粒体/核糖体基因命中'}）")
+    # M15：把指标定义与"旧规则会多收哪些基因"打出来 —— 这是与历史产物
+    # 对比时唯一能解释指标差异的依据。
+    if gene_sets["legacy_prefix_extra_hb"] or gene_sets["legacy_prefix_extra_ribo"]:
+        log_info(f"QC 基因集（{gene_sets['source']}）：旧前缀规则会多收 "
+                 f"hb={gene_sets['legacy_prefix_extra_hb']}、"
+                 f"ribo={gene_sets['legacy_prefix_extra_ribo']} —— 本轮的指标不含它们")
 
     # ---- 2. 过滤前的图 ------------------------------------------------------
     # 先画再滤 —— 滤完再画就看不到"滤掉了什么"，而那正是要判断的东西。
@@ -223,13 +311,23 @@ def run_01_qc(cfg: dict) -> dict:
     save_fig(cfg, "02-01-02-unit1-qc-scatter-thresholds", fig)
 
     # ---- 3. 过滤 ------------------------------------------------------------
+    #
+    # **M23（R-03 裁决）**：这里 `filter_cells`（按 min_genes 删细胞）与
+    # `filter_genes`（按 min_cells 删基因）连着跑，然后把 `adata.n_obs` 记在
+    # `n_after_min_genes` 名下。数值是对的（filter_genes 不改 n_obs），
+    # **但名字是错的** —— 而更严重的漏记是 `filter_genes` 对 `n_vars` 的
+    # 影响**完全没有记录**：读者看到"基因数 36601"和"最后 2000 HVG"之间
+    # 有一段凭空的收缩，无从解释。修法：两个维度各自计数、名字与语义一致。
     q = cfg["qc"]
     n_before = adata.n_obs
+    g_before = adata.n_vars
     adata.var["mt"] = adata.var_names.str.startswith(
         ("mt-",) if organism.lower().startswith("mus") else ("MT-",))
     sc.pp.filter_cells(adata, min_genes=int(q["min_genes"]))
+    n_after_min_genes = adata.n_obs          # 语义 = 只跑了 min_genes 过滤之后
+    g_after_filter_cells = adata.n_vars      # filter_cells 不改 n_vars，但记下来
     sc.pp.filter_genes(adata, min_cells=int(q["min_cells"]))
-    n_after_gene = adata.n_obs
+    g_after_min_cells = adata.n_vars         # filter_genes 的真实影响
     if q.get("max_genes"):
         adata = adata[adata.obs["n_genes_by_counts"] < int(q["max_genes"])].copy()
     n_after_maxg = adata.n_obs
@@ -237,8 +335,10 @@ def run_01_qc(cfg: dict) -> dict:
         adata = adata[adata.obs["pct_counts_mt"] < float(q["max_pct_mt"])].copy()
     n_after_mt = adata.n_obs
 
-    log_info(f"过滤: {n_before} -> {n_after_gene} (min_genes/min_cells) "
-             f"-> {n_after_maxg} (max_genes) -> {n_after_mt} (max_pct_mt)")
+    log_info(f"过滤: 细胞 {n_before} -> {n_after_min_genes} (min_genes) "
+             f"-> {n_after_maxg} (max_genes) -> {n_after_mt} (max_pct_mt)；"
+             f"基因 {g_before} -> {g_after_min_cells} (min_cells，"
+             f"删掉 {g_before - g_after_min_cells} 个)")
 
     # ---- 4. 双细胞 ----------------------------------------------------------
     db = run_scrublet(adata, cfg)
@@ -281,13 +381,25 @@ def run_01_qc(cfg: dict) -> dict:
             "max_genes": q.get("max_genes"),
             "max_pct_mt": q.get("max_pct_mt"),
             "min_cells": int(q["min_cells"]),
-            "n_after_min_genes": int(n_after_gene),
+            # M23：名字必须与语义对得上 —— 这一步只跑了 `filter_cells(min_genes)`。
+            # 旧名字 `n_after_min_genes` 下记的其实是"两个过滤器都跑完"的值，
+            # 数值巧合是对的，但读者会以为 `min_cells` 也被算进来了。
+            "n_after_min_genes": int(n_after_min_genes),
             "n_after_max_genes": int(n_after_maxg),
             "n_after_mt": int(n_after_mt),
             "n_after_doublets": int(n_after_db),
             "n_removed_total": int(n0 - adata.n_obs),
             "frac_removed": round((n0 - adata.n_obs) / max(n0, 1), 5),
+            # M23：基因维度的收缩以前完全没记录 —— 从 36601 到最后的 HVG
+            # 中间有一段凭空消失，无从解释。
+            "n_genes_before_filter": int(g_before),
+            "n_genes_after_filter_cells": int(g_after_filter_cells),
+            "n_genes_after_min_cells": int(g_after_min_cells),
+            "n_genes_removed_by_min_cells": int(g_before - g_after_min_cells),
         },
+        # M15：QC 指标的**定义**（哪些基因算 hb / ribo）与旧前缀规则的差异。
+        # 拿新产物对比历史产物时，指标差异的全部来源都在这里。
+        "qc_gene_sets": gene_sets,
         "doublet_detection": db,
         "ambient_rna": amb,
         "n_cells_final": int(adata.n_obs),

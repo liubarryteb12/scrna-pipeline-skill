@@ -153,8 +153,40 @@ def run_04_pseudobulk_de(cfg: dict) -> dict:
         write_json(res_dir / "pseudobulk_status.json", status)
         return status
 
-    meta["group"] = [str(adata.obs.loc[adata.obs[sample_key].astype(str) == s, group_key]
-                         .astype(str).iloc[0]) for s in meta["sample"]]
+    # ---- 样本 -> 分组 的映射（审计 M1）---------------------------------------
+    #
+    # 原实现 `[str(...iloc[0]) for s in meta["sample"]]` 对每个样本取**第一个
+    # 细胞的 group 值**。样本与分组应当是一对一的，但契约被破坏时（同一个
+    # 样本里混了两个分组）它**静默取第一个** —— 于是那个样本的全部细胞被
+    # 当成一个分组，DESeq2 照样跑出一张完整的差异表，而没有任何东西知道
+    # 分组标签是错的。**这比抛错危险得多：错的结果看起来和真的完全一样。**
+    #
+    # 修法：逐样本枚举真实取值集合；只有恰好 1 个取值才接受，
+    # 否则记进 `mixed_group_samples` 并让整步以 `mixed_group` 收尾。
+    sample_groups = {}
+    mixed_group_samples = []
+    _obs_s = adata.obs[sample_key].astype(str)
+    _obs_g = adata.obs[group_key].astype(str)
+    for s in meta["sample"]:
+        vals = sorted(set(_obs_g[_obs_s == str(s)].tolist()))
+        if len(vals) == 1:
+            sample_groups[str(s)] = vals[0]
+        else:
+            mixed_group_samples.append({"sample": str(s), "groups": vals})
+    if mixed_group_samples:
+        # 契约被破坏：不产出差异表，避免下游把错标签的 log2FC 当成结论。
+        status.update({
+            "status": "mixed_group",
+            "reason": ("样本与分组不是一对一："
+                       f"{len(mixed_group_samples)} 个样本跨多个分组"),
+            "mixed_group_samples": mixed_group_samples,
+            "n_samples_checked": int(len(meta["sample"])),
+        })
+        log_warn(f"拟bulk 不可行：{len(mixed_group_samples)} 个样本跨多个分组 "
+                 f"（样本-分组契约被破坏，拒绝按 iloc[0] 猜分组）")
+        write_json(res_dir / "pseudobulk_status.json", status)
+        return status
+    meta["group"] = [sample_groups[str(s)] for s in meta["sample"]]
     log_info(f"拟bulk 矩阵: {mat.shape[0]} 个 (样本 x 细胞类型) x {mat.shape[1]} 基因")
 
     # ---- 每个细胞类型单独做 --------------------------------------------------
@@ -236,7 +268,17 @@ def run_04_pseudobulk_de(cfg: dict) -> dict:
         meta.to_csv(res_dir / "pseudobulk_samples.csv")
         status["n_genes_tested"] = int(len(allres))
         status["n_celltypes_tested"] = len(results)
-        status["status"] = "ok"
+        # **M20（R-03 裁决）**：原来只要有**一个**细胞类型成功就记 `ok`，
+        # 而被跳过的细胞类型只躺在 `skipped_celltypes` 里没人读 ——
+        # 于是"7 个细胞类型里 5 个因重复不足被跳过"和"7 个全做成了"
+        # 在状态文件里长得一模一样。修法：有跳过就记 `partial`，
+        # 让"结果只覆盖了一部分"这件事在顶层可见（不判红 —— 跳过本身
+        # 是设计如此，判红会让每个 job 都红）。
+        status["status"] = "partial" if skipped else "ok"
+        if skipped:
+            status["partial_reason"] = (
+                f"{len(skipped)}/{len(skipped) + len(results)} 个细胞类型被跳过，"
+                f"差异表只覆盖 {len(results)} 个")
     else:
         status["status"] = "no_celltype_testable"
 

@@ -35,7 +35,29 @@ import scanpy as sc  # noqa: E402
 import yaml  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, result_status_of, save_fig, set_seed, write_json, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, plot_marker_dotplot, build_marker_dotplot_figure, PAL,)
+                    log_warn, parse_args, record_step, result_status_of, save_fig, set_seed, write_json, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, grid_figsize, build_marker_dotplot_figure, PAL,)
+
+
+def cluster_sort_key(x):
+    """簇标签的排序键 —— **纯数字与混合类型都能排，且不抛异常**。
+
+    **M18（R-03 裁决）**：原来有三处各写各的：
+      * `03_cluster_annotate.py:413` `key=lambda x: int(x) if x.isdigit() else x`
+        —— 簇标签里同时有 `"3"` 和 `"3a"` 时，`int("3")` 与 `"3a"` 比较
+        **抛 `TypeError`**（`'<' not supported between instances of 'str' and 'int'`）；
+      * `:464` `key=lambda v: int(v)` —— 只要有一个非纯数字标签就
+        **抛 `ValueError`**；
+      * `05_trajectory.py:766` 用了 `(not x.isdigit(), int(x) if x.isdigit() else x)`
+        —— 这一处是对的。
+
+    标签是纯数字时它们恰好都对（`leiden` 默认就是），所以这个坑只在
+    **换了聚类算法**（如 `celltype` 列里是细胞类型名）或**标签里混了数字
+    与名字**时才炸，而那时整个步骤失败、拿不到任何结果。
+    统一成一个键：先按"是不是纯数字"分组（数字在前），组内数字按数值、
+    其余按字符串。**这个键对任何输入都返回可比较的元组。**
+    """
+    s = str(x)
+    return (0, int(s), "") if s.isdigit() else (1, 0, s)
 
 
 def load_signatures(cfg: dict) -> dict:
@@ -294,8 +316,27 @@ def compare_annotations(assign: pd.DataFrame, ct_labels, adata, log=log_info) ->
             "celltypist": ct_labels.reindex(adata.obs_names).values,
         }).dropna()
         # 每簇的众数标签 + 该标签占比（占比低说明这个簇本身不纯）
-        maj = (df.groupby("cluster")["celltypist"]
-                 .agg(lambda s: s.value_counts().index[0]))
+        #
+        # **L5（R-03 裁决）**：`value_counts()` 并列时按**出现顺序**取第一个
+        # —— 于是"两个标签各占 40%"这种真并列的簇，众数完全由
+        # `groupby` 内部的行的顺序决定（而行的顺序来自 h5ad 的细胞顺序）。
+        # 换句话说：重排细胞可以让 assignment 换一个类型，而产物里
+        # 看不出发生过这件事。修法：把"是否并列"算出来落盘，
+        # 让不确定可见（不改成"必须唯一"——真并列时没有正确答案）。
+        def _majority_and_tie(s):
+            vc = s.value_counts()
+            if len(vc) == 0:
+                return None, False, 0
+            top = int(vc.iloc[0])
+            n_tied = int((vc == top).sum())
+            return vc.index[0], n_tied > 1, n_tied
+
+        maj, maj_tied = {}, {}
+        for c, sub in df.groupby("cluster")["celltypist"]:
+            m, tied, n_tied = _majority_and_tie(sub)
+            maj[c] = m
+            maj_tied[c] = {"tied": tied, "n_tied_at_top": n_tied}
+        maj = pd.Series(maj)
         purity = (df.groupby("cluster")["celltypist"]
                     .agg(lambda s: float(s.value_counts().iloc[0] / len(s))))
         own = dict(zip(assign["cluster"].astype(str), assign["assigned"]))
@@ -317,6 +358,10 @@ def compare_annotations(assign: pd.DataFrame, ct_labels, adata, log=log_info) ->
                 "cluster": c, "marker_signature": ours,
                 "celltypist_majority": theirs,
                 "celltypist_purity": round(float(purity[c]), 3),
+                # L5：并列标记。`tied=True` 时 `celltypist_majority`
+                # **不是一个结论**，只是排序的副产品。
+                "celltypist_majority_tied": bool(maj_tied[c]["tied"]),
+                "n_labels_tied_at_top": int(maj_tied[c]["n_tied_at_top"]),
                 "agree": agree,
             })
 
@@ -333,15 +378,65 @@ def compare_annotations(assign: pd.DataFrame, ct_labels, adata, log=log_info) ->
                                       if mapped else None),
             "unmapped": unmapped,
             "mapping_source": "assets/celltype_mapping.yml",
+            # L5：并列簇的个数。**这是"这个一致性数字有多可信"的前置条件**
+            # —— 并列簇越多，`celltypist_majority` 越像随机抽签的结果。
+            "n_clusters_majority_tied": sum(
+                1 for r in rows if r["celltypist_majority_tied"]),
             "per_cluster": rows,
         })
+        _n_tied = out["n_clusters_majority_tied"]
         log(f"两种注释在簇层面一致 {agree_n}/{len(mapped)}"
             f"（有映射的簇；{len(unmapped)} 个簇的词表无映射，不计入）"
             "—— 不一致的簇值得人工看")
+        if _n_tied:
+            log_warn(f"{_n_tied} 个簇的 CellTypist 众数**并列**"
+                     f"（最高票被多个标签共享）—— 这些簇的 "
+                     f"`celltypist_majority` 由行序决定，不是结论")
     except Exception as exc:  # noqa: BLE001
         out["reason"] = f"对比失败：{type(exc).__name__}: {exc}"
         log_warn(out["reason"])
     return out
+
+
+# marker 点图：每簇取前 3 个
+#
+# **M24（R-03 裁决）**：原来用 `.unique()` 做**跨簇全局去重** ——
+# 同一个基因若同时是两个簇的前 3，只在第一个簇那里出现一次。于是列数
+# **少于 3×n_clusters**，而注释写的是"每簇取前 3 个"。读者拿列数去除簇数
+# 会得到"每簇不到 3 个"的结论，却不知道是去重造成的。
+#
+# 去重本身是必要的（同一基因两列无法区分），所以不能去掉；修法是
+# **把去重造成的影响算出来并落盘**：每个簇实际贡献了几个、哪些基因被
+# 别的簇抢走了。这样"每簇 3 个"这句话与产物可核对。
+def _top3_per_cluster(markers: pd.DataFrame, top_n: int = 3):
+    """每簇取前 `top_n` 个 marker 基因，返回 `(列顺序, 诊断信息)`。
+
+    `诊断` 里 `per_cluster_kept` 记录每簇实际进了几列、
+    `shared_dropped` 记录因跨簇重复而被去掉的 `(簇, 基因)`。
+    """
+    ordered, kept, dropped = [], {}, []
+    for c in markers["cluster"].astype(str).unique():
+        sub = (markers[markers["cluster"].astype(str) == c]
+               .sort_values("scores", ascending=False).head(top_n))
+        kept.setdefault(c, [])
+        for g in sub["names"].tolist():
+            if g in ordered:
+                dropped.append({"cluster": c, "gene": g,
+                                "kept_by_cluster": next(
+                                    (k for k, v in kept.items() if g in v), None)})
+                continue
+            ordered.append(g)
+            kept[c].append(g)
+    return ordered, {
+        "per_cluster_kept": {c: len(v) for c, v in kept.items()},
+        "n_columns": len(ordered),
+        "n_clusters": int(markers["cluster"].nunique()),
+        "top_n_per_cluster_requested": top_n,
+        "shared_dropped": dropped,
+        "why": ("同一基因可能是多个簇的前 3，而点图的列不能重复 —— "
+                "所以列数少于 `top_n × n_clusters`。被去掉的那些记在 "
+                "`shared_dropped` 里，不是静默丢弃"),
+    }
 
 
 def run_03_cluster_annotate(cfg: dict) -> dict:
@@ -410,7 +505,7 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
     fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(84)))
     xy = adata.obsm["X_umap"]
     cats = adata.obs["leiden"].astype(str).values
-    for c in sorted(set(cats), key=lambda x: int(x) if x.isdigit() else x):
+    for c in sorted(set(cats), key=cluster_sort_key):
         m = cats == c
         ax.scatter(xy[m, 0], xy[m, 1], s=4, alpha=0.75, label=c)
         cx, cy = xy[m, 0].mean(), xy[m, 1].mean()
@@ -437,12 +532,18 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
     log_info(f"marker 表: {len(markers)} 行（每簇前 {top_n}）")
 
     # marker 点图：每簇取前 3 个
-    top3 = (markers.sort_values(["cluster", "scores"], ascending=[True, False])
-            .groupby("cluster", observed=True).head(3)["names"].unique().tolist())
+    top3, top3_diag = _top3_per_cluster(markers, 3)
     # **上限按图宽算，不是随手取 40。** 双栏 183 mm 下每个基因约 7 mm，
     # 再多标签就挤成一片。原来取 40 会画出 323 mm 宽的图 —— 装不进任何
     # 期刊的一页。
     top3 = [g for g in top3 if g in adata.raw.var_names][:24]
+    top3_diag["n_columns_after_cap"] = len(top3)
+    top3_diag["width_cap_note"] = (
+        "列数上限 24 是按双栏 183mm / 每基因约 7mm 算的；"
+        "被上限截掉的不影响每簇至少一个代表基因")
+    log_info(f"marker 点图: {top3_diag['n_columns']} 列（{top3_diag['n_clusters']} "
+             f"个簇，每簇请求 3 个）；跨簇重复去掉 "
+             f"{len(top3_diag['shared_dropped'])} 个")
     if top3:
         # **手工画 dotplot，不用 `sc.pl.dotplot`。** 用户 2026-09-24 第四轮
         # 指出四个问题，前两个是根因级的：
@@ -461,7 +562,7 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
         sub = raw[:, top3]
         X = np.asarray(sub.X.todense()) if hasattr(sub.X, "todense") else np.asarray(sub.X)
         groups = adata.obs["leiden"].astype(str).values
-        ug = sorted(set(groups), key=lambda v: int(v))
+        ug = sorted(set(groups), key=cluster_sort_key)
         # frac = 表达细胞比例（>0 计表达，与 scanpy 默认 expression_cutoff 一致）
         frac = np.zeros((len(ug), len(top3)))
         mean_expr = np.zeros((len(ug), len(top3)))
@@ -536,8 +637,8 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
         # 打分热图
         # 宽度夹在 [单栏半, 双栏]：类型少时不至于太空，类型多时也不会
         # 画出装不进一页的图（标签已旋转 45°）
-        fig, ax = plt.subplots(figsize=(min(W_DOUBLE, max(W_ONE_HALF, 0.45 * len(per_cell.columns) + 3)),
-                                        max(3.0, 0.32 * len(per_cell) + 1.6)))
+        fig, ax = plt.subplots(figsize=grid_figsize(len(per_cell.columns),
+                                                    len(per_cell)))
         im = ax.imshow(per_cell.values, aspect="auto", cmap="viridis")
         ax.set_xticks(range(len(per_cell.columns)))
         ax.set_xticklabels(per_cell.columns, rotation=45, ha="right", fontsize=7)
@@ -626,6 +727,10 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
         "n_pcs_used": int(n_pcs_use),
         "use_rep": use_rep,
         "n_markers_rows": int(len(markers)),
+        # **M24（R-03 裁决）**：点图的列数为什么少于 `3 × 簇数`。
+        # 原来 `.unique()` 静默跨簇去重，注释却写"每簇取前 3 个" ——
+        # 读者拿列数除簇数会得到"每簇不到 3 个"而不知原因。
+        "marker_dotplot_columns": top3_diag,
         "cluster_sizes": {str(k): int(v) for k, v in
                           adata.obs["leiden"].value_counts().sort_index().items()},
         "annotation": annot_record,

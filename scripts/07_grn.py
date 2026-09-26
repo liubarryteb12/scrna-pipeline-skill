@@ -38,10 +38,10 @@ import scanpy as sc  # noqa: E402
 import yaml  # noqa: E402
 from scipy import sparse  # noqa: E402
 
-from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, place_labels, record_step,
+from common import (df_to_records, ensure_dirs, grid_figsize, load_config,  # noqa: E402
+                    log_info, log_warn, parse_args, place_labels, record_step,
                     result_status_of, save_fig,
-                    set_seed, write_json, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, PAL,)
+                    set_seed, write_json, W_ONE_HALF, W_SINGLE, mm, PAL,)
 
 # 每个调控子保留多少个共表达靶基因
 N_TARGETS = 30
@@ -89,14 +89,20 @@ def run_07_grn(cfg: dict) -> dict:
     lookup = {g: i for i, g in enumerate(var_names)}
     log_info(f"表达矩阵（全基因集）: {X.shape[0]} 细胞 x {X.shape[1]} 基因")
 
-    tfs = [t for t in load_tfs() if t in lookup]
+    # L15：`load_tfs()` 原来在本函数里被调两次（一次筛、一次算分母）。
+    # 两次调用的返回值在逻辑上必须相同，但那是"碰巧"——`load_tfs` 读的是
+    # 磁盘上的 TF 清单文件，两次调用之间文件被改（或第二次读失败走了别的
+    # 分支）就会让 `len(tfs) > len(load_tfs())`，打印出"12/8 在数据里存在"
+    # 这种自相矛盾的日志。一次调用、两个用途。
+    _all_tfs = load_tfs()
+    tfs = [t for t in _all_tfs if t in lookup]
     if not tfs:
         status = {"dataset_id": cfg["dataset_id"], "status": "no_tfs_in_data",
                   "reason": "TF 列表里的基因一个都不在数据里"}
         write_json(res_dir / "grn_status.json", status)
         log_warn(status["reason"])
         return status
-    log_info(f"转录因子: {len(tfs)}/{len(load_tfs())} 在数据里存在")
+    log_info(f"转录因子: {len(tfs)}/{len(_all_tfs)} 在数据里存在")
 
     # ---- 1. 选推断用的基因集 ------------------------------------------------
     # 用表达方差最高的基因（而不是 HVG 标记），因为需要全基因集上的方差
@@ -237,8 +243,17 @@ def run_07_grn(cfg: dict) -> dict:
                 if (idx >= 0).all():
                     pt = pt[idx]
                 else:
-                    log_warn(f"pseudotime_per_cell.csv 有 {(idx < 0).sum()} 个细胞"
-                             "在 adata 里找不到，按原顺序使用（**可能错位**）")
+                    # **M16（R-03 裁决）**：原来这里是 `log_warn(... 可能错位)`
+                    # 然后**照旧继续** —— 于是每一个 `rho_with_pseudotime`
+                    # 都是两个不配对细胞的伪相关，而产物看起来完全正常
+                    # （有 CSV、有 q 值、有 top 表）。**错位不会自己暴露。**
+                    # 长度相等时连下面那个 `len(pt) != n_obs` 的守卫都不会响。
+                    # 修法：抛错，由外层记成嵌套 `traj_status=failed`
+                    # （M19：顶层不再无条件 `ok`）。
+                    raise ValueError(
+                        f"pseudotime_per_cell.csv 有 {(idx < 0).sum()} 个细胞"
+                        f"在 adata 里找不到 —— 细胞顺序无法对齐，"
+                        f"继续算会得到全部伪相关（拒绝按原顺序使用）")
             if len(pt) != adata.n_obs:
                 raise ValueError(f"拟时序长度 {len(pt)} != 细胞数 {adata.n_obs}")
 
@@ -376,12 +391,25 @@ def run_07_grn(cfg: dict) -> dict:
                   .head(int(grn.get("top_tfs", 10)) * 2)["tf"].tolist())
     if top_tfs:
         sub = act_mat[top_tfs]
-        # 宽度夹在 [单栏半, 双栏]：类别少时不至于太空，类别多时也不会
-        # 画出装不进一页的图
-        fig, ax = plt.subplots(figsize=(min(W_DOUBLE, max(W_ONE_HALF, W_SINGLE, 0.42 * len(top_tfs) + 2.4)),
-                                        max(3.4, 0.34 * len(sub) + 1.8)))
+        # **L4（R-03 裁决）**：原写作
+        #   figsize=(min(W_DOUBLE, max(W_ONE_HALF, W_SINGLE, 0.42*len(top_tfs)+2.4)),
+        #            max(3.4, 0.34*len(sub)+1.8))
+        # —— 宽度走 `mm()`（毫米→英寸），高度是**裸英寸**，同一行两种单位；
+        # 而且高度只有下限没有上限，调控子多时能画出一页装不下的长条图。
+        # 统一走 `grid_figsize()`：全程毫米、高度也封顶。
+        fig, ax = plt.subplots(figsize=grid_figsize(len(top_tfs), len(sub)))
+        # **L16（R-03 裁决）**：色标上下限原来直接取 `max(|values|)`。
+        # 当所有活性都是 0（某些数据/某些参数下真的会发生）时
+        # `vmin == vmax == 0`，matplotlib 的归一化退化成除以 0 ——
+        # 整张热图变成一个纯色块，**看起来像"活性完全一致"，
+        # 实际是色标坏了**。给一个非退化下限：全零时用 ±1。
+        _amax = float(np.abs(sub.values).max()) if sub.size else 0.0
+        if not np.isfinite(_amax) or _amax <= 0:
+            _amax = 1.0
+            log_warn("TF 活性矩阵全为 0（或含非有限值）—— 色标改用 ±1，"
+                     "否则 vmin == vmax 会让整张热图塌成一个色块")
         im = ax.imshow(sub.values, aspect="auto", cmap="RdBu_r",
-                       vmin=-np.abs(sub.values).max(), vmax=np.abs(sub.values).max())
+                       vmin=-_amax, vmax=_amax)
         ax.set_xticks(range(len(top_tfs)))
         ax.set_xticklabels(top_tfs, rotation=45, ha="right", fontsize=7)
         ax.set_yticks(range(len(sub)))
@@ -415,10 +443,21 @@ def run_07_grn(cfg: dict) -> dict:
                  "labels = top 8 by cluster specificity (auto-placed, non-overlapping)")
     save_fig(cfg, "02-07-03-unit1-tf-specificity-scatter", fig)
 
+    # **M19（R-03 裁决）**：顶层原来无条件写 `"status": "ok"`，而嵌套的
+    # `regulon_vs_pseudotime` 可以是 `failed` —— 这正是 E-48 的现场
+    # （5 张 `02-07-01` 图从未产出而验收 70 项全绿）。嵌套扫描现在能把它
+    # 判红，但**顶层自称 `ok` 而里面崩了**本身仍是一句假话：
+    # 下游只要读顶层就会被骗。修法：嵌套失败时顶层记 `partial`。
+    # 登记在 `STEP_SKIP_VALUES` 而不是 `STEP_ABORT_VALUES` —— 主体
+    # （调控子推断 + 三张图）确实产出了，判红会让整步失败。
+    _traj_failed = str(traj_status.get("status", "")).lower() in ("failed", "error", "fail")
     status = {
         "dataset_id": cfg["dataset_id"],
-        "status": "ok",
-        "n_tfs_in_list": len(load_tfs()),
+        "status": "partial" if _traj_failed else "ok",
+        **({"partial_reason": "regulon_vs_pseudotime 失败（"
+                              + str(traj_status.get("reason"))[:150] + "）"}
+           if _traj_failed else {}),
+        "n_tfs_in_list": len(_all_tfs),
         "n_tfs_present": len(tfs),
         "n_regulons": int(len(reg)),
         "n_targets_per_regulon": N_TARGETS,

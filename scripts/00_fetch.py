@@ -31,6 +31,10 @@ from common import (ensure_dirs, load_config, log_info, log_warn,  # noqa: E402
 MIN_CELLS = 50
 MIN_GENES = 50
 MAX_CELLS_WARN = 200_000   # 超过只警告（内存与时间），不拒绝
+# 为什么是 20 万（L18）：本地实测 ~2 万细胞用 ~1.5 GB、CI runner 7 GB 内存，
+# 20 万约 15 GB —— 已经**超过 runner 内存**，只告警不拒绝是因为有些分析
+# （只做 QC + 聚类）确实跑得完。这个依据原先只存在于作者脑子里，
+# 现在写下来，否则没人知道这个数字能不能改。
 
 
 def load_registry(repo_root: Path) -> dict:
@@ -93,19 +97,38 @@ def read_10x_tar(tar_path: Path, cache_dir: Path):
 
     **10x 的 tar 里目录名带版本后缀**（filtered_gene_bc_matrices/hg19/），
     不能写死路径 —— 不同版本的目录结构不同。这里找到含 matrix.mtx 的目录。
+
+    返回 `(adata, extract_filter)`。第二个值是 `"data"` 或
+    `"none_fallback"`（M14：老 Python 上 `filter=` 不可用时**必须留下痕迹**，
+    不能"用了"和"没用"在产物里长得一样）。
     """
     import scanpy as sc
 
     extract_to = cache_dir / "10x_extracted"
     marker = extract_to / ".done"
+    extract_filter = "cached"
     if not marker.exists():
         extract_to.mkdir(parents=True, exist_ok=True)
         log_info(f"解压 {tar_path.name} -> {extract_to}")
         with tarfile.open(tar_path, "r:gz") as tf:
-            # Python 3.12+ 的 tarfile 有 data 过滤；老版本没有这个参数
+            # Python 3.12+ 的 tarfile 有 `filter=` 参数（防路径穿越）；老版本
+            # 没有，传了会 `TypeError`。
+            #
+            # **M14（R-03 裁决）**：原来的回退分支 `except TypeError:
+            # tf.extractall(extract_to)` **静默放弃安全过滤且不打任何日志** ——
+            # 于是"这份 tar 被检查过"和"这份 tar 被无条件解压"在日志里
+            # 长得一样。修法：回退时显式 WARN + 记进 status，把降级说出来。
+            # （不改成 raise：老 Python 上会直接不可用，而这是数据获取步骤。）
             try:
                 tf.extractall(extract_to, filter="data")
+                extract_filter = "data"
             except TypeError:
+                extract_filter = "none_fallback"
+                log_warn(
+                    f"本机 Python {sys.version_info.major}.{sys.version_info.minor} "
+                    f"的 tarfile 不支持 filter= 参数（需 3.12+）—— "
+                    f"**本次解压未做路径穿越过滤**（10x 官方 tar 包，风险低，"
+                    f"但这是一次降级，不是正常路径）")
                 tf.extractall(extract_to)
         marker.write_text("ok", encoding="utf-8")
     else:
@@ -119,7 +142,7 @@ def read_10x_tar(tar_path: Path, cache_dir: Path):
     mtx_dir = sorted(hits, key=lambda p: (len(p.parts), str(p)))[0]
     log_info(f"10x 矩阵目录: {mtx_dir.relative_to(extract_to)}")
     adata = sc.read_10x_mtx(mtx_dir, var_names="gene_symbols", cache=False)
-    return adata
+    return adata, extract_filter
 
 
 def read_h5ad(path: Path):
@@ -251,9 +274,10 @@ def run_00_fetch(cfg: dict) -> dict:
         raise ValueError(f"数据源条目缺少 kind/url: {entry}")
 
     # ---- 取数 --------------------------------------------------------------
+    extract_filter = None
     if kind == "10x_tar":
         tar_path = download(url, cache_dir / Path(url).name)
-        adata = read_10x_tar(tar_path, cache_dir)
+        adata, extract_filter = read_10x_tar(tar_path, cache_dir)
     elif kind == "10x_h5":
         h5_path = download(url, cache_dir / Path(url).name)
         adata = read_10x_h5(h5_path)
@@ -303,6 +327,13 @@ def run_00_fetch(cfg: dict) -> dict:
         "counts_check": counts,
         "min_cells_gate": MIN_CELLS,
         "min_genes_gate": MIN_GENES,
+        # **M14**：解压时有没有做路径穿越过滤。`none_fallback` 是降级路径。
+        "extract_filter": extract_filter,
+        # **L18（R-03 裁决）**：这个阈值原来只 WARN、且不落盘 ——
+        # 于是"细胞数 21 万，已经越过提示线"这件事在产物里查不到，
+        # 事后想解释 CI 为什么慢/为什么内存吃紧时没有任何依据。
+        "max_cells_warn_gate": MAX_CELLS_WARN,
+        "n_cells_over_warn_gate": bool(adata.n_obs > MAX_CELLS_WARN),
     }
     write_json(data_dir / "dataset_info.json", info)
     return info

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -61,6 +62,31 @@ STEP_STATUS_FILES = {
     "grn": "grn_status.json",
     "virtual_perturbation": "virtual_perturbation_status.json",
 }
+
+# **M10（R-03 裁决）**：这张表的键必须与 `STEPS` 的 id 集合一致。
+#
+# 旧代码 `stale = res_dir / STEP_STATUS_FILES.get(sid, "")` 用的是**默认空串**
+# —— `res_dir / ""` 就是 `res_dir` 本身，一旦上面那个 `if sid in STEP_STATUS_FILES`
+# 守卫被改动（比如将来有人加了新步骤却忘了登记状态文件），`unlink()` 就会
+# 作用在**结果目录**上，`IsADirectoryError` 被 `except` 接住 ⇒ 步骤莫名失败。
+# 守卫现在挡着，所以是**潜伏**缺陷，但"靠守卫恰好成立"不是设计。
+#
+# 这里在导入时就把两个集合对齐 —— 将来加步骤忘了登记，**启动即报错**。
+#
+# `fetch` 是唯一的例外，且是**设计如此**：它不写 `res_dir/*_status.json`，
+# 写的是 `data_dir/dataset_info.json`（见 `00_fetch.py:338`）—— 取数步骤的
+# 产物是数据本身，"状态"没有独立载体。所以它进豁免集，而不是给它编一个
+# 空文件名（编了就会在跑前删掉一个不该删的东西）。
+_STEPS_WITHOUT_STATUS_FILE = {"fetch"}
+
+_MISSING_STATUS_FILES = sorted(
+    {s[0] for s in STEPS} - set(STEP_STATUS_FILES) - _STEPS_WITHOUT_STATUS_FILE)
+if _MISSING_STATUS_FILES:
+    raise RuntimeError(
+        f"STEPS 里的步骤既没有登记状态文件、也不在豁免集里: "
+        f"{_MISSING_STATUS_FILES} —— 没有登记的话跑前删旧状态文件的逻辑"
+        f"会落到结果目录上（审计 M10）。请在 STEP_STATUS_FILES 里补上，"
+        f"或（确实不写状态文件时）加进 _STEPS_WITHOUT_STATUS_FILE 并写明理由。")
 
 # 文档 §2「本部分人工复核节点」。**默认 pending，不是 confirmed** ——
 # 自动化流水线不能替人签字，把未确认的节点记成已确认，等于把复核节点
@@ -106,17 +132,43 @@ REQUIRED_FILES = [
 ]
 
 # 必需的图（相对 figures_dir，不含扩展名）
+#
+# **M11（R-03 裁决）：这张表不再单独承担判据。** 它是一张**手抄**的表，
+# 而手抄的表会漂移 —— 实测漏了 `02-05-01-unit1-paga-graph`、
+# `02-05-04-unit1/unit2/unit3`、`02-05-05-unit1` 与全部 `02-06-*`，
+# 其中 `02-06-01-unit1-communication-heatmap` 在 `06_communication.py` 里
+# 写出却**没有任何检查看得见**。漂移的方向恰好是"新加的图不在表里"，
+# 也就是把 E-48 那个盲区原样再造一遍。
+#
+# 所以真正的判据换成 `declared_figures()`（从源码扫声明，见下），
+# 这张表退化成**说明文字**：给每张图一个人话标题。表里缺条目不再是盲区
+# （扫出来的图名不依赖它），但会让报告少一句解释 —— 所以下面有一条
+# 检查专门盯"扫出来的图有没有说明"。
 REQUIRED_FIGURES = [
-    ("02-01-01-unit1-genes-detected",     "过滤前 QC: genes detected"),     ("02-01-01-unit2-total-counts",      "过滤前 QC: total counts"),     ("02-01-01-unit3-mito-fraction",     "过滤前 QC: mito fraction"),     ("02-01-01-unit4-ribo-fraction",     "过滤前 QC: ribo fraction"),     ("02-01-01-unit5-hb-fraction",       "过滤前 QC: hb fraction"),
+    ("02-01-01-unit1-genes-detected",     "过滤前 QC: genes detected"),
+    ("02-01-01-unit2-total-counts",       "过滤前 QC: total counts"),
+    ("02-01-01-unit3-mito-fraction",      "过滤前 QC: mito fraction"),
+    ("02-01-01-unit4-ribo-fraction",      "过滤前 QC: ribo fraction"),
+    ("02-01-01-unit5-hb-fraction",        "过滤前 QC: hb fraction"),
     ("02-01-02-unit1-qc-scatter-thresholds",     "QC 阈值散点"),
     ("02-02-01-unit1-hvg-selection",             "高变基因选择"),
     ("02-02-02-unit1-pca-variance-ratio",        "PCA 方差解释"),
+    ("02-02-03-unit1-batch-mixing",              "批次混合前后对比"),
     ("02-03-01-unit1-cluster-resolution-scan",   "分辨率扫描曲线"),
     ("02-03-02-unit1-umap-clusters",             "UMAP 聚类图"),
     ("02-03-03-unit1-markers-dotplot",           "marker 点图"),
     ("02-03-04-unit1-celltype-scores-heatmap",   "细胞类型打分热图"),
+    ("02-05-01-unit1-paga-graph",                "PAGA 连接图（M11 补）"),
+    ("02-05-02-unit1-trajectory-method-correlation", "轨迹方法一致性"),
+    ("02-05-03-unit1-trajectory-modules-heatmap",    "轨迹模块热图"),
+    ("02-05-03-unit2-trajectory-module-profiles",    "轨迹模块轮廓"),
+    ("02-05-04-unit1-pseudotime-consensus",      "共识拟时序 UMAP"),
+    ("02-05-04-unit2-pseudotime-dpt",            "DPT 拟时序 UMAP"),
+    ("02-05-04-unit3-celltype-on-umap",          "细胞类型 UMAP（M6，条件产出）"),
     ("02-05-04-unit4-pseudotime-principal-path", "拟时序主路径+root"),
+    ("02-05-05-unit1-pseudotime-by-cluster",     "各簇拟时序箱线图"),
     ("02-05-05-unit2-pseudotime-ridgeline",      "拟时序山脊图"),
+    ("02-06-01-unit1-communication-heatmap",     "细胞通讯热图（M11 补）"),
     # Q-26 / E-48 补：这四条原来**不在这张表里**，所以"该有的图没有"这一整类
     # 问题没有任何检查看得见。02-07-01 的 5 张图（本图 + unit2..5 单 TF 面板）
     # 因 `figsize` 三元素元组从未产出过，而验收 70 项全绿。
@@ -125,6 +177,149 @@ REQUIRED_FIGURES = [
     ("02-07-03-unit1-tf-specificity-scatter",    "TF 特异性散点"),
     ("02-08-01-unit1-virtual-perturbation-effect", "虚拟扰动效应"),
 ]
+_FIG_DESC = {nm: desc for nm, desc in REQUIRED_FIGURES}
+
+PART = "02"
+
+
+def _strip_comments(src: str) -> str:
+    """逐行剥注释，**引号内不剥** —— 与 `tools/check_fig_names.mjs` 的
+    `stripComments` 同义。
+
+    口径必须一致：门禁层用 JS 那份扫"声明了哪些图"，验收层用这份扫，
+    两边算法不同就会对同一份源码给出不同的图名集合，而**没有任何东西
+    能发现它们不一致**（门禁绿、验收也绿）。
+
+    与 E-62 同源：纯文本扫描器必须先把非代码区域抹掉，否则一个写注释里的
+    图名会让靠括号配平的扫描器一路吞到文件尾。
+    """
+    out = []
+    for line in src.split("\n"):
+        q, cut = None, None
+        for i, c in enumerate(line):
+            if q:
+                if c == q:
+                    q = None
+            elif c in "\"'":
+                q = c
+            elif c == "#":
+                cut = i
+                break
+        out.append(line if cut is None else line[:cut])
+    return "\n".join(out)
+
+
+def _script_sources():
+    for f in sorted((REPO / "scripts").glob("[0-9][0-9]_*.py")):
+        # **必须排除 main_analysis.py**：本文件的验收层会引用图名，
+        # 那是"检查对象"不是"出图声明"。不排除的话验收会要求自己
+        # 引用过的每张图都存在，把口径搞反。
+        if f.name == "main_analysis.py":
+            continue
+        yield f, _strip_comments(f.read_text(encoding="utf-8"))
+
+
+_FIG_NAME_RE = re.compile(
+    rf"^{PART}-\d{{2}}-\d{{2}}-unit\d+-[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def declared_figures() -> list:
+    """扫出**声明要出**的静态图名（字符串字面量）。M11。
+
+    声明从源码扫出来而不是手抄一张表 —— 手抄的表会漂移，而漂移的方向
+    恰好是"新加的图不在表里"，也就是把 E-48 那个盲区原样再造一遍。
+
+    含 `{ }` 的模板串跳过（运行时拼名，由 `DYNAMIC_FIG_BASES` 声明豁免）。
+    """
+    out = []
+    pat = re.compile(rf'"{PART}-[^"]*"')
+    for _f, src in _script_sources():
+        for m in pat.finditer(src):
+            nm = re.sub(r"\.(pdf|png)$", "", m.group(0)[1:-1])
+            if "{" in nm or "}" in nm:
+                continue
+            if _FIG_NAME_RE.match(nm):
+                out.append(nm)
+    return sorted(set(out))
+
+
+def dynamic_fig_bases() -> dict:
+    """扫出 `DYNAMIC_FIG_BASES = {"<图号>": <张数>}` 声明。
+
+    键补全成完整前缀 `02-<模块号>-<图号>`。这是**槽位上限**，不是精确值：
+    少出合法（只有 top 8 个 marker 基因时 8 个槽位里出不满），
+    但**一张都没有说明那段循环整段没跑**。
+    """
+    out = {}
+    pat = re.compile(r"DYNAMIC_FIG_BASES\s*=\s*\{([^}]*)\}")
+    for f, src in _script_sources():
+        m = pat.search(src)
+        if not m:
+            continue
+        for pair in m.group(1).split(","):
+            if ":" not in pair:
+                continue
+            k, v = pair.split(":", 1)
+            key = k.strip().strip("\"'")
+            try:
+                out[f"{PART}-{f.name[:2]}-{key}"] = int(v.strip())
+            except ValueError:
+                continue
+    return out
+
+
+# 条件产出的图：**图名 -> (状态文件, 判据路径, 能力就位时的取值, 说明)**。
+#
+# **M6（R-03 裁决）**：`05_trajectory.py` 的 unit3 在 `celltype` 列缺失时
+# 回退成按 `leiden` 着色，然后**跳过保存**（图名账目不含 leiden 回退）。
+# 旧实现把这件事只写进 `log_warn` —— 日志是过程性的，事后没人读得到。
+# 这里把它变成可判定的：`celltype` 列存在时这张图**变成必需**，
+# 不存在时允许缺失但**必须可见**（报告里列出豁免原因）。
+#
+# 语义与 spatial 的 `CONDITIONAL_FIGURES` 一致：**不是"已知缺陷白名单"**，
+# 它写的是"为什么可以没有"，且是**自愈**的 —— `celltype` 列哪天有了，
+# 这张图立刻自动变成必需。
+CONDITIONAL_FIGURES = {
+    "02-05-04-unit3-celltype-on-umap": (
+        "cluster_status.json", ("annotation", "status"), "ok",
+        "03 步骤的细胞类型注释没成功时没有 `celltype` 列，"
+        "此时 unit3 会退回 leiden 且按约定不落盘"),
+    "02-02-03-unit1-batch-mixing": (
+        "integration_status.json", ("has_batch_key",), True,
+        "单样本数据没有批次，没有「前后对比」可画 —— 这张图本就不该存在"),
+}
+
+
+def _dig(obj, path):
+    """按路径取值；任一层缺失返回 `None`（**不抛异常**）。"""
+    cur = obj
+    for k in path:
+        if isinstance(cur, dict):
+            cur = cur.get(k)
+        elif isinstance(cur, list) and isinstance(k, int) and 0 <= k < len(cur):
+            cur = cur[k]
+        else:
+            return None
+    return cur
+
+
+def chk(cid: str, kind: str, ok: bool, detail: str,
+        severity: str = "required") -> dict:
+    """构造一条验收项（Q-27 范式，与 spatial 侧同签名）。
+
+    **第二个位置参数是 `kind` 不是 `severity`** —— 两者同名同型、位置相邻，
+    传错不会报错，只会把 severity 值写进 kind 槽而检查仍然"看起来正常"
+    （E-53 自查抓到的正是这个）。所以这里两个参数都写成关键字更安全的
+    形式：`kind` 在前、`severity` 有默认值且在末位。
+
+    `severity` 三档：
+      - `"required"`：失败即验收红（默认）；
+      - `"content"`：内容正确性，失败即红但计数分开；
+      - `"info"`：只可见，永不判红（如"这张图缺中文说明"）。
+    """
+    return {"id": cid, "kind": kind, "item": f"[{kind}] {cid}",
+            "ok": bool(ok), "required": severity != "info",
+            "severity": severity, "detail": detail}
 
 
 def load_step_fn(module_file: str, fn_name: str):
@@ -274,10 +469,16 @@ def run_all(cfg: dict, only: list = None) -> int:
             continue
         log_info("")
         log_info(f"--- {label} ({sid})" + ("" if required else "  [可选]"))
-        # 先删本步的状态文件：崩溃时不留旧文件冒充本轮结果
-        stale = res_dir / STEP_STATUS_FILES.get(sid, "")
-        if sid in STEP_STATUS_FILES and stale.exists():
-            stale.unlink()
+        # 先删本步的状态文件：崩溃时不留旧文件冒充本轮结果。
+        # M10：**显式取键再判空**，不用 `.get(sid, "")` —— 空串会让
+        # `res_dir / ""` 等于结果目录本身。上面导入时的断言已保证键存在，
+        # 这里仍然写成显式判空，两层各管一件事（断言管"配置一致"，
+        # 判空管"这一行不会删到目录"）。
+        fname = STEP_STATUS_FILES.get(sid)
+        if fname:
+            stale = res_dir / fname
+            if stale.exists() and stale.is_file():
+                stale.unlink()
         t0 = time.time()
         try:
             fn = load_step_fn(mfile, fn)
@@ -376,28 +577,100 @@ def run_all(cfg: dict, only: list = None) -> int:
     # （如 `trajectory.enabled: false` 时 `02-05-*` 一张都不该有）。
     # 上一版把 `02-05-04/02-05-05` 无条件写成 required=True，等于一旦关掉
     # 轨迹，验收必红 —— 那是判据错了，不是产物错了。
+    #
+    # **M11（R-03 裁决）**：判据从"手抄表里的图在不在"换成
+    # "**源码声明过的图在不在**"。手抄表会漂移，实测漏了 `02-05-01` /
+    # `02-05-04-unit1..3` / `02-05-05-unit1` / `02-06-01` —— 其中
+    # `02-06-01-unit1-communication-heatmap` 在 `06_communication.py` 里
+    # 正常写出，却**没有任何检查看得见**。漂移方向恰好是"新加的图不在表里"，
+    # 就是把 E-48 那个盲区原样再造一遍。
     _mod2sid = {mfile[:2]: sid for sid, mfile, _f, _r, _l in STEPS}
     _step_status = {s["id"]: s.get("status", "not_run")
                     for s in read_state(cfg).get("steps", [])}
     _step_required = {sid: req for sid, _m, _f, req, _l in STEPS}
-    for fname, desc in REQUIRED_FIGURES:
+
+    fig_names = sorted(p.stem for p in fig_dir.glob("*.png"))
+    declared = declared_figures()
+    dyn = dynamic_fig_bases()
+    declared_set = set(declared)
+
+    def _owner_of(fname: str):
         mod = fname.split("-")[1] if fname.count("-") >= 1 else ""
         owner = _mod2sid.get(mod)
-        owner_status = _step_status.get(owner, "not_run") if owner else "not_run"
-        ran = owner_status == "ok"
-        ok = has_file(fig_dir / f"{fname}.png")
-        if not ran and not _step_required.get(owner, False):
-            # 可选步骤没跑（或配置关闭）→ 不要求这张图，但**必须可见**
-            checks.append({
-                "item": f"图 {desc} ({fname}.png)", "ok": True,
-                "required": False,
-                "detail": f"步骤 {owner} = {owner_status}，本轮不要求产出",
-            })
+        return owner, (_step_status.get(owner, "not_run") if owner else "not_run")
+
+    # ---- 静态图：声明过的每一张都要在（可选步骤没跑则豁免但可见）------------
+    missing, waived, skipped_optional = [], [], []
+    for fname in declared:
+        owner, owner_status = _owner_of(fname)
+        if has_file(fig_dir / f"{fname}.png"):
             continue
-        checks.append({"item": f"图 {desc} ({fname}.png)", "ok": ok,
-                       "required": True,
-                       "detail": "存在" if ok else
-                                 f"**缺失**（步骤 {owner} = {owner_status}）"})
+        cond = CONDITIONAL_FIGURES.get(fname)
+        if cond:
+            st_file, path, ready_val, why = cond
+            p = res_dir / st_file
+            got = None
+            if p.exists():
+                try:
+                    got = _dig(json.loads(p.read_text(encoding="utf-8")), path)
+                except Exception:  # noqa: BLE001
+                    got = None
+            if got != ready_val:
+                waived.append(f"{fname}（{why}；{st_file} "
+                              f"{'.'.join(str(x) for x in path)}={got!r}）")
+                continue
+        if not _step_required.get(owner, False) and owner_status != "ok":
+            # 可选步骤没跑（或配置关闭）→ 不要求这张图，但**必须可见**
+            skipped_optional.append(f"{fname}（步骤 {owner} = {owner_status}）")
+            continue
+        missing.append(fname)
+
+    _notes = []
+    if waived:
+        _notes.append(f"{len(waived)} 张条件图本轮不适用：{waived}")
+    if skipped_optional:
+        _notes.append(f"{len(skipped_optional)} 张属于未运行的可选步骤："
+                      f"{skipped_optional}")
+    _tail = ("；".join(_notes)) if _notes else ""
+    checks.append(chk("figures:declared", "required", not missing,
+                      (f"源码声明 {len(declared)} 张静态图，全部产出"
+                       + (f"；{_tail}" if _tail else "")
+                       if not missing else
+                       f"**声明了但没产出** {missing}"
+                       + (f"（{_tail}）" if _tail else "")
+                       + f" —— 实际产出 {len(fig_names)} 张")))
+
+    # ---- 动态图名：每组前缀至少 1 张 ----------------------------------------
+    dyn_missing = []
+    for base, n_slots in dyn.items():
+        got = [nm for nm in fig_names
+               if nm.startswith(base + "-") and nm not in declared_set]
+        if not got:
+            dyn_missing.append(f"{base}（声明 {n_slots} 个槽位，实际 0 张）")
+    checks.append(chk("figures:dynamic", "required", not dyn_missing,
+                      (f"{len(dyn)} 组动态图名共 {sum(dyn.values())} 个槽位，"
+                       f"各自至少产出 1 张"
+                       if not dyn_missing else
+                       f"**动态图名整组没产出** {dyn_missing} —— "
+                       f"槽位是上限不是精确值，少出合法，"
+                       f"但**一张都没有说明那段循环整段没跑**")))
+
+    # 保留计数作为**下限兜底**：声明扫描本身失效时（如源码结构大改导致
+    # 一条字面量都扫不到）这条还能拦住"一张图都没有"。
+    checks.append(chk("figures:count", "required", len(fig_names) >= 8,
+                      f"{len(fig_names)} 张图（要求 >=8）"))
+
+    # 扫出来的图名必须有说明 —— 否则报告里会出现一个只有文件名、没人知道
+    # 它想表达什么的条目。**这条不判红**（`severity="info"`）：
+    # `REQUIRED_FIGURES` 只是说明文字表，缺一条说明不代表产物有问题，
+    # 判红会让"加了新图"这件好事变成一次 CI 失败。
+    _no_desc = [nm for nm in declared if nm not in _FIG_DESC]
+    checks.append(chk("figures:documented", "required", True,
+                      (f"{len(declared)} 张声明图都有中文说明"
+                       if not _no_desc else
+                       f"{len(_no_desc)} 张声明图缺中文说明（不影响正确性，"
+                       f"但报告里只有文件名）：{_no_desc}"),
+                      severity="info"))
 
     # ---- 模块零：运行清单（§0.3 / §0.4）-------------------------------------
     # 清单缺项不是"分析错了"，而是"这轮跑出来的东西没法追溯"。
@@ -412,10 +685,51 @@ def run_all(cfg: dict, only: list = None) -> int:
                    if msum.get("present") else "**缺失**"),
     })
     if msum.get("present"):
+        # **旧判据是 `msum["n_versions"] >= 20`（L12），一个没有任何依据的
+        # 魔数。** 它有两个毛病：
+        #   1. 20 从哪来说不清 —— 实测本仓装 96 个包，20 只是"看起来够多"；
+        #   2. 它把「枚举成功」和「枚举到多少个」混成一个量。枚举器半路抛
+        #      异常时 `n_versions` 仍可能凑够 21 个，验收照样绿，而
+        #      `versions` 里缺的正是后来要用来复现的那几个包。
+        # 现在判「枚举这个动作成功没有」——那是一个事实，不是阈值。
+        #
+        # **三态，不是二态。** `versions_enumeration` 有三个取值：
+        #   `"ok"`     —— 枚举成功；
+        #   `"failed"` —— 枚举器抛了异常（这是本轮唯一该判红的）；
+        #   `"unknown"`—— 清单里**没有这个字段**，即清单由旧版本代码写出。
+        # 把 `unknown` 判红会让"读一份历史 artifact"变成失败，而那不是
+        # 任何人的缺陷；把 `unknown` 判绿又会让"枚举从没跑过"混进通过里 ——
+        # 与 E-64 同一条教训：**"没跑"和"跑了没问题"必须长得不一样**。
+        # 所以 `unknown` 只可见（`required=False`），红只留给 `failed`。
+        _enum = msum.get("versions_enumeration", "unknown")
+        _enum_ok = (_enum == "ok")
         checks.append({
-            "item": "版本记录非空（pip freeze 全量）",
-            "ok": msum["n_versions"] >= 20, "required": True,
-            "detail": f"{msum['n_versions']} 个已安装包",
+            "item": "版本枚举成功（importlib.metadata 未抛异常）",
+            "ok": _enum != "failed", "required": _enum == "failed",
+            "detail": (f"{msum.get('n_versions', 0)} 个已安装包"
+                       if _enum_ok else
+                       (f"**枚举失败**：{msum.get('versions_enumeration_error')}"
+                        f" —— versions 只有 {msum.get('n_versions', 0)} 项，"
+                        f"不足以复现本轮"
+                        if _enum == "failed" else
+                        f"**无法判断**：清单里没有 `versions_enumeration` "
+                        f"字段（该清单由旧版本代码写出，不记枚举成败）；"
+                        f"versions 有 {msum.get('n_versions', 0)} 项。"
+                        f"本轮代码写出的清单会带这个字段。")),
+        })
+        # 关键工具解析率**可见但不阻断**：本仓 CI 只装 §2 的一个子集，
+        # 实测 22 个关键工具里 8 个解析出来（含 scTenifoldKnk 1.1），
+        # 其余是"查过了，没装"。把它判红会让每轮都红，但完全不报又会
+        # 让"关键工具一个都没记上"从验收里消失 —— 所以要求**至少有一个
+        # 解析出来**，并把未解析的名单完整列出。
+        _nkr, _nkt = msum.get("n_key_resolved", 0), msum.get("n_key_total", 0)
+        _unres = msum.get("key_unresolved") or []
+        checks.append({
+            "item": "关键工具版本有记录（§0.3）",
+            "ok": _nkt > 0 and _nkr > 0, "required": True,
+            "detail": (f"{_nkr}/{_nkt} 个关键工具解析出版本"
+                       + (f"；未解析（查过了，未安装）: {', '.join(_unres)}"
+                          if _unres else "")),
         })
         checks.append({
             "item": "输入哈希已登记且必需项无缺失",
@@ -471,6 +785,16 @@ def run_all(cfg: dict, only: list = None) -> int:
     # 可选步骤的"没做"要在报告里可见 —— 不能只是绿
     #
     # **但"崩了"和"没做"必须分开** —— 见下面独立的内嵌 status 扫描（Q-26）。
+    #
+    # **M12（R-03 裁决）**：这里原来写死 `"ok": True` —— 无论 `st` 是什么
+    # 都恒为真。后果：`ok=True` 的检查在报告里是 `[PASS]`，于是
+    # "`trajectory` 崩了"和"`trajectory` 正常跑完"打印得一模一样。
+    # 恒为真的量比没有这个量更糟 —— 它看起来像一条检查。
+    #
+    # 修法：`ok` 反映真实取值，`severity="info"` 保证**永不判红**
+    # （可选步骤没做是设计如此，判红会让每个 job 都红，台账元规则 ④）。
+    # 这样"崩了"在报告里显示成 `[INFO] ... ok=False`，与 `ok=True` 可区分，
+    # 而不改变退出码。
     for sid, fname in (("pseudobulk_de", "pseudobulk_status.json"),
                        ("trajectory", "trajectory_status.json"),
                        ("communication", "communication_status.json"),
@@ -481,8 +805,14 @@ def run_all(cfg: dict, only: list = None) -> int:
             continue
         st = d.get("status")
         note = d.get("reason") or d.get("method") or ""
-        checks.append({"item": f"可选步骤状态 {sid} = {st}", "ok": True,
-                       "required": False, "detail": str(note)[:150]})
+        # `classify_step_result` 把自述状态归成 ok / abort / skip ——
+        # 只有 `abort` 算"崩了"，其余（`not_applied` / `package_missing` …）
+        # 是设计如此地没做。这里只借它算 `ok` 的真假，`severity="info"`
+        # 保证退出码不受影响。
+        _ok = classify_step_result(st) != "abort"
+        checks.append(chk(f"step_status:{sid}", "info", _ok,
+                          f"可选步骤状态 {sid} = {st!r}；{str(note)[:150]}",
+                          severity="info"))
 
     # ---- 内嵌 status 扫描（Q-26 / E-48，本轮新增）----------------------------
     #
@@ -806,8 +1136,18 @@ def run_all(cfg: dict, only: list = None) -> int:
     # 用 `read_manifest(cfg)` 而不是拼 `res_dir / "run_manifest.json"` ——
     # 文件名只该有一处（`MANIFEST_NAME`）。`read_manifest` 在文件不存在时
     # 已经返回 `{}`，所以这里不需要 `has_file` 判断。
-    msum = read_manifest(cfg)
-    named = (msum.get("params") or {}).get("named_tools")
+    #
+    # **变量名是 `mfull` 不是 `msum`（L13）。** 旧版这一段复用同一个 `msum`
+    # 先装 `manifest_summary(cfg)`（计数摘要，键是 `n_versions` /
+    # `inputs_missing` 这类）再装 `read_manifest(cfg)`（全量清单，键是
+    # `versions` / `params` / `decisions`）。两个结构**键完全不同**，
+    # 而 Python 对"读一个不存在的键"的默认行为是抛 `KeyError` ——
+    # 或者更糟：`.get()` 静默给 `None`，检查项就变成一个恒真的空判据。
+    # 同名的代价在下一次改动时才兑现：有人加一行 `msum["versions"]`
+    # 会得到 `KeyError`，而加一行 `msum.get("versions")` 会**静默通过**。
+    # 所以两个结构必须有两个名字。
+    mfull = read_manifest(cfg)
+    named = (mfull.get("params") or {}).get("named_tools")
     if not isinstance(named, dict) or not named:
         checks.append({
             "item": "§2 点名工具的缺口已登记（清单 named_tools）",
@@ -835,7 +1175,7 @@ def run_all(cfg: dict, only: list = None) -> int:
             "detail": f"已标注: {sorted(squat)}" if squat else "**一个都没标**",
         })
         # 决策链也要留痕（§0.4）
-        dec = msum.get("decisions") or []
+        dec = mfull.get("decisions") or []
         checks.append({
             "item": "点名工具的使用情况进了决策链（§0.4）",
             "ok": any((d or {}).get("node") == "named_tools" for d in dec),
@@ -846,7 +1186,7 @@ def run_all(cfg: dict, only: list = None) -> int:
 
     n_fail = 0
     for c in checks:
-        mark = "PASS" if c["ok"] else "FAIL"
+        mark = "PASS" if c["ok"] else ("FAIL" if c["required"] else "INFO")
         if not c["ok"] and c["required"]:
             n_fail += 1
         if c["ok"] and c["required"]:
@@ -860,10 +1200,11 @@ def run_all(cfg: dict, only: list = None) -> int:
         "dataset_id": cfg["dataset_id"],
         "n_checks": len(checks),
         "n_failed_required": n_fail,
+        "n_info": sum(1 for c in checks if c.get("severity") == "info"),
         "checks": checks,
         "steps_failed_required": [{"id": i, "label": l, "error": m}
                                   for i, l, m in failed_required],
-        "manifest": msum,
+        "manifest": mfull,
         "verdict": "ok" if n_fail == 0 else "failed",
     }
     write_json(res_dir / "acceptance.json", summary)
