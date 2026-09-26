@@ -56,6 +56,19 @@
 `ambient_rna` 的正规做法需要 SoupX（R，需空液滴）或 CellBender（需 GPU）；
 GitHub 托管 runner 无 GPU，所以默认不做，并如实记录。
 
+**"失败原因"必须是原因码，不能是布尔量（E-66 第二版 M2，2026-09-26 亲读
+artifact 才抓到）。** 一个 `p_adj_available: false` 只能表达"没做校正"，而
+"没做"至少有三种互不相干的处境。实测 `scrna-results-68` 的
+`trajectory_status.json` 写着 `note: "statsmodels 不可用"`，而同一份 artifact
+的 `run_manifest.json` 里 **`versions.statsmodels = 0.15.0`（装着呢）** ——
+真因是配置里 `group_key: null`。**一个真实但错误的原因，比"没有原因"更糟**：
+下一个人会去查依赖装没装、换镜像、加超时，而真正要改的只有那一行。
+
+所以：处境有几种就写几个**原因码**（`not_configured` / `single_group` /
+`no_pairs` / `import_failed` / `ok`），文案做成 `{码: 文案}[码]` 的映射表且
+两两不同，布尔量**由码推导**（`p_adj_available = (ks_reason == "ok")`）而不是
+与它并列 —— 两个独立量一定会漂开。**"数据里没有分组"与"配置漏了"是两件事。**
+
 ## 5. 每个"结论"都要带上它的适用范围
 
 单细胞分析里，方法学限定不是免责声明，是**结论的适用范围**。

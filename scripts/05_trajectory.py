@@ -632,10 +632,28 @@ def run_05_trajectory(cfg: dict) -> dict:
     ks_rows = []
     design = cfg.get("design") or {}
     group_key = design.get("group_key")
+    # **M2 修正（自查，2026-09-26）**：第一版只用 `p_adj_available` 一个布尔量，
+    # 于是三种完全不同的处境（没配分组 / 配了但凑不出比较对 / 校正真失败）
+    # 落盘成同一句话「statsmodels 不可用」。实测 CI artifact
+    # `scrna-results-68` 的 `trajectory_status.json` 就是这形态：
+    # `n_pairs: 0` 而 note 说「statsmodels 不可用」—— 而
+    # `run_manifest.json` 的 `versions.statsmodels = 0.15.0`，**它装着呢**。
+    # 这正是 E-58 防复发②「注释陈述的行为必须与代码实际行为对得上」的
+    # 又一实例：**一个真实但错误的原因，比"没有原因"更糟** —— 下一个人会去
+    # 查依赖装没装，而真正要改的是配置。所以改成显式的原因码 + 按码给话。
+    ks_reason = "not_configured"   # not_configured / single_group / no_pairs / import_failed / ok
+    ks_correction = None
     if group_key and group_key in adata.obs.columns:
         groups = adata.obs[group_key].astype(str).values
         uniq = sorted(set(groups))
-        if len(uniq) >= 2:
+        if len(uniq) < 2:
+            # **与"没配分组"分开记**：配了但只有一个取值，说明这列在**本数据集上**
+            # 没有可比的分组（例如单样本数据集的 sample 列）—— 与"根本没配"是
+            # 两件事，混成一句话会让读者以为配置漏了。
+            ks_reason = "single_group"
+            log_info(f"分组列 {group_key} 只有 1 个取值（{uniq[0] if uniq else '空'}），"
+                     f"没有可比较的两组，跳过 KS 比较")
+        else:
             for i in range(len(uniq)):
                 for j in range(i + 1, len(uniq)):
                     a_ = consensus[groups == uniq[i]]
@@ -651,11 +669,13 @@ def run_05_trajectory(cfg: dict) -> dict:
                         "median_b": round(float(np.median(b_)), 4),
                     })
             # **BH 校正**（与 06/07 同口径）。`multipletests` 不可用时退化成
-            # 不校正但**显式记 `p_adj_available: False`** —— 静默不校正会让
-            # 读者以为 `p_value` 就是可用的判据（同 E-58 防复发②：注释与
-            # 代码行为必须一致）。
-            p_adj_available = False
-            if ks_rows:
+            # 不校正但**显式记原因码** —— 静默不校正会让读者以为 `p_value`
+            # 就是可用的判据。
+            if not ks_rows:
+                ks_reason = "no_pairs"
+                log_info(f"分组列 {group_key} 有 {len(uniq)} 个取值，"
+                         f"但没有任何一对满足最小细胞数（各 >=5），跳过 KS 比较")
+            else:
                 try:
                     from statsmodels.stats.multitest import multipletests
                     _pv = [r["p_value"] for r in ks_rows]
@@ -663,21 +683,22 @@ def run_05_trajectory(cfg: dict) -> dict:
                     for r, padj, rej in zip(ks_rows, _padj, _rej):
                         r["p_adj_bh"] = float(padj)
                         r["significant_bh"] = bool(rej)
-                    p_adj_available = True
+                    ks_reason = "ok"
+                    ks_correction = "fdr_bh"
                 except Exception as e:  # noqa: BLE001
+                    ks_reason = "import_failed"
                     log_warn(f"KS 的 BH 校正失败（{type(e).__name__}: {e}）—— "
-                             f"只报原始 p_value，状态里会记 p_adj_available=False")
-            if ks_rows:
+                             f"只报原始 p_value，状态里会记 ks_by_group_note.reason="
+                             f"import_failed")
                 pd.DataFrame(ks_rows).to_csv(res_dir / "trajectory_ks_by_group.csv",
                                              index=False)
                 n_sig = sum(1 for r in ks_rows if r.get("significant_bh"))
                 log_info(f"多条件 KS 检验：{len(ks_rows)} 对比较，"
-                         + (f"BH 校正后显著 {n_sig} 对"
-                            if p_adj_available else
-                            "**未做 BH 校正**（statsmodels 不可用）"))
+                         + (f"BH 校正后显著 {n_sig} 对" if ks_reason == "ok" else
+                            "**未做 BH 校正**（statsmodels.stats.multitest 导入失败）"))
     else:
-        p_adj_available = False
         log_info("未配置 design.group_key，跳过多条件拟时序分布比较")
+    p_adj_available = ks_reason == "ok"
 
     # ---- 8. 分支点 ----------------------------------------------------------
     #
@@ -984,13 +1005,24 @@ def run_05_trajectory(cfg: dict) -> dict:
         # 判据（spatial 侧同问题记在 `p_value_resolution`，口径对齐）。
         "ks_by_group_note": {
             "p_adj_available": p_adj_available,
-            "correction": "fdr_bh" if p_adj_available else None,
+            "correction": ks_correction,
+            "reason": ks_reason,
             "n_pairs": len(ks_rows),
-            "note": ("两两 KS 检验的家庭是全部条件对；"
-                     "`p_adj_bh` 是 BH 校正后的值，判显著性看它"
-                     if p_adj_available else
-                     "**本轮未做 BH 校正**（statsmodels 不可用），"
-                     "`p_value` 是未校正值，不能直接当判据"),
+            "note": {
+                "ok": ("两两 KS 检验的家庭是全部条件对；"
+                       "`p_adj_bh` 是 BH 校正后的值，判显著性看它"),
+                "not_configured": ("未配置 `design.group_key`（或该列不在 obs 里），"
+                                   "本轮**没有做**多条件拟时序分布比较 —— "
+                                   "这是「没做」，不是「做了没问题」"),
+                "single_group": ("`design.group_key` 配了，但该列在本数据集里"
+                                 "只有 1 个取值，没有可比较的两组 —— "
+                                 "这是「数据里没有分组」，不是「配置漏了」"),
+                "no_pairs": ("分组列存在，但没有任何一对条件同时满足最小细胞数"
+                             "（各 >=5），本轮**没有做** KS 比较 —— "
+                             "这是「样本不够」，不是「分布没有差异」"),
+                "import_failed": ("`statsmodels.stats.multitest` 导入失败，"
+                                  "`p_value` 是**未校正**值，不能直接当判据"),
+            }[ks_reason],
         },
         "scvelo": {
             "status": "not_done",
