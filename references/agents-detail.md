@@ -93,6 +93,82 @@ E-61 的直接触发动作是**手工清理死 import**：死名字扫描器正�
 
 ---
 
+## 原规则 16. 每轮运行必须留下可追溯的运行清单（模块零）
+
+参考规范：三大部分整合文档的「模块零」（§0.2–§0.4）。
+
+**没有运行清单的分析结果不是结果。** 半年后拿到一份
+`cell_communication.csv`，如果不知道当时装的是哪个版本的 liana、
+输入的 h5ad 是哪个哈希、随机种子是多少，那份 CSV 就**无法被复现，
+也无法被质疑** —— 而不可质疑的结论没有价值。
+
+`common.py` 提供清单层，产物是 `results/<dataset_id>/run_manifest.json`：
+
+| 函数 | 记录什么 | 规范条款 |
+|---|---|---|
+| `init_manifest` | 开新一轮（**清掉上一轮**） | — |
+| `capture_versions` | 全量已装 Python 包 + `KEY_PACKAGES` + `R_KEY_PACKAGES` 逐个 | §0.3 |
+| `probe_r_packages` | 起一次 `Rscript` 问 R 这些包装了没有 | §0.3 |
+| `record_input` | 输入文件的 sha256 | §0.4 |
+| `record_params` | 全部参数**含 seed** | §0.3 |
+| `record_decision` | Agent 决策链（问题/结论/证据） | §0.4 |
+| `record_human_review` | 人工复核节点及状态 | §0.4 |
+| `record_cross_language` | 跨语言转换前后维度与**丢失字段** | §0.2 |
+| `manifest_summary` | 供验收用的摘要 | — |
+
+**几条不能省的约定：**
+
+1. **未装的工具要记成 `null`，不能省略键。** `key_versions` 里
+   `"liana": null` 和"没有 liana 这个键"是两件事：前者是"查过了，没装"，
+   后者是"没查"。省略会让读者分不清。
+   **但"查过了"的前提是问对了地方** —— R 包走 `R_KEY_PACKAGES` +
+   `probe_r_packages()`，见第 6 条。
+2. **人工复核未确认不算失败。** `human_review` 默认就是 `pending`，
+   判成 FAIL 会让每个 job 都红，反而没人看。但必须**可见**。
+3. **`init_manifest` 必须清掉上一轮。** 和规则 14 同一个道理：
+   上一轮的清单留在那里冒充本轮，比没有清单更糟。
+4. **清单在步骤跑完之后才登记输入。** 可选步骤这轮有没有产物，
+   跑完才知道；在开头登记会把"上轮残留"记成本轮输入。
+5. **`pip freeze` 不用 subprocess 抓。** 沙箱下管道捕获会 EPERM，
+   用 `importlib.metadata` 枚举。**这条只对 Python 包成立** —— 见第 6 条。
+6. **R 包必须问 R，`importlib` 永远问不出来。** `importlib.metadata` 与
+   `importlib.util.find_spec` 查的都是 Python 的发行版数据库 / 模块查找器，
+   对 R 包**原理上**永远返回"没有"。那个 `None` 会被读成"查过了，装不上"，
+   而它真正的含义是"**问错了地方**"。
+
+   实测的后果：K-01b 起 CI 装了 R、`scTenifoldKnk` 真跑了 6 分钟，而
+   `run_manifest.json`（**复现依据**）仍记 `scTenifoldKnk: null` ——
+   于是它与 `virtual_perturbation_status.json` 的
+   `tools.scTenifoldKnk.available = true` 对**同一个工具**给出相反结论。
+
+   所以拆成两条通道，且**失败原因分开写**：
+
+   | 通道 | 实现 | 清单字段 |
+   |---|---|---|
+   | Python 包 | `importlib.metadata` 枚举（不起子进程） | `key_versions` |
+   | R 包 | `probe_r_packages()`：一次 `Rscript -e requireNamespace` | `key_versions` + `r` |
+
+   `r` 那段（`{rscript, r_version, packages, reason}`）是必要的：
+   `key_versions` 是**平铺**的 name→version，读不出"哪些是 R 包、
+   R 是什么版本、R 到底有没有装"。
+
+   三种失败各有独立 `reason`，**不能混成一句**：包名非法（拒绝把任意
+   字符串拼进 `Rscript -e`）/ `Rscript` 不在 PATH（本机没 CI 没装 R）/
+   退出码非 0。"没装 R"与"R 装了但包没装"必须区分开，
+   否则排查方向会被带偏。
+
+   `08_virtual_perturbation.py` 的 `_probe_r_package()` **转调**
+   `probe_r_packages()`，不再自己拼一遍 —— 同一件事只留一份代码
+   （抄两份时验证的往往只是副本，见 E-41 与规则 15 的教训）。
+
+`run_manifest.json` 落在 `results/` 下，随 artifact 一起上传 ——
+**它必须和结果同时可及**，否则追溯链是断的。
+
+> 本段原为 `AGENTS.md` 规则 16 的正文（2026-09-26 E-69 收口时移入本归档）。
+
+
+---
+
 ## 原规则 17. 虚拟敲除 / 过表达是保留框架，重点是"没做什么"（§1.7 / §1.8）
 
 参考规范：三大部分整合文档 §1.7 / §1.8。规范把这两节标为**保留框架**、
@@ -930,3 +1006,138 @@ E-63 的自检第一版有 9 个用例，**用例 8 自己另写了一遍路径�
 **两仓 `tools/check_figures.mjs` 与 `tools/check_legend_convention.mjs`
 各自必须逐字节相同**（`check_figures.mjs` 只在本仓与 spatial 仓之间，
 `check_legend_convention.mjs` 三仓同一份）。改一侧必须同步并比对 SHA256。
+
+---
+
+## 原规则 30. 「写出来了」不等于「有人读」：三种形态与三个守卫（E-69，2026-09-26）
+
+> 这是 `AGENTS.md` 规则 30 的**未删节原文**。`AGENTS.md` 只保留一份精简版（因为 harness 在 65536 字节处截断注入的指令文件）。
+
+**规则句：** 一个字段 / 一条判据的价值不在于它被算出来，而在于**有人消费它**；而"算不出来"和"算出来很小"必须在产物里**长得不一样**。
+
+E-68 是同族第一次自查（规则 29 那批门禁的连带产物），E-69 是拿它的判据**回头扫全仓**抓到的第二次 —— **第三次跨仓抓到东西**（spatial 侧 15 个只写不读的字段、一个恒真的人工复核判据、以及验收层看不见的产生端；scrna 侧同形一处）。
+
+---
+
+### 30.1 Form A：`nan` 参与比较会静默变成 `False`
+
+`nan > x` / `nan < x` / `nan == x` 全是 `False`，而且**不报错、不打日志、不抛异常**。后果是"**算不出来**"和"**算出来很小**"在产物里长得一模一样 —— 状态字段会一本正经地报告一个**由 nan 推出的结论**。
+
+三处现场（spatial 侧，`spatial-pipeline-skill/AGENTS.md` 规则 31 的同一次收口）：
+
+| 现场 | 缺陷 | 假结论 |
+|---|---|---|
+| `spatial-pipeline-skill/scripts/05_deconvolution.py` 重建误差 | `np.nanmean` / `np.nanpercentile` / `np.nanmax` 在全 nan 时返回 nan 并继续算；`frac_unreliable` 的分母用 `len(errors)` 而不是有限值个数 | "重建误差的中位数是 nan" 被当成一个可比较的量 |
+| `spatial-pipeline-skill/scripts/07_spatial_communication.py` z 分数 | `null_sd = float(np.nanstd(perm_means)) or 1e-9` —— 全 nan 时 `nan` 是 truthy，`or` **不触发** → `z = nan` 写进 top5；`denom` 全零时 `100.0/1e-9 = 1e11` 的**假放大** | "这个配体-受体对显著富集" |
+| `spatial-pipeline-skill/scripts/08_spatial_trajectory.py` Moran's I | `improved = I_spatial > I_expr`，两侧都是 nan 时 `nan > nan` 为 `False` | 状态声称"**平滑损害了一致性**"，而两个量**一个都没算出来** |
+
+**修法：抽纯函数。** 抽出来才能被标定脚本**直接调**（139 项断言，秒级）；内联在流水线里只能靠跑整条流水线验证（25 分钟一轮），而"跑一轮要 25 分钟"会让人**不去验证**。
+
+```python
+summarize_morans_pair(i_expr, i_spatial, ndigits=4) -> {"defined","improved","gain","expression_only","spatially_smoothed","note"}
+spatial_z_score(near_mean, perm_means) -> (null_mu, null_sd, z, z_reason)
+summarize_reconstruction_error(errors, max_err) -> {"error_defined","median","n_unreliable","frac_unreliable",...}
+common.finite_round(x, n)   # 三态：nan/inf/None -> None；有限 -> 四舍五入；0.0 保留
+```
+
+`finite_round` 的两个坑：**`0.0` 是合法值、必须保留**（判空要用 `is not None` 而不是 `if not x`）；**`np.float64` 是 `float` 子类、`np.float32` 不是** —— float32 会走到 `json.dump` 的 `default` 回调。
+
+**本仓同族现场（已修，2026-09-26 收口）：** `scripts/05_trajectory.py` 的
+`off = [float(cmat.loc[a_, b_]) for i, a_ in enumerate(cv_names) for b_ in cv_names[i + 1:]]` 在 `cv_names` 只有 1 个方法时是**空列表**，于是 `mean_rho` / `min_rho` 记 `nan` —— `mean_rho < 0.3` 那条限制**静默不触发**（限制被跳过而不是被报告）、`round(mean_rho, 4)` 落盘成 `null`（**写盘前是 `nan`**）、日志与限制文案打出 `+nan`。
+
+修法与 spatial 侧同形，也抽成纯函数：
+
+```python
+method_correlation_stats(cv_names, cmat) -> (mean_rho, min_rho, state, note)
+# state ∈ {"ok", "single_method", "undefined"}
+```
+
+**为什么是三个状态而不是"有值 / nan"两个。** `single_method`（分母里只有一个方法，**没有"方法间一致性"这个量**）与 `undefined`（有两个以上方法，但离对角相关**全是非有限值** —— 各方法退化成常数列）是**两种互不相干的处境，排查方向不同**：前者要去看方向参考是不是把方法都剔掉了，后者要去看那些方法为什么退化成常数列。压成一个 `nan` 就等于把排查线索丢掉 —— 这与规则 5「'不确定'与'算不出来'要分开报」、规则 4「失败原因必须是原因码不能是布尔量」是同一条。
+
+配套改动四处，**缺一处这类缺陷就能再犯一次**：
+
+| 位置 | 改动 | 为什么 |
+|---|---|---|
+| 产出端 | `method_correlation_mean_offdiag` / `_min_offdiag` 走 `common.finite_round` 而不是裸 `round` | `round(nan, 4)` 是 `nan`；靠 `_scrub_nonfinite` 兜底只是**写盘那一刻**变成 `null`，内存里的消费者读到的仍是 `nan` |
+| 产出端 | 新增 `method_correlation_state` + `method_correlation_undefined_note`（**正常态与 `no_consensus` 两处都写**） | `null` 本身不说明**为什么**是 `null` |
+| 判据 | `if mean_rho is not None and mean_rho < 0.3:` | 加 `is not None` 守卫；**不能用真值判断**（`0.0` 是有效值，而 `0.0 < 0.3` 必须触发那条限制） |
+| 消费端 | `main_analysis.py` 的「轨迹方法间一致性已量化」判据由 `_mc_ok` 参与，detail 里带 state 与原因 | **只把状态打进 detail 是装饰** —— 判据本身必须由它参与，否则"算不出来"照样绿 |
+
+**消费端这一处值得单独说。** 旧判据是 `bool(cv) and mean_rho is not None` —— 在"一致性算不出来"时，产出端写的是裸 `NaN`，`json.load` 读回来是 `nan`，于是 `nan is not None` 为真、**这条判据照样是绿的**。也就是说：**这条判据从落地起就对它本该抓的那类处境失效**，而它在干净产物上永远是绿的（正向标定看不出来）。
+
+---
+
+### 30.2 Form B：只写不读的状态字段
+
+字段写进 JSON、而验收层**一个消费者都没有**时，**坏值与"字段不存在"长得一模一样**。全仓扫出 **15 个**这样的字段（`used_counts_layer` / `matrix_source` / `counts_layer` / `full_gene_counts_available` / `hvg_fallback` / `counts_check` / `n_spots_dropped_no_coords` / `dropped_no_coords_examples` / `coord_coverage_note` / `max_genes_cap` / `gene_selection` / `n_genes_dropped` / `n_proportion_values_truncated` / `celltype_spot_alignment` / `spatial_smoothing_improves_coherence`），补了 **12 条注册表探针**：
+
+```python
+dict(cid, base="data"|"results", f=<文件>, path=<元组>, kind, severity, opt, fn=<lambda>, good=<文本|lambda>, bad=<文本|lambda>)
+```
+
+- `fn` 返回 `None` ⇒ **不适用**（PASS）
+- `opt=False` = **无条件写**，缺失 ⇒ 判红「**产生端不再写了**」
+- `opt=True` = **条件写**，缺失 ⇒ PASS
+
+12 条：`status:input_is_counts` / `coords_dropped` / `hvg_flavor` / `full_gene_counts` / `svg_gene_subset` / `svg_gene_selection` / `svg_genes_dropped` / `proportions_truncated` / `deconv_matrix_source` / `niche_spot_alignment` / `smoothing_improves` / `morans_I_defined`。
+
+**三个守卫：**
+
+1. `chk(cid, kind, ok, detail, severity="required")` —— **第二个位置参数是 `kind` 不是 `severity`**。第一版把 severity 值塞进 kind 槽，`bad_root` / `not_applicable` / `missing_pca` 全被记成 `required`；两个同名同型的参数相邻，**传错不报错**。
+2. 父状态白名单 `_PROBE_PARENT_OK = (None, "ok")` + `_PARENT_NOT_EXECUTED` 映射 12 个非 ok 字面量；**未知状态跳过但打印原始值**（不要静默放行）。
+3. `_dig_present(obj, path) -> (found, value)` —— `_dig()` 对"**键不存在**"与"**值为 None**"返回同一个 `None`，而 `hvg_fallback=None` 的意思是**没有发生回退**（好事）。
+
+本仓同族：`manifest_summary` 的 `n_human_review` / `human_review_confirmed`。
+
+---
+
+### 30.3 Form C：恒真判据
+
+`manifest:human_review` 的 `ok` 曾**写死 `True`**、`required: False` —— "**一个都没登记**"被写成"**全部已确认**"。两仓同形。
+
+修法：`_n_hr > 0` 才可能为真；`human_review_confirmed` 只列 `status in ("confirmed","overridden","not_needed")` 的节点；默认 `pending` **不算失败但必须可见**（与规则 16 第 2 条同一条理由 —— 判成 FAIL 会让每个 job 都红，反而没人看）。
+
+**恒真判据比"没有这个判据"更糟**：它占着"已检查"的位置，让人不再去找真正该检查的东西。
+
+---
+
+### 30.4 三个实现坑（第三个坑有两个方向）
+
+1. **消费端标定看不见产生端。** 反向标定里把产生端的 `morans_I_defined` 键名改掉，消费端 12 条探针**全绿** —— 因为消费端读的是标定用的 JSON 夹具，**产生端写什么它根本不知道**。补的判据必须是**源码级**的：`spatial-pipeline-skill/scripts/08_spatial_trajectory.py:404` 必须是 `"morans_I_defined": _mi_pair_defined`。
+2. **`_code_only` 不能查字典键名。** `_code_only` 剥 COMMENT+STRING，而**键名本身就是 STRING token**，一起被剥掉 ⇒ 永远找不到。要用只剥 COMMENT 的 `_no_comment`。**同一个文件里两种剥离策略各服务一条判据**（E-68 第三处、E-69 结构组各踩一次）。
+3. **tokenize 的 token 是无空格拼接的。** 判据写成 `'"morans_I_defined": _mi_pair_defined'`（带空格）**永远匹配不上**；实测 `with space: False` / `without space: True`，上下文是 `..."morans_I_defined":_mi_pair_defined,...`。
+
+---
+
+### 30.5 收口
+
+- `common.write_json` 加 `allow_nan=False` + `_scrub_nonfinite`（递归 dict / list / tuple / numpy 类型；**dict 键必须能当 `str`**，否则 `json.dump` 的 `default` 回调崩）。此前它会写出**裸 `NaN`** —— 那是**非法 JSON 字面量**，Python 的 `json.load` 能读回去，其它语言的解析器不能。
+- `lib/alignment.py` 是唯一绕过 `common.write_json` 的写盘点，已收口。
+- `common.read_json` 改成**损坏时抛异常**（原来 `except Exception: return None` 把"文件缺失"与"文件损坏"混成一件事），另加 `read_json_or_none` 给"确实可能没有"的调用点。
+
+---
+
+### 30.6 标定与防复发（本仓这一处：正向 37 项 + 反向 6 类）
+
+**spatial 侧**（`D:\tmp\_q28\`）正向：`calib_e69_probes.py` **139 项 / 0 失败**、`calib_e69.py` 100 项、`calib_e69_consumer.py` 36 项。
+反向：`neg_e69_probes.py` **11 类注入 → 符合预期 10 类 / 不符合 0 类**、`exit=0`、末尾 `源码已还原: True`。
+
+**本仓侧**（`D:\tmp\_e69\`）正向：`calib_scrna_traj.py` **37 项 / 0 失败**（三种 state 各取到、`0.0` 不被当成"算不出来"、部分 nan 报出剔除对数、旧实现在同一输入下给出 `nan` 且 `nan < 0.3` 静默为假、旧消费端 `mean_rho is not None` 对 `nan` 判绿）。
+反向：`neg_scrna_traj.py` **6 类注入 → 符合预期 6 类 / 不符合 0 类**、`exit=0`、末尾 `源码已还原: True`（注入项：调用点退回裸 `nan` / 去掉 `is not None` 守卫 / 产出端退回裸 `round` / 去掉 `method_correlation_state` / `finite_round` 不再挡 nan / 消费端不再用状态判红）。
+
+**反向标定第一轮有 3 类注回去却全绿** —— 说明那 3 条判据当时**压根不存在**（产出端用没用 `finite_round`、状态字段还在不在、消费端有没有拿状态参与判红，一条都没查）。补上判据后才是 6/6。**这正是反向标定的全部价值：正向 37 项全绿时，你并不知道哪几条判据是空的。**
+
+防复发：
+
+1. **正向标定（干净产物）看不出 Form A/B/C 任何一形** —— 必须反向标定：逐个把原缺陷注回去，确认判据真的会红。
+2. **判红必须伴随非空 FAIL 摘要。** 子进程少 `cwd` / `PYTHONIOENCODING` 时按 cp936 读 UTF-8 源码抛 `UnicodeDecodeError`，**崩溃的非零退出会被误读成"判红"**。
+3. 断言必须 **None-safe**（`"x" in why` 在 `why is None` 时抛 `TypeError`）。
+4. 断言必须**复刻调用点的构造方式**（`np.concatenate` 传空数组不抛、传空列表抛）。
+5. 标定要覆盖**整条回退链**，不是只标定其中一环。
+6. `nan` 不能参与比较；`or` 不能兜底 nan（`nan` 是 truthy）。
+7. 凡"空值有语义"处（顶层路径、根节点、默认分支）判据要显式写，不要靠 truthiness。
+8. 新字段要**同时**加产生端和消费端，否则就是下一个 Form B。
+9. 检查器查"有没有"之外，还要查"**取到的值是不是平凡值**"（恒 0 / 恒真）。
+10. **抽纯函数**是让标定可执行的前提 —— 抽不出来就只能跑整条流水线，而"要跑 25 分钟"会让人不去验证。
+
+台账：`governance/15_ERROR_LEDGER.md` E-69。

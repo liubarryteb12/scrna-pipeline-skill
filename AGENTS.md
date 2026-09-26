@@ -230,72 +230,22 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 
 参考规范：三大部分整合文档的「模块零」（§0.2–§0.4）。
 
-**没有运行清单的分析结果不是结果。** 半年后拿到一份
-`cell_communication.csv`，如果不知道当时装的是哪个版本的 liana、
-输入的 h5ad 是哪个哈希、随机种子是多少，那份 CSV 就**无法被复现，
-也无法被质疑** —— 而不可质疑的结论没有价值。
+**没有运行清单的分析结果不是结果。** 半年后拿到一份 `cell_communication.csv`，
+如果不知道当时装的是哪个版本的 liana、输入的 h5ad 是哪个哈希、随机种子是多少，
+那份 CSV 就**无法被复现，也无法被质疑** —— 而不可质疑的结论没有价值。
 
-`common.py` 提供清单层，产物是 `results/<dataset_id>/run_manifest.json`：
+产物是 `results/<dataset_id>/run_manifest.json`，由 `common.py` 的清单层写出
+（`init_manifest` / `capture_versions` / `probe_r_packages` / `record_input` /
+`record_params` / `record_decision` / `record_human_review` /
+`record_cross_language` / `manifest_summary`）。几条不能省的约定：
+未装的工具记 `null`、不能省略键（"查过了没装"与"没查"是两件事）；
+人工复核默认 `pending`，**不算失败但必须可见**；`init_manifest` 必须清掉上一轮；
+清单在步骤跑完之后才登记输入；`pip freeze` 不用 subprocess 抓（沙箱下 EPERM）；
+**R 包必须问 R**（`probe_r_packages()`）—— `importlib` 对 R 包**原理上**永远返回
+"没有"，那个 `None` 会被读成"查过了，装不上"（E-41）。
 
-| 函数 | 记录什么 | 规范条款 |
-|---|---|---|
-| `init_manifest` | 开新一轮（**清掉上一轮**） | — |
-| `capture_versions` | 全量已装 Python 包 + `KEY_PACKAGES` + `R_KEY_PACKAGES` 逐个 | §0.3 |
-| `probe_r_packages` | 起一次 `Rscript` 问 R 这些包装了没有 | §0.3 |
-| `record_input` | 输入文件的 sha256 | §0.4 |
-| `record_params` | 全部参数**含 seed** | §0.3 |
-| `record_decision` | Agent 决策链（问题/结论/证据） | §0.4 |
-| `record_human_review` | 人工复核节点及状态 | §0.4 |
-| `record_cross_language` | 跨语言转换前后维度与**丢失字段** | §0.2 |
-| `manifest_summary` | 供验收用的摘要 | — |
-
-**几条不能省的约定：**
-
-1. **未装的工具要记成 `null`，不能省略键。** `key_versions` 里
-   `"liana": null` 和"没有 liana 这个键"是两件事：前者是"查过了，没装"，
-   后者是"没查"。省略会让读者分不清。
-   **但"查过了"的前提是问对了地方** —— R 包走 `R_KEY_PACKAGES` +
-   `probe_r_packages()`，见第 6 条。
-2. **人工复核未确认不算失败。** `human_review` 默认就是 `pending`，
-   判成 FAIL 会让每个 job 都红，反而没人看。但必须**可见**。
-3. **`init_manifest` 必须清掉上一轮。** 和规则 14 同一个道理：
-   上一轮的清单留在那里冒充本轮，比没有清单更糟。
-4. **清单在步骤跑完之后才登记输入。** 可选步骤这轮有没有产物，
-   跑完才知道；在开头登记会把"上轮残留"记成本轮输入。
-5. **`pip freeze` 不用 subprocess 抓。** 沙箱下管道捕获会 EPERM，
-   用 `importlib.metadata` 枚举。**这条只对 Python 包成立** —— 见第 6 条。
-6. **R 包必须问 R，`importlib` 永远问不出来。** `importlib.metadata` 与
-   `importlib.util.find_spec` 查的都是 Python 的发行版数据库 / 模块查找器，
-   对 R 包**原理上**永远返回"没有"。那个 `None` 会被读成"查过了，装不上"，
-   而它真正的含义是"**问错了地方**"。
-
-   实测的后果：K-01b 起 CI 装了 R、`scTenifoldKnk` 真跑了 6 分钟，而
-   `run_manifest.json`（**复现依据**）仍记 `scTenifoldKnk: null` ——
-   于是它与 `virtual_perturbation_status.json` 的
-   `tools.scTenifoldKnk.available = true` 对**同一个工具**给出相反结论。
-
-   所以拆成两条通道，且**失败原因分开写**：
-
-   | 通道 | 实现 | 清单字段 |
-   |---|---|---|
-   | Python 包 | `importlib.metadata` 枚举（不起子进程） | `key_versions` |
-   | R 包 | `probe_r_packages()`：一次 `Rscript -e requireNamespace` | `key_versions` + `r` |
-
-   `r` 那段（`{rscript, r_version, packages, reason}`）是必要的：
-   `key_versions` 是**平铺**的 name→version，读不出"哪些是 R 包、
-   R 是什么版本、R 到底有没有装"。
-
-   三种失败各有独立 `reason`，**不能混成一句**：包名非法（拒绝把任意
-   字符串拼进 `Rscript -e`）/ `Rscript` 不在 PATH（本机没 CI 没装 R）/
-   退出码非 0。"没装 R"与"R 装了但包没装"必须区分开，
-   否则排查方向会被带偏。
-
-   `08_virtual_perturbation.py` 的 `_probe_r_package()` **转调**
-   `probe_r_packages()`，不再自己拼一遍 —— 同一件事只留一份代码
-   （抄两份时验证的往往只是副本，见 E-41 与规则 15 的教训）。
-
-`run_manifest.json` 落在 `results/` 下，随 artifact 一起上传 ——
-**它必须和结果同时可及**，否则追溯链是断的。
+台账：governance/15_ERROR_LEDGER.md 模块零（§0.2–§0.4）/ E-41
+完整原文（含九个函数的字段表与三种失败原因）：references/agents-detail.md#原规则-16
 
 ## 17. 虚拟敲除 / 过表达是保留框架，重点是"没做什么"（§1.7 / §1.8）
 
@@ -321,7 +271,6 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 
 台账：governance/15_ERROR_LEDGER.md §1.7 / §1.8（含 E-41 探针教训）
 完整原文（含全部实测证据与表格）：references/agents-detail.md#原规则-17
-
 
 ## 18. 笼统的 `except Exception` 会把代码 bug 记成环境问题
 
@@ -458,7 +407,6 @@ runner 的出网策略、换镜像、加超时 —— 而真正要改的只有�
 > R 侧 `save_pdf` 的调用写法）。阶段号表写在文件头的 `PART_BY_REPO`，
 > 仓库目录名认不出时它直接报错退出，不会静默放行。
 
-
 ## 23. 出图三条补充约定（评审 3.1/3.6/3.8 实测）
 
 **23.1 退化分布必须显式处理。** 恒定值指标（如 pbmc3k 的 `pct_counts_hb`，
@@ -482,7 +430,6 @@ PAL_CYCLE**（与 `axes.prop_cycle` 同源），需要就加显式图例。
 
 > 散点标注防撞（`tf_specificity_scatter`）用"按 y 排序 + 上下交替偏移"
 > 的纯绘图参数法；`adjustText` 不在依赖里，不要临时引入。
-
 
 ## 24. 图例一律图框外右侧、纵向排列（用户约定 v2，2026-09-23）
 
@@ -511,40 +458,36 @@ PAL_CYCLE**（与 `axes.prop_cycle` 同源），需要就加显式图例。
 > "文件存在 / 有墨迹 / 图名合规 / 配色合规 / 图幅合规"眼里**全都是合格的** ——
 > 这正是工作区治理层错误台账（`governance/15_ERROR_LEDGER.md`，**不在本仓库内**）E-06「门禁本身有盲区」的又一例。
 
-
 ## 25. 四条"图没了 / 图被裁了却全绿"的补强（Q-26，2026-09-25）
 
 **规则：** E-48 与 E-49 两条**互相独立**的缺陷暴露了验收层与门禁层**四个各自独立的盲区**，四条补强各堵一个，缺一条那类缺陷就能再犯一次。
 
-**25.1 嵌套 `status` 的 `failed` 必须判红（验收层）。** `status` 不只在顶层 —— `qc_status.json` / `integration_status.json` / `cluster_status.json` / `grn_status.json` 里都有**嵌套** `status`，而旧验收层只看顶层 `d.get("status")`。实测真 artifact `scrna-results-55`：顶层分布 `{ok: 7, not_configured: 1}`，**嵌套分布 `{ok: 5, failed: 1, not_applied: 1, not_done: 2}`** —— 唯一那条 `failed` 是 `grn_status.json → regulon_vs_pseudotime.status = failed`（`ValueError: Invalid unit 6.800000000000001 in 'figsize'`），而它的顶层 `status` 是 `ok`：**顶层全绿、里面已经崩了**。判据**只把 `failed` / `error` / `fail` 判红**（`not_applied` / `not_done` 可见不阻断，`ok` 放行）—— 误判代价是双向的：把 `not_applied`（单样本不做整合）判红会让每个 job 都红，把 `failed` 放行则正是 E-48。实现 `_iter_nested_status(obj, path=())` 递归产出 `(路径, 值, 同级 reason)`，扫**全部** `*status.json`（不只可选步骤那 5 个）。
+**25.1 嵌套 `status` 的 `failed` 必须判红（验收层）。** `status` 不只在顶层 —— `qc_status.json` / `integration_status.json` / `cluster_status.json` / `grn_status.json` 里都有**嵌套** `status`，而旧验收层只看顶层 `d.get("status")`。实测真 artifact `scrna-results-55`：顶层 `{ok: 7, not_configured: 1}`，**嵌套 `{ok: 5, failed: 1, not_applied: 1, not_done: 2}`** —— 唯一那条 `failed` 是 `grn_status.json → regulon_vs_pseudotime.status`，而它顶层是 `ok`：**顶层全绿、里面已经崩了**。判据**只把 `failed` / `error` / `fail` 判红**（`not_applied` / `not_done` 可见不阻断）。实现 `_iter_nested_status(obj, path=())`，扫**全部** `*status.json`（不只可选步骤那 5 个）。
 
-**25.2 图验收必须条件化且覆盖全部出图脚本（验收层）。** `REQUIRED_FIGURES` 原来只有 **14 条**，**不含 `02-07-*`（三张 GRN 图）与 `02-08-01`** —— E-48 让 5 张图从未产出而验收层不知道它们该存在。补齐后还有第二个问题：`trajectory.enabled: false` 时 `02-05-*` 一张都不该有，无条件要求就必红。改成由图名第 2 段（`02-07-01` 的 `07`）反查所属步骤、从 `read_state(cfg)` 取 status 与 required：可选且未跑成 → `required: False`（detail 写明 `步骤 grn = not_configured，本轮不要求产出`），否则 → `required: True`（缺失 detail 带 `**缺失**（步骤 grn = ok）`）。**兜底是 25.1 那条独立扫描。**
+**25.2 图验收必须条件化且覆盖全部出图脚本（验收层）。** `REQUIRED_FIGURES` 原来只有 **14 条**，**不含 `02-07-*`（三张 GRN 图）与 `02-08-01`** —— E-48 让 5 张图从未产出而验收层不知道它们该存在。补齐后还有第二个问题：`trajectory.enabled: false` 时 `02-05-*` 一张都不该有。改成由图名第 2 段反查所属步骤、从 `read_state(cfg)` 取 status 与 required：可选且未跑成 → `required: False`，否则 → `required: True`。**兜底是 25.1 那条独立扫描。**
 
-**25.3 溢出检测必须落盘，不能只打 WARN（产物级）。** E-49 的形态：`_content_overflow()` **正确检测到** `width_overflow_frac=0.3523`、**正确打了 WARN**，然后**没有任何人读** —— 标题超宽 **35%**，`savefig.bbox: standard` 下被静默裁掉，图照样生成、门禁照样绿。**"检测到了"不等于"有人会知道"。** 现在 `_record_figure_overflow(cfg, name, bad)` 把溢出落盘到 `results/<dataset_id>/figure_overflow.json`（`{figures: {名: bad}, n_overflow}`），验收层读它并**判红（required）**，detail 写明"**会被静默裁掉**"。三条约束：①跑前必须删旧文件（`_ovf_stale.unlink()`）②**只累积、不覆盖**③记录可被修复（标题改短后不再新增，已双向验证）。
+**25.3 溢出检测必须落盘，不能只打 WARN（产物级）。** E-49 的形态：`_content_overflow()` **正确检测到** `width_overflow_frac=0.3523`、**正确打了 WARN**，然后**没有任何人读** —— 标题超宽 **35%**，`savefig.bbox: standard` 下被静默裁掉，图照样生成、门禁照样绿。**"检测到了"不等于"有人会知道"。** 现在 `_record_figure_overflow(cfg, name, bad)` 落盘到 `results/<dataset_id>/figure_overflow.json`，验收层读它并**判红**，detail 写明"**会被静默裁掉**"。三条约束：①跑前必须删旧文件 ②**只累积、不覆盖** ③记录可被修复。
 
-**25.4 门禁要查"内容贴边"，不能只查"有没有墨"（门禁层）。** `check_figures.mjs` 原来只查"有没有墨 / 是不是糊死"——**被裁掉的图照样有墨**，这正是它漏掉 E-49 的原因。裁切的物理后果是**墨迹延伸到画布边缘**，量非背景像素外接框到左右边的距离，阈值 `EDGE_MIN_PX = 3`。实测标定（scrna 34 张 + spatial 76 张）：scrna 边距分布 `{0:1, 10:9, 11:2, 12:6, 13:13, 14:2, 41:1}` —— `L<3 或 R<3`、`L==0 或 R==0`、`L<6 或 R<6` **都只命中 `02-08-01` 一张**（E-49 那张），零误伤；spatial 76 张全部通过。两条刻意取舍：**只判左右不判上下**（`02-05-05-unit1-pseudotime-by-cluster` 上边距 = 0 是布局取舍不是裁切）、**暗底图跳过**（整幅都是墨，判了全是假阳性）。
+**25.4 门禁要查"内容贴边"，不能只查"有没有墨"（门禁层）。** `check_figures.mjs` 原来只查"有没有墨 / 是不是糊死"——**被裁掉的图照样有墨**，这正是它漏掉 E-49 的原因。裁切的物理后果是**墨迹延伸到画布边缘**，量非背景像素外接框到左右边的距离，阈值 `EDGE_MIN_PX = 3`（标定：scrna 34 张 + spatial 76 张，三种候选阈值**都只命中 E-49 那一张**，零误伤）。两条刻意取舍：**只判左右不判上下**、**暗底图跳过**（整幅都是墨，判了全是假阳性）。
 
-**25.5 上线首跑就抓到一条新缺陷。** 补强推送后第一次 CI（run `36140048953`，commit `e2d7a2c`）**验收判红**：`[FAIL] 图 02-07-01-unit5-tf-smarca4-trend 内容超出画布  **会被静默裁掉**：{'width_overflow_frac': 0.0371}`。`scripts/07_grn.py` 单 TF 面板标题是**单行**而面板宽只有 `W_SINGLE = 89 mm`。本地用 `apply_style` + `_content_overflow` 逐名标定得 `FOSL2 +0.0093 / ATF4 −0.0019 / E2F2 −0.0021 / SMARCA4 +0.0371`（**与 CI 逐位吻合**），假想长名 `SMARCAD1 +0.0485` —— **在阈值附近徘徊、随 TF 名长度而变**。这批面板此前**从未渲染过**（Q-24 的三元素 `figsize` 让整段在 `plt.subplots` 就抛异常），缺陷与图同时诞生 —— **旧缺陷一直在掩盖新缺陷**。修法是**折行**（第二行宽度**与 TF 名无关**，8 个名字含 3 个假想长名标定**一律 −0.0238**，固定 2.4% 余量；对照：去掉尾巴只剩 −0.0143 余量太薄、去掉 `along` 在 `SMARCAD1` 上仍 `+0.0228` 判红）。
+**25.5 上线首跑就抓到一条新缺陷。** 补强推送后第一次 CI（run `36140048953`，commit `e2d7a2c`）**验收判红**：`02-07-01-unit5-tf-smarca4-trend` `width_overflow_frac = 0.0371` —— `scripts/07_grn.py` 单 TF 面板标题是**单行**而面板宽只有 `W_SINGLE = 89 mm`（本地标定 `SMARCA4 +0.0371` **与 CI 逐位吻合**）。这批面板此前**从未渲染过**（Q-24 的三元素 `figsize` 让整段在 `plt.subplots` 就抛异常）—— **旧缺陷一直在掩盖新缺陷**。修法是**折行**（第二行宽度**与 TF 名无关**，固定 2.4% 余量）。
 
 > **宽度受限的小面板，标题折行，不要删字；修好一个缺陷后要重跑一遍全部检查。**
 
 台账：governance/15_ERROR_LEDGER.md Q-26（含 E-48 / E-49 / E-51，均属 `savefig.bbox: standard` 下静默裁切同族）
 完整原文（含全部实测证据与表格）：references/agents-detail.md#原规则-25
 
-
 ## 26. native 崩溃绕过 `except`：`sc.pp.scrublet` 偶发 SIGSEGV（E-52，2026-09-25）
 
 **规则：** native 崩溃不能靠 `except` 兜底 —— 凡有 C 扩展参与的关键步骤，先问"它要是崩了，我连日志都没有吗"。**给 native 崩溃留取证路径，比急着改代码值钱。**
 
-**失败形态（E-52）：** CI「跑流水线」偶发 **exit 139**，日志停在 `01_qc.py:226` 的 `过滤:` 之后一行 `Segmentation fault (core dumped)`，**没有任何 Python traceback** —— `01_qc.py:85` 的 `except Exception` 接不住 native SIGSEGV，`qc_status.json` 里连失败原因都没有。`scripts/lib/common.py:62` 的 `print(..., flush=True)` 逐行 flush，所以"日志最后一行"就是"代码走到哪一行"：L229 `db = run_scrublet(adata, cfg)` → L79 `sc.pp.scrublet(...)`。**它是长期存在的，不是哪一轮引入的**：全量 60 个 run 里 8 个 `run_attempt>1`，**全部**是"att1 失败 + rerun 成功"，最早 `06977d0`（2026-09-20T11:34:50Z），**这 8 个的 att1 崩溃位置逐字相同**，跨 5 天、跨 7 个 commit —— **"rerun 能过"把它掩盖了整整 5 天。**
+**失败形态：** CI 偶发 **exit 139**，日志停在 `01_qc.py:226` 之后一行 `Segmentation fault (core dumped)`，**没有任何 Python traceback** —— `except Exception` 接不住 native SIGSEGV，`qc_status.json` 里连失败原因都没有。**全量 60 个 run 里 8 个 `run_attempt>1`，全部是"att1 失败 + rerun 成功"**，崩溃位置逐字相同，跨 5 天、跨 7 个 commit —— **"rerun 能过"把它掩盖了整整 5 天。**
 
-**根因（靠 `PYTHONFAULTHANDLER: 1` 的真栈定下来，run `36150495910`；此前只能靠猜）：** OpenBLAS 0.3.34 的 `dgemm_kernel_HASWELL` 栈越界。栈逐字自下而上：`scipy/sparse/linalg/_interface.py:1118 in _matmat` → `scipy/sparse/linalg/_eigen/_svds.py:511 in svds` → `sklearn/decomposition/_pca.py:440 in fit` → `scanpy/preprocessing/_scrublet/pipeline.py:84 in pca` → `scripts/01_qc.py:79 in run_scrublet`，**一帧 numba 都没有**：`pipeline.py` L79 先把稀疏矩阵 `.toarray()`，L84 交给 `PCA(svd_solver="arpack")`，`self.A` 已是**稠密 ndarray**，于是落到 `dgemm_kernel_HASWELL`。上游 **OpenBLAS #6026**（2026-09-11 报、09-13 关）机制与本仓逐项吻合（环境原文即 `OpenBLAS 0.3.34, as bundled in the scipy-openblas64 wheel shipped with numpy 2.5.2 and 2.5.3` + `OPENBLAS_CORETYPE=Haswell` + GitHub 托管 `ubuntu-latest`）：Haswell 内核把 k 维打包进固定 **`0x7080`** 字节**栈缓冲区**，每步写 **96 字节**且**对 k 无上界**，**k ≳ 319** 时越界覆盖 callee-saved 寄存器与返回地址槽。**偶发是因为 level-3 blocking 在运行期按宿主 cache 拓扑选取** —— Azure fleet 混着不同型号 CPU，同一 commit、同一批包版本、相隔 8 分钟的两个 run 一成一败；上游实测受影响机器约三次崩一次。**附带风险：越界若只覆盖保存寄存器、没碰到返回地址，进程会正常返回而数值被污染 —— "没崩"不等于"算对了"。**
+**根因（`PYTHONFAULTHANDLER: 1` 的真栈定下来，run `36150495910`；此前只能靠猜）：** OpenBLAS 0.3.34 的 `dgemm_kernel_HASWELL` 栈越界。栈：`scipy/.../_interface.py:1118 in _matmat` → `_svds.py:511 in svds` → `sklearn/.../_pca.py:440 in fit` → `scanpy/.../_scrublet/pipeline.py:84 in pca` → `01_qc.py:79 in run_scrublet`，**一帧 numba 都没有**。上游 **OpenBLAS #6026**：Haswell 内核把 k 维打包进固定 **`0x7080`** 字节栈缓冲区、每步写 **96 字节**且**对 k 无上界**，**k ≳ 319** 时越界；**偶发是因为 level-3 blocking 按宿主 cache 拓扑选取**。**附带风险：越界若没碰到返回地址，进程正常返回而数值被污染 —— "没崩"不等于"算对了"。**
 
-各 numpy wheel 自带的 OpenBLAS（读 `numpy.libs/libscipy_openblas64_*.so` 的版本串）：2.4.6 → 0.3.31.188.0 正常；2.5.0 / 2.5.1 → 0.3.33.112.0 **最后一个正常版**；2.5.2 → 0.3.34.0.0 回归；**2.5.3（本仓此前浮动到的）→ 0.3.34.106.0 回归**。
+**处置：** 钉 `numpy>=2.1,<2.5.2`（**上游修复 0.3.35 尚未进入任何 numpy wheel**，只能钉、不能等）。复验 run `36153515064`：attempt 1 一次过，artifact `versions.numpy = 2.5.1` —— 两处对上。
 
-**处置：** `requirements.txt` 钉 `numpy>=2.1,<2.5.2`（下界 2.1 是 `anndata 0.13` 硬要求；**上游修复 0.3.35 尚未进入任何 numpy wheel**，所以只能钉、不能等）。复验 run `36153515064` / commit `f19eff9`：**attempt 1 一次过**（本条 60 个 run 里第一次），segfault 命中 **0**，CI 实装 `numpy-2.5.1-…whl` 且 artifact `run_manifest.json` 的 `versions.numpy = 2.5.1` —— **两处对上**；artifact `scrna-results-61`：`acceptance.json` **75 项全过 / 0 失败**、`figure_overflow.json` 不存在、`figures/` 39 PNG + 39 PDF。`PYTHONFAULTHANDLER: 1` 继续留着（没有它根因定不下来，而 numpy 上界只覆盖 OpenBLAS 一个来源）。`NUMBA_THREADING_LAYER: workqueue` 保留但**立项理由已被推翻**（栈证明 numba 不在路径上，带上它照崩，run `36150495910`），只剩防御性理由：numba `omp` 层会加载 libgomp，而 scikit-learn 自己 bundle 了一份（`sklearn.utils._openmp_helpers`，在崩溃轮的 218 个 extension modules 里），**同进程两份 OpenMP 运行时**是上游有记录的崩溃形态。
-
-> **"rerun 能过"不等于"没有问题"（重试成功是掩盖不是修复，应把重试率当成可观测指标）；"本地复现不了"不等于"没问题"（k 按宿主 cache 拓扑选，这是设计如此）。依赖"没钉上界"就是把自己的稳定性交给上游的发布节奏 —— 不只是"API 会变"，也包括"二进制会坏"。**
+> **"rerun 能过"不等于"没有问题"（重试率是可观测指标）；"本地复现不了"不等于"没问题"（k 按宿主 cache 拓扑选，设计如此）。不钉上界 = 把稳定性交给上游的发布节奏。**
 
 台账：governance/15_ERROR_LEDGER.md E-52（任务行 governance/02_TASKLIST.md V-02）
 完整原文（含全部实测证据与表格）：references/agents-detail.md#原规则-26
@@ -583,7 +526,6 @@ PAL_CYCLE**（与 `axes.prop_cycle` 同源），需要就加显式图例。
 台账：governance/15_ERROR_LEDGER.md E-58（任务行 governance/02_TASKLIST.md R-03；标定脚本 `D:\tmp\_s2\calib_s2_s10.py`：每条配"回退版必须抓不到"对照，34 项全过）
 完整原文（含全部实测证据与表格）：references/agents-detail.md#原规则-28
 
-
 ## 29. 门禁要带内建自检，自检必须被反向标定，且必须接进 CI 与 pre-push（E-62 / E-63，2026-09-26）
 
 姊妹项目 `spatial-pipeline-skill/AGENTS.md` 规则 30 是同一批经验的另一半。
@@ -595,101 +537,34 @@ PAL_CYCLE**（与 `axes.prop_cycle` 同源），需要就加显式图例。
 | E-62 | `tools/check_legend_convention.mjs` | Python 侧没抹注释 → 注释里一个 `fig.legend(` 让括号配平**一路吞到文件尾**，其后所有真调用一个都没查，门禁照样打绿 |
 | E-63 | `tools/check_figures.mjs` | WARN 落盘分支从落地起**一次都没执行过**，里面有两个必崩的错（`INK_FAIL_MIN` 未定义、报告路径用了循环变量 `dir`）|
 
-两条的共同点：**假阴性**。门禁的失败方式不是"报错"，而是"什么都不报" ——
-而"什么都没发现"与"检查通过了"在输出上完全一样。**假阴性比假阳性危险得多**：
-假阳性会被人骂着修掉，假阴性会被当成绿。
+两条的共同点：**假阴性** —— 门禁的失败方式不是"报错"，而是"什么都不报"，而"什么都没发现"与"检查通过了"在输出上完全一样。**假阴性比假阳性危险得多**：假阳性会被人骂着修掉，假阴性会被当成绿。
 
-### 29.1 自检要调真代码，不能自己重写一遍逻辑
+**29.1 自检要调真代码，不能自己重写一遍逻辑。** E-63 的自检第一版有 9 个用例，**用例 8 自己另写了一遍路径拼接**；反向标定把缺陷注回去（`outPath` 改回 `join(dir, ...)`）→ **自检仍然通过（exit=0）**。**抽函数**才解决：`checkDirs()` / `buildWarnReport()` / `writeWarnReport()` 三个纯函数，`main()` 与自检**都调它们**；抽完再注一次缺陷 → `ReferenceError: dir is not defined`、exit=1。**自检里重实现一遍被测逻辑，等于没测。**
 
-E-63 的自检第一版有 9 个用例，**用例 8 自己另写了一遍路径拼接**
-（`join(dirname(join(dir, "figures")), "warn_report.json")`），没调真代码。
-反向标定把缺陷注回去（`outPath` 改回 `join(dir, ...)`）→ **自检仍然通过（exit=0）**。
+**29.2 反向标定：逐个把原缺陷注回去，确认自检真的会红。** **正向通过证明不了任何事** —— 一个永远返回 True 的用例在干净产物上也是绿的。三处注入中 `outPath` 那条第一版**不红**（假自检），抽函数后才红；**尾斜杠那条是修完才发现的第三个缺陷**（`dirname("a/b/figures/")` 把最后一段当文件名，报告落进 `figures/` 里与图混在一起）。
 
-**抽函数**才解决：`checkDirs()` / `buildWarnReport()` / `writeWarnReport()`
-三个纯函数（不 print 不 exit），`main()` 与自检**都调它们**。抽完再注一次缺陷 →
-`ReferenceError: dir is not defined`、exit=1。
+**29.3 自检必须接进 CI 与 pre-push —— 没人跑的自检是同一类缺陷。** 现在三处都接：两个 `*_analysis.yml` 的「静态检查（不装依赖）」那一步、以及 `governance/hooks/pre-push.mjs` 的 `SELFTESTS` 表（日志标签 `（自检）` —— **必须区分"带镜像目录"与"带 `--selftest`"**）。
 
-> 同 E-62 的「检查器要检查的东西，与检查器描述自己要检查什么，在纯文本上
-> 无法区分」是同一个坑的两种形态：**自检里重实现一遍被测逻辑，等于没测。**
+**29.4 判据的"通过数"必须能看见 0（E-64）。** `check_doc_refs.mjs` 补判据 C（跨仓引用）时，主体写在 `if (!isA && !isB) continue` **之后** —— 跨仓 token 正是"两条判据都不进"的那一类，于是**判据 C 的分支永远走不到**；报告那行又是 `if (nCheckedC)` 守卫的，计数恒 0 时**连打印都不打印**。**①新判据要放在早退分支之前**（死代码不报错、只是永远不执行）；**②计数行不能加 `if (n)` 守卫** —— **0 也是信息**。
 
-`check_figures.mjs` 的 `--selftest` 自带零依赖 PNG 编码器（`crc32` +
-`encodePng` + `deflateSync`）合成用例，9 个用例里 3 条是 E-63 回归，
-输出 `自检通过（9 个用例，含 3 条 E-63 回归）`。
+**29.5 门禁的"检查范围"要和"它守护的动作"对齐（E-65）。** `governance/hooks/pre-push.mjs` 的 `changesOf(repo)` 原来只读 `git status --porcelain`（**只含未提交改动**），而 pre-push 唯一被调用的时刻就是"已经提交、还没推送" —— 那时 porcelain 为空，三仓全走 `无改动，跳过`，**[4/6] 静态门禁段一条都没跑**，而打印的是 `PRE-PUSH 通过（0 条提醒）。可以 push。` **这不是边角，是主路径。** 修法是取并集：再加 `git log --name-only --pretty=format: @{upstream}..HEAD`。
 
-### 29.2 反向标定：逐个把原缺陷注回去，确认自检真的会红
+> **一个门禁段被整段跳过时，不能打印"通过"** —— `无改动，跳过` 用的是 `ok()`（绿勾），它和"查过了没问题"在输出上一样。**正确的提交顺序是：改完 → 跑 pre-push → 提交 → push。**
+> **接了线但从不失败的检查，与没接线是一样的。** 每加一条自检，都要问"我怎样让它红一次"。
 
-**正向通过证明不了任何事** —— 一个永远返回 True 的用例在干净产物上也是绿的。
+**两仓 `tools/check_figures.mjs` 与 `tools/check_legend_convention.mjs` 各自必须逐字节相同**（前者只在本仓与 spatial 仓之间，后者三仓同一份）。改一侧必须同步并比对 SHA256。
 
-| 注入 | 期望 | 实测 |
-|---|---|---|
-| `inkFailBlank: MIN_INK` → `INK_FAIL_MIN` | 回归 1/2 红 | ✅ `ReferenceError` |
-| `outPath` 改回 `join(dir, ...)` | 回归 2 红 | ✅ 第一版**不红**（假自检）→ 抽函数后红 |
-| 尾斜杠处理删掉 | 回归 3 红 | ✅ |
+## 30. 「写出来了」不等于「有人读」：三种形态与三个守卫（E-69，2026-09-26）
 
-**尾斜杠那条是修完才发现的第三个缺陷**：`dirname("a/b/figures/")` 给出
-`a/b/figures`（尾斜杠把最后一段当成文件名），报告落进 `figures/` 里与图混在一起。
-修法 `String(dirs[0]).replace(/[\\/]+$/, "")` 后再 `dirname`。
+**规则：** 一个字段 / 一条判据的价值不在于它被算出来，而在于**有人消费它**；而"算不出来"和"算出来很小"必须在产物里**长得不一样**。姊妹项目 `spatial-pipeline-skill/AGENTS.md` 规则 31 是同一次收口的另一半。
 
-### 29.3 自检必须接进 CI 与 pre-push —— 没人跑的自检是同一类缺陷
+- **Form A：`nan` 参与比较会静默变成 `False`。** `nan > x` / `nan < x` 都是 `False` 且不报错 —— "**算不出来**"被当成"**算出来很小**"。本仓现场（已修）：`05_trajectory.py` 的 `off` 在 `cv_names` 只有 1 个方法时为空 → `mean_rho` / `min_rho` 记 `nan` → `mean_rho < 0.3` 那条限制**静默不触发**、日志打出 `+nan`、JSON 里写 `NaN`（非法字面量）。修法是**抽纯函数** `method_correlation_stats(cv_names, cmat) -> (mean_rho, min_rho, state, note)`，`state ∈ {ok, single_method, undefined}` —— **"只有一个方法"和"相关全是 nan"是两种处境、排查方向不同，不能压成一个 `nan`**；再配 `common.finite_round(x, n)`（nan / inf / None → `None`，**`0.0` 要保留、判空用 `is not None`**，不能用真值判断）。**抽出来才能被标定脚本直接调**（内联只能靠跑整条流水线，25 分钟一轮）。产出端落 `method_correlation_state` + 原因文案，验收层 `main_analysis.py` 拿它参与判红 —— **只把状态打进 detail 是装饰，判据本身必须由它参与**。
+- **Form B：只写不读的状态字段。** 字段写进 JSON 而验收层没有消费者时，**坏值与"字段不存在"长得一模一样**。spatial 侧扫出 15 个、补了 12 条探针（`opt=False` = 无条件写、缺失判红「**产生端不再写了**」；`opt=True` = 条件写、缺失 PASS；`fn` 返回 `None` ⇒ 不适用）。本仓同族：`manifest_summary` 的 `n_human_review` / `human_review_confirmed`。
+- **Form C：恒真判据。** `manifest:human_review` 的 `ok` 曾**写死 `True`** —— "**一个都没登记**"被写成"**全部已确认**"。修法：`_n_hr > 0` 才可能为真；默认 `pending` **不算失败但必须可见**。
 
-写了 `--selftest` 却只在本地手敲，等于又造了一个"从未执行过的分支"。
-现在三处都接：
+**三个实现坑：** ①**消费端标定看不见产生端** —— 补的判据必须是**源码级**的；②`_code_only`（剥 COMMENT+STRING）**不能查字典键名**（键名本身就是 STRING token），要用只剥 COMMENT 的 `_no_comment`；③`tokenize` 的 token **不自带分隔符** —— `"".join(t.string)` 得到的既是 `"key":value`（所以查相邻 token 要按**无空格**形式写），也会把 `is not None` 拼成 `isnotNone`（所以查多 token 表达式**必然匹配不上**）。要查后者就按 token 的 `start`/`end` 坐标**补回原有空白**再匹配。
 
-| 位置 | 内容 |
-|---|---|
-| `.github/workflows/scrna_analysis.yml`（本仓）/ `spatial-pipeline-skill/.github/workflows/spatial_analysis.yml` | 「静态检查（不装依赖）」那一步跑 `check_legend_convention.mjs --selftest` + `check_figures.mjs --selftest` |
-| `geo-normal-pipeline-skill/.github/workflows/geo_analysis.yml` | 同一步跑 `check_legend_convention.mjs --selftest`（geo 无 `check_figures.mjs`）|
-| `governance/hooks/pre-push.mjs` | 新增 `SELFTESTS` 表，在**所有**静态门禁之后跑，日志标签是 `（自检）` |
+> **正向标定（干净产物）看不出这三形；反向标定必须逐个把原缺陷注回去，且判红必须伴随非空 FAIL 摘要。** 本仓这次是正向 37 项 + 反向 6 类注入（调用点退回裸 `nan` / 去掉 `is not None` 守卫 / 产出端退回裸 `round` / 去掉状态字段 / `finite_round` 不再挡 nan / 消费端不再用状态判红）—— **第一轮有 3 类注回去却全绿**，说明那 3 条判据当时压根不存在，补上才 6/6。
 
-**日志标签必须区分"带镜像目录"与"带 `--selftest`"** —— 两者都走 `extraArgs`，
-但一个是拿真实产物判、一个是拿合成用例判，长得一样就没法排查。
-
-### 29.4 判据的"通过数"必须能看见 0 —— 否则死代码与"没有这类输入"无法区分（E-64）
-
-`check_doc_refs.mjs` 补判据 C（跨仓引用）时，主体写在
-`if (!isA && !isB) continue` **之后** —— 而跨仓 token 正是"两条判据都不进"
-的那一类，于是**判据 C 的分支永远走不到**。更糟的是报告那行是
-`if (nCheckedC) console.log(...)` 守卫的：计数恒 0 时**连打印都不打印**，
-输出看起来与本仓没有跨仓引用**完全一样**。三仓复跑全绿、毫无异常迹象。
-
-**两条规则：**
-
-1. **新判据要放在早退分支之前** —— 分流顺序错了分支就是死代码，
-   而**死代码不报错、只是永远不执行**。
-2. **计数行不能加 `if (n)` 守卫** —— **0 也是信息**。"检查了 0 条"与
-   "根本没检查"必须在输出上长得不一样。
-
-### 29.5 门禁的"检查范围"要和"它守护的动作"对齐（E-65）
-
-`governance/hooks/pre-push.mjs` 的 `changesOf(repo)` 原来只读
-`git status --porcelain`（**只含未提交改动**）。而 pre-push 是 `git push`
-的钩子，**它唯一被调用的时刻就是"已经提交、还没推送"** —— 那时 porcelain
-为空，三仓全走 `无改动，跳过`，**[4/6] 静态门禁段一条都没跑**，
-而打印的是 `PRE-PUSH 通过（0 条提醒）。可以 push。`
-
-**这不是边角，是主路径**：正常情况下它每次都在空转，给出虚假的安心。
-修法是取并集 —— 除未提交改动外，再加
-`git log --name-only --pretty=format: @{upstream}..HEAD`（**已提交未推送**）。
-
-> **一个门禁段被整段跳过时，不能打印"通过"。** `无改动，跳过` 用的是
-> `ok()`（绿勾），它和"查过了没问题"在输出上一样。写门禁前先跑一次
-> "什么都没改"的路径 —— 如果它空转时也说通过，那它有改动时说的通过
-> 也不可信。**正确的提交顺序是：改完 → 跑 pre-push → 提交 → push。**
-
-**`SELFTESTS` 的接线也做了反向标定**：把 `check_figures.mjs` 自检里
-"全白判红"用例的条件改成 `false` → pre-push 输出
-`✗ spatial-pipeline-skill tools/check_figures.mjs 未通过`、
-`PRE-PUSH 未通过：1 项判红 —— 禁止 push。` —— **说明接线真的会拦，
-而不是只在日志里多打一行 `✓`。**
-
-> **接了线但从不失败的检查，与没接线是一样的。** 每加一条自检，都要问
-> "我怎样让它红一次"——答不上来就说明它现在是个装饰。
-
-**两仓 `tools/check_figures.mjs` 与 `tools/check_legend_convention.mjs`
-各自必须逐字节相同**（`check_figures.mjs` 只在本仓与 spatial 仓之间，
-`check_legend_convention.mjs` 三仓同一份）。改一侧必须同步并比对 SHA256。
-
-
-
-
-
+台账：governance/15_ERROR_LEDGER.md E-69（任务行 governance/02_TASKLIST.md R-03）
+完整原文（含全部实测证据与表格）：references/agents-detail.md#原规则-30

@@ -36,9 +36,9 @@ import pandas as pd  # noqa: E402
 import scanpy as sc  # noqa: E402
 from scipy.stats import ks_2samp, spearmanr  # noqa: E402
 
-from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, result_status_of,
-                    save_fig, set_seed, write_json,
+from common import (df_to_records, ensure_dirs, finite_round, load_config,  # noqa: E402
+                    log_info, log_warn, parse_args, record_step,
+                    result_status_of, save_fig, set_seed, write_json,
                     W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, PAL, PAL_CYCLE,)
 
 # 校正后的统一方向：**值越大越晚**
@@ -288,6 +288,48 @@ def select_cv_methods(names, direction_rows, reference_method):
     return cv, excluded
 
 
+def method_correlation_stats(cv_names, cmat):
+    """交叉验证方法两两 Spearman 相关的**离对角**摘要（E-69 Form A）。
+
+    返回 `(mean_rho, min_rho, state, note)`。
+
+    **为什么必须抽成纯函数。** 旧实现在 `cv_names` 只有 1 个方法时
+    `off` 是空列表，`mean_rho` / `min_rho` 都记 `nan` —— 而下游
+    `if mean_rho < 0.3:` 对 `nan` **静默为 False**（`nan` 参与任何比较都是
+    `False`，且不报错），于是"**算不出来**"被当成"**一致性不低**"，
+    连"方法间一致性偏低"那条限制都不会加；日志里打出 `+nan`，
+    JSON 里写 `null`。**算不出来和算出来很小，在产物里长得一模一样。**
+
+    抽出来才能被标定脚本直接调（规则 29.1：自检必须调真代码，
+    不能自己重写一遍逻辑）。内联的话只能靠跑整条流水线（约 25 分钟一轮）。
+
+    `state` 取值：
+
+    · `"ok"` —— 至少两个方法，且离对角相关里有有限值
+    · `"single_method"` —— 只有 0/1 个方法，**没有"方法间一致性"这个量**
+    · `"undefined"` —— 有两个以上方法，但离对角相关**全是非有限值**
+      （各方法退化成常数列）
+
+    后两种**都不是"一致性低"**：一个是分母里只有一个方法、一个是相关算不出来。
+    调用点判空一律 `is not None`，**不能用真值判断**（`0.0` 是有效值）。
+    """
+    if len(cv_names) < 2:
+        return (None, None, "single_method",
+                f"只有 {len(cv_names)} 个方法可交叉验证，"
+                "**没有「方法间一致性」这个量**（不是一致性低，是算不出来）")
+    off = [float(cmat.loc[a_, b_]) for i, a_ in enumerate(cv_names)
+           for b_ in cv_names[i + 1:]]
+    finite = [v for v in off if np.isfinite(v)]
+    n_bad = len(off) - len(finite)
+    if not finite:
+        return (None, None, "undefined",
+                f"离对角相关 {len(off)} 对**全部非有限**（各方法退化成常数列），"
+                "方法间一致性算不出来")
+    note = (f"{n_bad}/{len(off)} 对相关非有限，已从均值/最小值中剔除"
+            if n_bad else None)
+    return (float(np.mean(finite)), float(np.min(finite)), "ok", note)
+
+
 # ============================================================================
 # 主流程
 # ============================================================================
@@ -505,10 +547,17 @@ def run_05_trajectory(cfg: dict) -> dict:
         log_warn(f"**{len(cv_excluded['direction_undecided'])} 个方法的方向无法判定"
                  f"（{', '.join(cv_excluded['direction_undecided'])}），"
                  f"已从交叉验证与共识中剔除** —— 不剔除等于给共识掺进一个随机方向")
-    off = [float(cmat.loc[a_, b_]) for i, a_ in enumerate(cv_names)
-           for b_ in cv_names[i + 1:]]
-    mean_rho = float(np.mean(off)) if off else float("nan")
-    min_rho = float(np.min(off)) if off else float("nan")
+    # **E-69 Form A：`nan` 参与比较静默为 `False`。** 旧实现在 `cv_names`
+    # 只有一个方法时 `off` 为空 → `mean_rho` 记 `nan` → 下游
+    # `if mean_rho < 0.3:` 静默判假（限制不加）、日志打 `+nan`、JSON 写 null。
+    # "算不出来"与"算出来不低"在产物里长得一样。抽成纯函数后由它显式区分
+    # 三种状态（`ok` / `single_method` / `undefined`），调用点判空一律
+    # `is not None`（`0.0` 是有效值，不能用真值判断）。
+    mean_rho, min_rho, mc_state, mc_note = method_correlation_stats(cv_names, cmat)
+    if mc_state != "ok":
+        log_warn(f"方法间一致性**算不出来**（state={mc_state}）：{mc_note}")
+    elif mc_note:
+        log_warn(f"方法间一致性部分不可用：{mc_note}")
     if reference_method:
         log_info(f"一致性统计已排除方向参考 {reference_method}"
                  f"（它与参考的相关是定义上的，不是证据）")
@@ -550,6 +599,10 @@ def run_05_trajectory(cfg: dict) -> dict:
             "methods_ok": methods_ok, "methods_failed": methods_failed,
             "direction_table": direction_rows,
             "cv_excluded": cv_excluded,
+            # 同口径落盘（E-69 Form A）：这里 `cv_names` 为空，所以
+            # `mc_state` 必然是 `single_method`，原因文案一并写出来。
+            "method_correlation_state": mc_state,
+            "method_correlation_undefined_note": mc_note,
         }
         write_json(res_dir / "trajectory_status.json", status)
         log_warn(f"拟时序共识不可用: {status['reason']}")
@@ -574,7 +627,8 @@ def run_05_trajectory(cfg: dict) -> dict:
              f"{', '.join(consensus_names)}"
              + (f"；已排除方向参考 {reference_method}" if reference_method else "")
              + "）；方法间平均 rho="
-             f"{mean_rho:+.4f}，最低 {min_rho:+.4f}"
+             + (f"{mean_rho:+.4f}，最低 {min_rho:+.4f}" if mean_rho is not None
+                else f"**不可用**（state={mc_state}）")
              + (f"；含参考方法的共识与它 rho={rho_ref:+.4f}" if rho_ref is not None else ""))
 
     # ---- 6. 沿轨迹变化的基因 ------------------------------------------------
@@ -1006,15 +1060,23 @@ def run_05_trajectory(cfg: dict) -> dict:
         f"方向参考 = {direction_note}",
         "**没有 RNA 速率（spliced/unspliced）时不能下方向性结论** —— "
         "本流水线只有计数矩阵，scVelo 记 not_done，所以这里报的是相似度排序",
-        f"方法间一致性只是**内部一致性**：{len(cv_names)} 种被交叉验证的方法"
-        "都错向同一个伪轨迹时，它们依然彼此高度相关。一致不等于正确",
     ]
+    # **E-69 Form A**：`mc_state != "ok"` 时**没有**"方法间一致性"这个量，
+    # 不能照抄"N 种方法彼此高度相关"那句（那会把"算不出来"说成"算出来不低"）。
+    if mc_state == "ok":
+        limitations.append(
+            f"方法间一致性只是**内部一致性**：{len(cv_names)} 种被交叉验证的方法"
+            "都错向同一个伪轨迹时，它们依然彼此高度相关。一致不等于正确"
+            + (f"（{mc_note}）" if mc_note else ""))
+    else:
+        limitations.append(
+            f"**方法间一致性算不出来**（state={mc_state}）：{mc_note}")
     if direction_source == "cytotrace_fallback":
         limitations.append(
             "**方向参考是 CytoTRACE 而非 marker 基因**：若该数据集中分化潜能"
             "与成熟度不同向，整条轴会反掉。要下方向性结论请在配置里给出"
             "trajectory.early_markers / late_markers")
-    if mean_rho < 0.3:
+    if mean_rho is not None and mean_rho < 0.3:
         limitations.append(
             f"**方法间一致性偏低（平均 rho={mean_rho:+.3f}）**："
             "各算法对同一数据给出了差异较大的排序，此时不该报单一「轨迹」")
@@ -1049,8 +1111,12 @@ def run_05_trajectory(cfg: dict) -> dict:
         "consensus_excludes_direction_reference": bool(reference_method),
         "consensus_vs_with_reference_rho": (round(rho_ref, 4)
                                             if rho_ref is not None else None),
-        "method_correlation_mean_offdiag": round(mean_rho, 4),
-        "method_correlation_min_offdiag": round(min_rho, 4),
+        "method_correlation_mean_offdiag": finite_round(mean_rho, 4),
+        "method_correlation_min_offdiag": finite_round(min_rho, 4),
+        # **E-69 Form A 的收口**：`null` 本身不说明为什么是 `null` ——
+        # 是"只有一个方法"还是"相关全是 nan"？状态与原因必须一起落盘。
+        "method_correlation_state": mc_state,
+        "method_correlation_undefined_note": mc_note,
         # **两组剔除分开记**（L6 第二半）：方向参考是"定义上相关"、
         # 方向未判定是"方向未知"，理由不同、处理也不同（前者无法修，
         # 后者应去看那个方法为什么退化）。合并成一个数会让读者以为
@@ -1171,7 +1237,8 @@ def run_05_trajectory(cfg: dict) -> dict:
     }
     write_json(res_dir / "trajectory_status.json", status)
     log_info(f"轨迹分析完成：{len(methods_ok)} 种方法，"
-             f"平均一致性 rho={mean_rho:+.4f}")
+             + (f"平均一致性 rho={mean_rho:+.4f}" if mean_rho is not None
+                else f"方法间一致性不可用（state={mc_state}）"))
     return status
 
 

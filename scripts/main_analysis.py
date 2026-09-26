@@ -744,11 +744,33 @@ def run_all(cfg: dict, only: list = None) -> int:
                        + (f"（可选缺失 {','.join(msum['inputs_missing'])}）"
                           if msum["inputs_missing"] else "")),
         })
+        # **不能直接拿 `pend` 判红。** `record_human_review()` 默认记成
+        # `status="pending"`（自动化流水线不能替人签字 —— 把未确认的节点默认记成
+        # 已确认，等于把复核节点变成摆设），所以**任何一轮自动化跑完 `pend` 都非空**，
+        # 拿它判红 = 每个 job 都红 = E-29「永远红的门禁等于没有门禁」。
+        #
+        # 要判的是**流水线真能控制的东西**：「这一轮到底登记了几个复核节点」。
+        # `HUMAN_REVIEW_NODES` 有 6 个，`n_human_review == 0` 说明上面那个登记
+        # 循环压根没跑到 —— 那才是缺陷（复核节点悄悄消失了，而 `human_review_pending`
+        # 空数组会把它说成「全部已确认」）。
+        # 登记了但全 pending = 设计如此，只报数不阻断。
         pend = msum["human_review_pending"]
+        _n_hr = msum.get("n_human_review", 0)
+        _n_conf = len(msum.get("human_review_confirmed") or [])
         checks.append({
-            "item": f"人工复核节点待确认（{len(pend)} 个，不阻断 job）",
-            "ok": True, "required": False,
-            "detail": (", ".join(pend) if pend else "全部已确认"),
+            "item": (f"人工复核节点已登记（{_n_hr}/{len(HUMAN_REVIEW_NODES)}，"
+                     f"其中 {len(pend)} 个待确认，不阻断 job）"),
+            "ok": _n_hr > 0, "required": False,
+            "detail": (
+                f"登记 {_n_hr} 个" + (f"，已确认 {_n_conf} 个" if _n_conf else "")
+                + (f"，待确认 {len(pend)} 个：{', '.join(pend)}" if pend
+                   else "（全部已确认，或本轮无人签字但节点已登记）")
+                if _n_hr else
+                # 把这话说清楚：`pending` 为空时千万别让读者以为「人签过字了」。
+                f"**清单里一个人工复核节点都没有** —— `HUMAN_REVIEW_NODES` "
+                f"（{len(HUMAN_REVIEW_NODES)} 个）那个登记循环没跑到"
+                f"（不是「全部已确认」：已确认会体现在 `human_review_confirmed` 里）"
+            ),
         })
         # ---- §0.2 跨语言转换：**空数组必须被解释** --------------------------
         #
@@ -900,14 +922,27 @@ def run_all(cfg: dict, only: list = None) -> int:
         })
         cv = tj.get("cross_validated_methods") or []
         mean_rho = tj.get("method_correlation_mean_offdiag")
+        # **E-69 Form A 的消费端。** 旧实现里一致性算不出来时写的是裸
+        # `NaN`，`json.load` 读回来是 `nan`，于是 `mean_rho is not None`
+        # 为真 —— **这条判据在"算不出来"时照样是绿的**。
+        # 现在产出端用 `finite_round` 落 `null`，这里读到的就是 `None`。
+        # `method_correlation_state` 与原因文案必须一起看：
+        # `single_method`（分母里只有一个方法）与 `undefined`（相关全是 nan）
+        # 是两种不同的处境，排查方向也不同。
+        mc_state = tj.get("method_correlation_state")
+        mc_note = tj.get("method_correlation_undefined_note")
+        _mc_ok = bool(cv) and mean_rho is not None
         checks.append({
             "item": "轨迹方法间一致性已量化（且排除方向参考）",
-            "ok": bool(cv) and mean_rho is not None,
+            "ok": _mc_ok,
             "required": True,
             "detail": (f"交叉验证 {len(cv)} 种，平均 rho={mean_rho:+.4f}，"
                        f"参考方法 {tj.get('direction_reference_method')}"
-                       if bool(cv) and mean_rho is not None else
-                       "**缺 cross_validated_methods 或一致性数值**"),
+                       + (f"（{mc_note}）" if mc_note else "")
+                       if _mc_ok else
+                       f"**方法间一致性算不出来**（state={mc_state}）："
+                       f"{mc_note or '缺 cross_validated_methods 或一致性数值'}"
+                       " —— 「算不出来」不是「一致性不低」"),
         })
         checks.append({
             "item": "轨迹方向来源已写明",

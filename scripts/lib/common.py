@@ -158,6 +158,28 @@ def set_seed(cfg: dict) -> int:
     return seed
 
 
+def finite_round(x, ndigits: int = 4):
+    """四舍五入到 `ndigits` 位；**非有限值一律落 `None`，不落裸 `NaN`**（E-69）。
+
+    `round(float("nan"), 4)` 是 `nan`，`round(float("inf"), 4)` 是 `inf` ——
+    两者都**不是合法 JSON**。`_scrub_nonfinite` 会把它们换成 `null`，但那是
+    最后一道兜底：**「算不出来」应当在产出它的地方就被标成 `None`**，
+    而不是靠写盘时被悄悄改掉（内存里的消费者读到的还是 `nan`）。
+
+    **更根本的问题在写盘之前**：`nan` 参与任何比较都是 `False` 且不报错，
+    所以 `if mean_rho < 0.3:` 这类判据对"算不出来"**静默判假** ——
+    "算不出来"被当成"算出来不低"。这就是 E-69 的 Form A。
+    调用点判空一律用 `is not None`，**不能用真值判断**（`0.0` 是有效值）。
+
+    姊妹项目 `spatial-pipeline-skill/scripts/lib/common.py` 有同名同语义的
+    函数，两仓必须一致（E-69 收口）。
+    """
+    if x is None:
+        return None
+    x = float(x)
+    return None if not math.isfinite(x) else round(x, ndigits)
+
+
 def _scrub_nonfinite(obj):
     """把 `NaN` / `Infinity` 递归换成 `None`，并返回 `(新对象, 命中数)`。
 
@@ -960,6 +982,18 @@ def manifest_summary(cfg: dict) -> dict:
         "human_review_pending": sorted(
             h["node"] for h in (m.get("human_review") or [])
             if h.get("status") == "pending"
+        ),
+        # 「一个都没登记」与「登记了且全部已确认」在 `human_review_pending`
+        # 眼里一模一样（都是空列表），但两者的排查方向完全相反：
+        #   - 前者 = 登记循环（main_analysis 里逐个 record_human_review）没跑到；
+        #   - 后者 = 人真的签过字了。
+        # 所以必须把「登记了几个」与「确认了几个」分开给出来 —— 消费端
+        # （验收层的 manifest:human_review）判的是前者（流水线真能控制的事），
+        # 而不是后者（人有没有签字，拿它判红会让每个 job 都红 = E-29）。
+        "n_human_review": len(m.get("human_review") or []),
+        "human_review_confirmed": sorted(
+            h["node"] for h in (m.get("human_review") or [])
+            if h.get("status") in ("confirmed", "overridden", "not_needed")
         ),
         "n_cross_language": len(m.get("cross_language") or []),
     }
