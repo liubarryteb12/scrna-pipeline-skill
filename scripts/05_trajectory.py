@@ -230,8 +230,9 @@ def orient(raw: dict, reference: np.ndarray, convention: dict):
         # 也会走到"不翻转"这条路上。
         #
         # 修法：把"方向无法判定"显式标出来（`flipped=None`），而不是让它
-        # 伪装成"判断过、结论是不用翻"。下游按 `direction_decided` 决定
-        # 是否把这个方法算进共识 —— 见 `consensus` 段。
+        # 伪装成"判断过、结论是不用翻"。**下游必须真的按
+        # `direction_decided` 把这类方法剔除** —— `select_cv_methods()`
+        # 是唯一的消费者，不要在这里只标不用（L6 第二半）。
         _decidable = bool(np.isfinite(r_before) and abs(r_before) > 0)
         flipped = None
         if _decidable and r_before < 0:
@@ -254,6 +255,37 @@ def orient(raw: dict, reference: np.ndarray, convention: dict):
             "rho_vs_reference_after_flip": round(float(r_after), 4),
         })
     return out, rows
+
+
+def select_cv_methods(names, direction_rows, reference_method):
+    """从候选方法里挑出**能进交叉验证与共识**的那些（L6 第二半）。
+
+    两道剔除，**理由不同所以分开记**：
+
+    · `direction_reference` —— 退回模式下方向参考就是 CytoTRACE 本身，
+      它与自己的相关恒为 ±1，那是**定义不是证据**；
+    · `direction_undecided` —— 该方法的 `rho_vs_reference` 是 nan 或 0
+      （退化成常数列），**方向未知**，与别人相关多少是随机的。
+
+    旧实现只有第一道，第二类照样进 `cv_names`，于是**一个随机方向被
+    算进一致性、又被算进共识**，而下游所有"沿轨迹变化的基因""模块"
+    都建在那个随机方向上 —— 产物里完全看不出来。
+
+    抽成纯函数是为了能被标定脚本直接调（AGENTS 规则 29.1：自检必须调
+    真代码，不能自己重写一遍逻辑）。
+
+    返回 `(cv_names, cv_excluded)`。
+    """
+    undecided = [r["method"] for r in direction_rows
+                 if not r.get("direction_decided", True)]
+    cv = [n for n in names if n != reference_method and n not in undecided]
+    excluded = {
+        "direction_reference": ([reference_method] if reference_method else []),
+        # 显式去掉一次：两组本应互斥（参考与自己的 rho 恒为 1），
+        # 但哪天参考换了之后两组都数它会把剔除数报大。
+        "direction_undecided": [n for n in undecided if n != reference_method],
+    }
+    return cv, excluded
 
 
 # ============================================================================
@@ -425,16 +457,29 @@ def run_05_trajectory(cfg: dict) -> dict:
 
     corrected, direction_rows = orient(raw_pt, reference, convention)
     pd.DataFrame(direction_rows).to_csv(res_dir / "trajectory_direction.csv", index=False)
-    _n_undecided = 0
     for r in direction_rows:
         if r["flipped"] is None:
-            _n_undecided += 1
             log_warn(f"  方向 {r['method']:10} "
                      f"rho={r['rho_vs_reference_before_flip']:+.4f} —— "
                      f"**无法判定方向**（L6），该方法的拟时序不做方向校正")
         else:
             log_info(f"  方向 {r['method']:10} rho={r['rho_vs_reference_after_flip']:+.4f}"
                      f"{'（已翻转）' if r['flipped'] else ''}")
+
+    # **L6 的第二半（自查 2026-09-26）。** 上面只把"方向无法判定"标出来、
+    # 打了 WARN —— 但 `direction_decided` **一个消费者都没有**，而
+    # `orient()` 的注释写的是"下游按 `direction_decided` 决定是否把这个
+    # 方法算进共识 —— 见 `consensus` 段"。**注释陈述的行为与代码实际行为
+    # 对不上**（E-58 防复发② 的又一实例）。
+    #
+    # 后果不是"少一条告警"，而是**一个随机方向被当成结论用**：
+    # `r_before` 是 nan（该方法退化成常数列）或恰为 0 时，`flipped=None`
+    # 表示方向**没被校正**，可它照样进 `cv_names` → 进一致性统计 →
+    # 进共识拟时序。而共识一旦带上一个随机方向的方法，下游**所有**
+    # "沿轨迹变化的基因""模块"都建在一个随机方向上，且产物里看不出来
+    # —— 这正是 E-58② 要防的"看起来在算、其实没在算"。
+    #
+    # 剔除动作在下面的 `select_cv_methods()`（纯函数，可被标定脚本直接调）。
 
     # ---- 5. 交叉验证矩阵 ----------------------------------------------------
     names = [n for n in ("dpt", "palantir", "scfates", "cytotrace") if n in corrected]
@@ -447,8 +492,19 @@ def run_05_trajectory(cfg: dict) -> dict:
     # **方向参考不能算进"交叉验证一致性"。**
     # 退回模式下参考就是 CytoTRACE 本身，它与自己的相关恒为 ±1 ——
     # 那是定义，不是证据。把它算进去会把一致性整体抬高。
+    #
+    # **方向无法判定的方法也不能算进去**（L6 第二半）—— 两道剔除都
+    # 落在 `select_cv_methods()` 里，理由分开记。`direction_decided`
+    # 在此之前**一个消费者都没有**，而 `orient()` 的注释却写着"下游按它
+    # 决定是否算进共识"：**注释陈述的行为与代码实际行为对不上**
+    # （E-58 防复发② 的又一实例），后果是一个随机方向被当成结论用。
     reference_method = "cytotrace" if direction_source == "cytotrace_fallback" else None
-    cv_names = [n for n in names if n != reference_method]
+    cv_names, cv_excluded = select_cv_methods(names, direction_rows,
+                                              reference_method)
+    if cv_excluded["direction_undecided"]:
+        log_warn(f"**{len(cv_excluded['direction_undecided'])} 个方法的方向无法判定"
+                 f"（{', '.join(cv_excluded['direction_undecided'])}），"
+                 f"已从交叉验证与共识中剔除** —— 不剔除等于给共识掺进一个随机方向")
     off = [float(cmat.loc[a_, b_]) for i, a_ in enumerate(cv_names)
            for b_ in cv_names[i + 1:]]
     mean_rho = float(np.mean(off)) if off else float("nan")
@@ -476,7 +532,29 @@ def run_05_trajectory(cfg: dict) -> dict:
     # 把它算进共识，等于让"定义了方向的那个方法"再投一次票。
     # 上面算交叉验证一致性时已经排除了它（`cv_names`），共识必须同口径，
     # 否则两个数讲的是两件不同的事。
-    consensus_names = cv_names if cv_names else names
+    #
+    # **`cv_names if cv_names else names` 这个回退已删除（L6 第二半）。**
+    # 它原本保证"至少有一个方法" —— 但在**所有**方法方向都未判定时，
+    # `cv_names` 为空，回退恰好把刚剔除的方法**全部放回共识**，
+    # 而且日志上什么都不会显示（`mean_rho` 是 nan，`nan < 0.3` 为假，
+    # 连"一致性偏低"那条限制都不会加）。**一个静默放回排除项的兜底，
+    # 与不排除等价。** 现在这种情况直接判 `no_consensus`。
+    if not cv_names:
+        status = {
+            "dataset_id": cfg["dataset_id"],
+            "status": "no_consensus",
+            "reason": ("没有任何方法的方向可判定"
+                       f"（方向未判定: {cv_excluded['direction_undecided']}；"
+                       f"方向参考: {reference_method}）"
+                       "—— 方向未知的拟时序不能取共识，否则共识方向是随机的"),
+            "methods_ok": methods_ok, "methods_failed": methods_failed,
+            "direction_table": direction_rows,
+            "cv_excluded": cv_excluded,
+        }
+        write_json(res_dir / "trajectory_status.json", status)
+        log_warn(f"拟时序共识不可用: {status['reason']}")
+        return status
+    consensus_names = cv_names
     Z = np.column_stack([
         (corrected[n] - np.nanmean(corrected[n])) / (np.nanstd(corrected[n]) + 1e-12)
         for n in consensus_names
@@ -973,6 +1051,11 @@ def run_05_trajectory(cfg: dict) -> dict:
                                             if rho_ref is not None else None),
         "method_correlation_mean_offdiag": round(mean_rho, 4),
         "method_correlation_min_offdiag": round(min_rho, 4),
+        # **两组剔除分开记**（L6 第二半）：方向参考是"定义上相关"、
+        # 方向未判定是"方向未知"，理由不同、处理也不同（前者无法修，
+        # 后者应去看那个方法为什么退化）。合并成一个数会让读者以为
+        # 剔除的都是同一类东西。
+        "cv_excluded": cv_excluded,
         "method_correlation_note": (
             "一致性统计**不含方向参考方法**"
             + (f"（{reference_method}）：退回模式下参考就是它本身，"

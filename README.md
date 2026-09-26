@@ -116,6 +116,10 @@ integration:
 
 - 注释是打分提示。`celltype_annotation.csv` 的 `score_margin` 告诉
   你第一名和第二名差多少；margin ≈ 0 时那个 assignment 不该被当结论。
+  配套的 `margin_state` 把**"不确定"（`low_margin`）与"算不出来"
+  （`single_celltype` / `margin_undefined`）分开** —— 后者
+  `assignment_confident` 是 `null` 不是 `false`，因为那是"指标不适用"，
+  排查方向是补签名基因而不是比对两条注释路。
 - **拟时序的符号是任意的。** 实测四种方法（DPT / Palantir / scFates /
   CytoTRACE）在 PBMC3k 上的**原始**拟时序两两相关从 **−0.50 到 +0.86**
   —— 符号都不一样。本流水线按「值越大越晚」统一方向后才互相比较，

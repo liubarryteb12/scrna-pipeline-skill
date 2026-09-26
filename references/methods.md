@@ -130,9 +130,23 @@ doi:10.1038/s41598-019-41695-z
 4. **签名重叠** —— 实测 pbmc3k 里 `T_cell` 与 `CD4_T` 的 marker
    完全重叠（IL7R、LTB 两边都有），打分差 **0.0**
 
-所以每个 assignment 都带 `score_margin` 与 `assignment_confident`。
+所以每个 assignment 都带 `score_margin`、`margin_state` 与
+`assignment_confident`。
 **margin 小的 assignment 不该被当成结论** —— 只报类型名等于把
 不确定性藏起来。
+
+`margin_state` 把"不确定"和"算不出来"分开（E-66 第二版同族）：
+
+| `margin_state` | 含义 | `assignment_confident` | 该怎么办 |
+|---|---|---|---|
+| `ok` | margin ≥ 0.05 | `true` | 可当结论 |
+| `low_margin` | 有第二名，差 < 0.05 | `false` | 去看那个簇，两条路谁更可信 |
+| `single_celltype` | **没有第二名**（只落进一个候选类型）| `null` | 补签名基因 —— 该簇压根没进候选 |
+| `margin_undefined` | 有第二名但分数含 nan/inf | `null` | 查上游打分 |
+
+后两行是 `null` 而不是 `false`：**"这个指标在这里不适用"与"这个指标说
+不确定"是两件事**，前者去补基因、后者去比对，混成一个 `false` 会把人
+引到错的排查方向上。
 
 ### 第二条独立证据：CellTypist（文档 §2.4 点名，**本流水线已实现**）
 

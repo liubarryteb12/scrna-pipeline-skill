@@ -69,6 +69,24 @@ artifact 才抓到）。** 一个 `p_adj_available: false` 只能表达"没做�
 两两不同，布尔量**由码推导**（`p_adj_available = (ks_reason == "ok")`）而不是
 与它并列 —— 两个独立量一定会漂开。**"数据里没有分组"与"配置漏了"是两件事。**
 
+**标出来的状态必须真的有人消费（L6 第二半，自查 2026-09-26）。**
+`05_trajectory.py` 的 `orient()` 早就把"方向无法判定"标成了
+`direction_decided: False` 并打了 WARN，注释还写着"下游按 `direction_decided`
+决定是否把这个方法算进共识"—— 而**它一个消费者都没有**：那些方法的拟时序
+照样进 `cv_names` → 进一致性统计 → 进共识。`rho_vs_reference` 是 nan
+（该方法退化成常数列）或恰为 0 时，`flipped=None` 意味着方向**没被校正**，
+共识方向就是随机的，而下游"沿轨迹变化的基因""模块"全建在那个随机方向上
+—— 产物里完全看不出来。**注释陈述的行为与代码实际行为对不上，是 E-58②
+"看起来在算、其实没在算"的又一种形态。**
+
+两道剔除理由不同、**分开记**（`cv_excluded.direction_reference` =
+"定义上相关" / `direction_undecided` = "方向未知"），合并成一个数会让读者
+以为剔的是同一类东西。并且**删掉"至少留一个"的静默回退**
+（`cv_names if cv_names else names`）—— 全部方向都未判定时，那个回退恰好
+把刚剔除的方法**全部放回共识**，而且 `mean_rho` 是 nan、`nan < 0.3` 为假，
+连"一致性偏低"那条限制都不会加。现在这种情况判 `no_consensus`
+（**已登记进 `STEP_ABORT_VALUES`**，否则会静默归成 `skip`）。
+
 ## 5. 每个"结论"都要带上它的适用范围
 
 单细胞分析里，方法学限定不是免责声明，是**结论的适用范围**。
@@ -76,12 +94,21 @@ artifact 才抓到）。** 一个 `p_adj_available: false` 只能表达"没做�
 
 | 产物 | 必需字段 | 为什么 |
 |---|---|---|
-| `celltype_annotation.csv` | `score_margin`、`assignment_confident` | margin 小时 assignment 不该被当结论 |
+| `celltype_annotation.csv` | `score_margin`、`margin_state`、`assignment_confident` | margin 小时 assignment 不该被当结论；`margin_state` 把"不确定"与"算不出来"分开 |
 | `trajectory_status.json` | `root_selection`、`limitations` | 拟时序方向完全依赖根的选择 |
 | `communication_status.json` | `method`、`limitations` | 共表达不等于通讯 |
 | `grn_status.json` | `method`、`limitations` | 没有 motif 剪枝就不是 SCENIC |
 
 **报一个类型名 / 一个 p 值而不报它的不确定性，等于把不确定性藏起来。**
+
+**并且"不确定"与"算不出来"要分开报（E-66 第二版同族，规则 4 同一条）。**
+`assignment_confident` 是三态：`true`（`margin_state: ok`）/ `false`
+（`low_margin`，两条路真的分不开）/ **`null`（`single_celltype` —— 没有
+第二名可比较，或 `margin_undefined` —— 分数含 nan/inf）**。后两种不是
+"不确定"，是**"这个指标在这里不适用"** —— 排查方向是补签名基因，
+不是去比对两条注释路。把三种处境压成一个 `false`，日志就会说
+「N/M 个簇 margin<0.05（assignment 不确定）」而其中可能一个簇的 margin
+都没算出来。
 
 ## 6. 绘图 API 会随版本变，写防御性代码
 

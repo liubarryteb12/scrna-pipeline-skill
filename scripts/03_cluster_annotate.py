@@ -3,9 +3,18 @@
 03_cluster_annotate.py — 邻居图、UMAP、Leiden 聚类、marker 基因、细胞类型打分
 
 **注释是打分提示，不是结论。** 见 assets/celltype_markers.yml 开头的说明。
-每个簇的 assignment 都带 `score_margin`（第一名与第二名的差）——
+每个簇的 assignment 都带 `score_margin`（第一名与第二名的差）与
+`margin_state`（这个差算不算得出来）——
 margin 小的 assignment 不该被当成结论，而这一点只有把 margin 写出来
 才看得出来。只报一个类型名等于把不确定性藏起来。
+
+`margin_state` 有四个取值，**它们的处理建议完全不同**（E-66 第二版同族）：
+  · `ok`               —— margin ≥ 0.05，assignment 可当结论；
+  · `low_margin`       —— 有第二名但差 < 0.05，两条路真的分不开；
+  · `single_celltype`  —— **没有第二名可比较**（该簇只落进一个候选类型）；
+  · `margin_undefined` —— 有第二名但分数含 nan/inf，差算不出来。
+后两者 `assignment_confident` 是 `None`（**不是 `False`**）：它们不是
+"不确定"，是"这个指标在这里不适用"—— 要补签名基因，不是去比对两条路。
 
 **两条独立的注释路径**（文档 §2.4）：
   1. **marker 签名打分**（`score_genes` + 簇均值）→ `celltype_annotation.csv`
@@ -117,20 +126,47 @@ def score_celltypes(adata, sig) -> tuple:
     per_cell.columns = list(present.keys())
 
     # 每个簇：第一名、第二名、margin
+    #
+    # **E-66 第二版同族（自查 2026-09-26）**：原来这里是
+    # `margin = ... if len(s) > 1 else float("nan")` +
+    # `"assignment_confident": bool(margin >= 0.05)`。
+    # 只打出一个细胞类型时 `margin` 是 `nan`，而 `nan >= 0.05` 是 `False`
+    # ⇒ 那个簇被记成"不确定"。**这是把两种互不相干的处境压成一个布尔量**：
+    #   · `low_margin` —— 有第二名，但差距 < 0.05，两条路真的分不开；
+    #   · `single_celltype` —— **没有第二名可比较**，margin 根本不存在。
+    # 后者不是"不确定"，是"这个指标在这里不适用"。
+    #
+    # 后果与 M2 同形：`n_clusters_low_margin` 把两者加在一起，日志就会说
+    # 「N/M 个簇 margin<0.05（assignment 不确定）」—— 而其中可能一个簇的
+    # margin 都没算出来。**一个真实但错误的结论，比没有结论更糟。**
+    #
+    # 所以拆成 `margin_state` 原因码 + `score_margin` 落 `None`（不落裸
+    # `NaN`）+ `assignment_confident` 三态（`True`/`False`/`None`）。
     rows = []
     for cl in per_cell.index:
         s = per_cell.loc[cl].sort_values(ascending=False)
         top = s.index[0]
-        margin = float(s.iloc[0] - s.iloc[1]) if len(s) > 1 else float("nan")
+        if len(s) <= 1:
+            # 没有第二名 —— margin 不存在，既不是"确定"也不是"不确定"
+            margin_state, margin_out, confident = "single_celltype", None, None
+        else:
+            margin = float(s.iloc[0] - s.iloc[1])
+            if not np.isfinite(margin):
+                # 有第二名，但两个分数里有 nan/inf ⇒ 差算不出来
+                margin_state, margin_out, confident = "margin_undefined", None, None
+            elif margin < 0.05:
+                margin_state, margin_out, confident = "low_margin", round(margin, 4), False
+            else:
+                margin_state, margin_out, confident = "ok", round(margin, 4), True
         rows.append({
             "cluster": str(cl),
             "assigned": top,
             "top_score": round(float(s.iloc[0]), 4),
             "runner_up": s.index[1] if len(s) > 1 else None,
             "runner_up_score": round(float(s.iloc[1]), 4) if len(s) > 1 else None,
-            "score_margin": round(margin, 4),
-            # margin 小于 0.05 时第一名与第二名基本无差别
-            "assignment_confident": bool(margin >= 0.05),
+            "score_margin": margin_out,
+            "margin_state": margin_state,
+            "assignment_confident": confident,
         })
     assign = pd.DataFrame(rows)
     diag = {
@@ -141,7 +177,14 @@ def score_celltypes(adata, sig) -> tuple:
         # "签名基因被 HVG 过滤削弱"看起来和"这批数据没测到这些基因"一样。
         "missing_markers": {k: v for k, v in missing_in_data.items()},
         "not_in_hvg": {k: v for k, v in not_in_hvg.items()},
-        "n_clusters_low_margin": int((~assign["assignment_confident"]).sum()),
+        # **同样刻意分开**（E-66 第二版）：只有 `low_margin` 才叫"不确定"，
+        # `single_celltype` / `margin_undefined` 单列 —— 它们不是"不确定"，
+        # 是"这个指标算不出来"。合并计数会让读者以为这些簇的 margin 被量过。
+        "n_clusters_low_margin": int((assign["margin_state"] == "low_margin").sum()),
+        "n_clusters_margin_undefined": int(
+            assign["margin_state"].isin(["single_celltype",
+                                         "margin_undefined"]).sum()),
+        "margin_state_counts": assign["margin_state"].value_counts().to_dict(),
     }
     return per_cell, assign, diag
 
@@ -629,10 +672,25 @@ def run_03_cluster_annotate(cfg: dict) -> dict:
         adata.obs["celltype"] = adata.obs["leiden"].astype(str).map(m).astype("category")
         annot_record.update({"status": "ok", **diag,
                              "assignments": df_to_records(assign)})
+        # **E-66 第二版同族（自查）**：日志原来只说「N/M 个簇 margin<0.05
+        # （assignment 不确定）」，而那个 N 里混着"margin 根本算不出来"的簇。
+        # 现在按 `margin_state` 分开说 —— 两种处境的**处理建议完全不同**：
+        # `low_margin` 要人去看那个簇的两条路谁更可信；`single_celltype`
+        # 要人去补签名基因（那个簇压根没进候选）。
+        _msc = diag["margin_state_counts"]
         log_info(f"细胞类型打分: {diag['n_celltypes_scored']} 种类型；"
-                 f"{diag['n_clusters_low_margin']}/{n_clusters} 个簇 margin<0.05（assignment 不确定）")
+                 f"{diag['n_clusters_low_margin']}/{n_clusters} 个簇 margin<0.05"
+                 f"（assignment 不确定）；margin 状态分布 {_msc}")
         if diag["n_clusters_low_margin"] > 0:
-            log_warn("margin<0.05 的簇其 assignment 不应被当成结论 —— 见 celltype_annotation.csv")
+            log_warn(f"margin<0.05 的 {diag['n_clusters_low_margin']} 个簇其 "
+                     f"assignment 不应被当成结论 —— 见 celltype_annotation.csv "
+                     f"的 margin_state='low_margin'")
+        if diag["n_clusters_margin_undefined"] > 0:
+            log_warn(f"另有 {diag['n_clusters_margin_undefined']} 个簇的 margin "
+                     f"**算不出来**（margin_state='single_celltype' / "
+                     f"'margin_undefined'）—— 这不是「不确定」，是「这个指标在这里 "
+                     f"不适用」：候选细胞类型只有一个，没有第二名可比。"
+                     f"处理方式与 low_margin 不同：要补签名基因，不是去比对两条路")
 
         # 打分热图
         # 宽度夹在 [单栏半, 双栏]：类型少时不至于太空，类型多时也不会

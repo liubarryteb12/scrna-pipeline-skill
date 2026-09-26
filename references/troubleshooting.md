@@ -169,7 +169,26 @@ matplotlib 3.9 把 `labels` 改名为 `tick_labels`，3.11 起旧名字直接报
 数据里表达低，导致两者打分一模一样。
 
 **这不是 bug，是打分法的固有局限。** `assignment_confident: false`
-如实标出。要区分需要看 CD4 的具体表达或换有监督方法。
+（`margin_state: low_margin`）如实标出。要区分需要看 CD4 的具体表达或换有监督方法。
+
+### 细胞类型注释的 `score_margin` 是空的（`null`）
+
+**先看 `margin_state`，两种处境的排查方向完全不同：**
+
+- **`single_celltype`** —— 这个簇**只落进一个候选类型**，没有第二名可比较，
+  margin 根本不存在。**这不是"不确定"，是"这个指标在这里不适用"。**
+  排查方向：**补签名基因**（该簇的 marker 一个都没匹配上任何其它类型），
+  而不是去比对两条注释路。
+- **`margin_undefined`** —— 有第二名，但两个分数里有 `nan`/`inf`，
+  差算不出来。排查方向：看上游 `score_genes` 是否被空签名/全零基因集喂了。
+
+两种情况 `assignment_confident` 都是 `null`（不是 `false`）。
+`celltype_annotation.csv` 里 `score_margin` 为空是**正常的**
+（M9/M17 的 NaN 清洗会把裸 `NaN` 换成 JSON `null`，因为裸 `NaN` 不是合法 JSON）。
+
+`cluster_status.json` 的 `annotation` 段会把计数分开报：
+`n_clusters_low_margin`（真的不确定）与 `n_clusters_margin_undefined`
+（算不出来），另有 `margin_state_counts` 给完整分布。
 
 ### 拟时序的根看起来不对
 

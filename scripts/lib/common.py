@@ -288,6 +288,10 @@ STEP_ABORT_VALUES = (
     "failed", "error", "fail",
     # 05 轨迹：配置的根簇不在簇列表里 / 上游没产出 leiden / 成功方法不足 2 种
     "bad_root", "missing_clusters", "insufficient_methods",
+    # 05 轨迹（L6 第二半，自查 2026-09-26）：**没有任何方法的方向可判定** ——
+    # 每个方法的 `rho_vs_reference` 都是 nan 或 0，取共识等于把随机方向
+    # 当结论。旧实现回退成 `names`（把刚剔除的方法全放回），且日志无痕。
+    "no_consensus",
     # 08 虚拟敲除：候选基因没有一个满足最小靶基因数
     "no_candidates",
     # 07 GRN：TF 一个都不在数据里 / 没有 TF 找到足够多的正相关靶
