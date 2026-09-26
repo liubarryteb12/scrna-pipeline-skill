@@ -1220,5 +1220,79 @@ hvg_names`，并把诊断拆成两个字段：`missing_markers`（数据里真�
 标定脚本：`D:\tmp\_s2\calib_s2_s10.py`（每条都配"回退版必须抓不到"的对照，34 项全过）。
 
 
+## 29. 门禁要带内建自检，自检必须被反向标定，且必须接进 CI 与 pre-push（E-62 / E-63，2026-09-26）
+
+姊妹项目 `spatial-pipeline-skill/AGENTS.md` 规则 30 是同一批经验的另一半。
+
+**没有自检的门禁只能证明"它没报错"，不能证明"它检查了"。** 两条实测：
+
+| 台账 | 门禁 | 缺陷形态 |
+|---|---|---|
+| E-62 | `tools/check_legend_convention.mjs` | Python 侧没抹注释 → 注释里一个 `fig.legend(` 让括号配平**一路吞到文件尾**，其后所有真调用一个都没查，门禁照样打绿 |
+| E-63 | `tools/check_figures.mjs` | WARN 落盘分支从落地起**一次都没执行过**，里面有两个必崩的错（`INK_FAIL_MIN` 未定义、报告路径用了循环变量 `dir`）|
+
+两条的共同点：**假阴性**。门禁的失败方式不是"报错"，而是"什么都不报" ——
+而"什么都没发现"与"检查通过了"在输出上完全一样。**假阴性比假阳性危险得多**：
+假阳性会被人骂着修掉，假阴性会被当成绿。
+
+### 29.1 自检要调真代码，不能自己重写一遍逻辑
+
+E-63 的自检第一版有 9 个用例，**用例 8 自己另写了一遍路径拼接**
+（`join(dirname(join(dir, "figures")), "warn_report.json")`），没调真代码。
+反向标定把缺陷注回去（`outPath` 改回 `join(dir, ...)`）→ **自检仍然通过（exit=0）**。
+
+**抽函数**才解决：`checkDirs()` / `buildWarnReport()` / `writeWarnReport()`
+三个纯函数（不 print 不 exit），`main()` 与自检**都调它们**。抽完再注一次缺陷 →
+`ReferenceError: dir is not defined`、exit=1。
+
+> 同 E-62 的「检查器要检查的东西，与检查器描述自己要检查什么，在纯文本上
+> 无法区分」是同一个坑的两种形态：**自检里重实现一遍被测逻辑，等于没测。**
+
+`check_figures.mjs` 的 `--selftest` 自带零依赖 PNG 编码器（`crc32` +
+`encodePng` + `deflateSync`）合成用例，9 个用例里 3 条是 E-63 回归，
+输出 `自检通过（9 个用例，含 3 条 E-63 回归）`。
+
+### 29.2 反向标定：逐个把原缺陷注回去，确认自检真的会红
+
+**正向通过证明不了任何事** —— 一个永远返回 True 的用例在干净产物上也是绿的。
+
+| 注入 | 期望 | 实测 |
+|---|---|---|
+| `inkFailBlank: MIN_INK` → `INK_FAIL_MIN` | 回归 1/2 红 | ✅ `ReferenceError` |
+| `outPath` 改回 `join(dir, ...)` | 回归 2 红 | ✅ 第一版**不红**（假自检）→ 抽函数后红 |
+| 尾斜杠处理删掉 | 回归 3 红 | ✅ |
+
+**尾斜杠那条是修完才发现的第三个缺陷**：`dirname("a/b/figures/")` 给出
+`a/b/figures`（尾斜杠把最后一段当成文件名），报告落进 `figures/` 里与图混在一起。
+修法 `String(dirs[0]).replace(/[\\/]+$/, "")` 后再 `dirname`。
+
+### 29.3 自检必须接进 CI 与 pre-push —— 没人跑的自检是同一类缺陷
+
+写了 `--selftest` 却只在本地手敲，等于又造了一个"从未执行过的分支"。
+现在两处都接：
+
+| 位置 | 内容 |
+|---|---|
+| `.github/workflows/scrna_analysis.yml` | 「静态检查（不装依赖）」那一步跑 `check_legend_convention.mjs --selftest` + `check_figures.mjs --selftest` |
+| `governance/hooks/pre-push.mjs` | 新增 `SELFTESTS` 表，在**所有**静态门禁之后跑，日志标签是 `（自检）` |
+
+**日志标签必须区分"带镜像目录"与"带 `--selftest`"** —— 两者都走 `extraArgs`，
+但一个是拿真实产物判、一个是拿合成用例判，长得一样就没法排查。
+
+**`SELFTESTS` 的接线也做了反向标定**：把 `check_figures.mjs` 自检里
+"全白判红"用例的条件改成 `false` → pre-push 输出
+`✗ spatial-pipeline-skill tools/check_figures.mjs 未通过`、
+`PRE-PUSH 未通过：1 项判红 —— 禁止 push。` —— **说明接线真的会拦，
+而不是只在日志里多打一行 `✓`。**
+
+> **接了线但从不失败的检查，与没接线是一样的。** 每加一条自检，都要问
+> "我怎样让它红一次"——答不上来就说明它现在是个装饰。
+
+**两仓 `tools/check_figures.mjs` 与 `tools/check_legend_convention.mjs`
+各自必须逐字节相同**（`check_figures.mjs` 只在本仓与 spatial 仓之间，
+`check_legend_convention.mjs` 三仓同一份）。改一侧必须同步并比对 SHA256。
+
+
+
 
 

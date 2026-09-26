@@ -230,6 +230,14 @@ jobs:
           # 既有检查器全都看不见图例位置 —— 图例压在数据点上的图，
           # 在"文件存在 / 有墨迹 / 图名合规 / 配色合规 / 图幅合规"眼里都是合格的。
           node tools/check_legend_convention.mjs
+          # 门禁自己的自检。**没有自检的门禁只能证明"它没报错"，不能证明
+          # "它检查了"。** E-62：图例门禁的 Python 侧没抹注释，注释里一个
+          # `fig.legend(` 就让括号配平吞到文件尾，其后所有真调用一个都没查
+          # 而门禁照样打绿。E-63：`check_figures.mjs` 的 WARN 落盘分支从落地
+          # 起一次都没执行过（里面有两个必崩的错），因为 WARN 带 (2%,92%) 直到
+          # spatial 侧 R-04c 才第一次被触发。两条都是**自检用例里的回归项**。
+          node tools/check_legend_convention.mjs --selftest
+          node tools/check_figures.mjs --selftest
           # R 脚本的静态检查 + **R↔Python 的 CLI 契约**。
           # 后者是重点：R 的 DEFAULTS 参数名、Python 的 --xxx 拼写、R 写出的
           # 文件名、Python 读回的文件名，分布在两个语言里，**没有任何编译器
