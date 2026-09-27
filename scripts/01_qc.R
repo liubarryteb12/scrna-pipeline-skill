@@ -84,11 +84,19 @@ add_qc_metrics <- function(counts, organism = "Homo sapiens") {
   hb_hit <- genes %in% hb_genes
   mt_hit <- grepl(mt_pref, genes)
 
-  lib_size <- Matrix::colSums(counts)
-  n_genes <- Matrix::colSums(counts > 0)
+  # **counts 布局 细胞 x 基因：每细胞指标 = 行聚合（rowSums），不是 colSums**
+  # —— 之前误写 colSums 得到"每基因"长度 32738 的向量，data.frame 长度恰好
+  # 匹配 row.names=colnames(counts) 构造成功但语义全反，下游
+  # counts[keep_cell, ]（keep_cell 长 32738、行数 2700）报
+  # "logical subscript too long"（CI run8 实跑抓到）。
+  # run6 曾把 row.names 从 rownames(counts)（细胞名 2700）改成
+  # colnames(counts)（基因名 32738）——方向修反：metrics 每行=每细胞，
+  # 行名就该是 rownames(counts)=细胞名。两处一起修正。
+  lib_size <- Matrix::rowSums(counts)
+  n_genes <- Matrix::rowSums(counts > 0)
   n_detected <- function(hit) {
-    if (!any(hit)) return(rep(0, ncol(counts)))
-    Matrix::colSums(counts[, hit, drop = FALSE])
+    if (!any(hit)) return(rep(0, nrow(counts)))
+    Matrix::rowSums(counts[, hit, drop = FALSE])
   }
   pct <- function(num) ifelse(lib_size > 0, 100 * num / pmax(lib_size, 1), 0)
 
@@ -98,10 +106,8 @@ add_qc_metrics <- function(counts, organism = "Homo sapiens") {
          pct_counts_mt = as.numeric(pct(n_detected(mt_hit))),
          pct_counts_ribo = as.numeric(pct(n_detected(ribo_hit))),
          pct_counts_hb = as.numeric(pct(n_detected(hb_hit))),
-         # row.names 是**细胞名**：counts 布局 细胞x基因，指标按列（每细胞一行）
-         # —— 不能用 rownames(counts)（那是基因名，长度不匹配直接
-         # "row names supplied are of the wrong length"，CI run6 实跑抓到）。
-         row.names = colnames(counts)),
+         # row.names 是**细胞名**：counts 布局 细胞x基因，metrics 每行=每细胞。
+         row.names = rownames(counts)),
        qc_vars = c("mt", "ribo", "hb")[c(any(mt_hit), any(ribo_hit), any(hb_hit))],
        gene_sets = list(
          source = sets$source,
@@ -135,7 +141,9 @@ run_doublet <- function(counts, metrics, cfg) {
     rate <- min(0.10, max(0.01, 0.008 * n / 1000.0))
     rate_old <- min(0.10, max(0.05, 5000 / max(n, 1) * 0.01))
     set.seed(as.integer(cfg$analysis$seed))
-    out <- scDblFinder::scDblFinder(counts, dbr = rate, samples = NULL,
+    # scDblFinder 要求**基因 x 细胞**（rows=features）；counts 是 细胞x基因，
+    # 必须转置（colData 行=细胞，与 metrics 行序一致）。
+    out <- scDblFinder::scDblFinder(Matrix::t(counts), dbr = rate, samples = NULL,
                                     BPPARAM = BiocParallel::SerialParam())
     # out 是 SingleCellExperiment；scDblFinder 列在 colData
     cd <- SummarizedExperiment::colData(out)
