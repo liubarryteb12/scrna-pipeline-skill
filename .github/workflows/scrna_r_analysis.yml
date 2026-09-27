@@ -1,0 +1,187 @@
+name: scRNA analysis (R)
+
+# ============================================================================
+# R 版单细胞流水线 CI（r_version.md §8 的落地）
+# ============================================================================
+# 与 scrna_analysis.yml（Python）**并行、互不触发**：
+#   - paths 只认 .R / tools / assets / 本文件 —— **Python 文件的改动不触发 R job**
+#     （各跑各的，免得每次 Python 提交都白跑 10 分钟 R 环境）。
+#   - 两版共用同一份 assets/config.pbmc3k.yml（r_version.md §5：配置同一份文件），
+#     `pipeline.language` 顶层键决定两版谁跑：R 入口读到 python 报错退出，反之亦然。
+#
+# 设计原则照抄 geo_analysis.yml 已验证的模式（r_version.md §8 不用 renv 的裁决）：
+#   1. setup-r@v2 + use-public-rspm（release + P3M 二进制，钉旧版会退化成全量源码编译）；
+#   2. 手动 actions/cache 显式缓存 R 库（无 DESCRIPTION/lockfile 时
+#      setup-r-dependencies 自带缓存 0s 跳过）；
+#      **改 packages 清单必须手动递增 key 里的 vN** —— key 一旦存在不再写回，
+#      沿用旧 key 时新装的包每轮被丢掉重装一遍（geo bioc-v1→v5 的历史教训）；
+#   3. 静态检查在前、装依赖在后（语法错误 1 秒发现，不该等装完才知道）；
+#   4. 产物 artifact 必须上传，且 data/ 清单与脚本写出清单由
+#      check_artifact_paths.mjs --lang r 交叉核对（两份清单不一致时 job 绿
+#      但用户下载后缺文件）。
+# ============================================================================
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**/*.R"
+      - "tools/**"
+      - "assets/**"
+      - ".github/workflows/scrna_r_analysis.yml"
+  pull_request:
+    paths:
+      - "scripts/**/*.R"
+      - "tools/**"
+      - "assets/**"
+      - ".github/workflows/scrna_r_analysis.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pipeline-r:
+    runs-on: ubuntu-latest
+    # 首轮（冷缓存）要装 18 个包（含 Seurat/DESeq2/destiny/liana 这些大家伙，
+    # geo 全冷缓存实测约 720s），暖缓存整轮参照 geo 约 9 分钟。写 45 留余量：
+    # 被掐死的 job 存不下缓存，下一轮又是冷缓存 → "每次都超时"死循环。
+    timeout-minutes: 45
+
+    # 与 common.R env 钉定段同源的浮点钉定（geo_analysis.yml 同款）：
+    # 线程数与 OpenBLAS 内核是**两组独立问题**，只钉线程数不够（geo 规则 12 实测）。
+    env:
+      OMP_NUM_THREADS: 1
+      OPENBLAS_NUM_THREADS: 1
+      MKL_NUM_THREADS: 1
+      OPENBLAS_CORETYPE: Haswell
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 编译源码包（igraph/渲染后端等传递依赖）需要的系统库。
+      # 清单照抄 geo / Python workflow 的同一段 —— 少一个只会在装包时报
+      # 缺那个包名的错，不会告诉你缺的是哪个系统库。
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libcurl4-openssl-dev libssl-dev libxml2-dev \
+            libfontconfig1-dev libfreetype6-dev libharfbuzz-dev \
+            libfribidi-dev libpng-dev libtiff5-dev libjpeg-dev
+
+      - name: Setup R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: 'release'
+          use-public-rspm: true
+
+      # **改 scripts/r_deps.R 的清单必须递增这里的 vN。**
+      - name: Cache R library
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.R_LIBS_USER }}
+          key: rlib-${{ runner.os }}-scrna-r-v1
+          restore-keys: |
+            rlib-${{ runner.os }}-
+
+      # setup-r-dependencies 自己读包清单装；清单的唯一事实源是
+      # scripts/r_deps.R（r_version.md §6.4：不新增清单门禁，靠这份文件）。
+      - name: Install R packages
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::Seurat
+            any::harmony
+            any::sva
+            any::scDblFinder
+            any::scater
+            any::SingleR
+            any::celldex
+            any::DESeq2
+            any::destiny
+            any::slingshot
+            any::liana
+            any::scTenifoldKnk
+            any::yaml
+            any::jsonlite
+            any::digest
+            any::ggplot2
+            any::Matrix
+            any::patchwork
+          cache-version: 1
+
+      # liana 不在 CRAN（r_version.md §3 06 行的 A/B 裁决：走 GitHub 包）。
+      # 放在 setup-r-dependencies 之后单独装，避免它的 remotes 依赖拖慢主安装。
+      - name: Install liana from GitHub
+        run: |
+          if (!requireNamespace("remotes", quietly=TRUE)) install.packages("remotes")
+          if (!requireNamespace("liana", quietly=TRUE))
+            remotes::install_github("saezlab/liana")
+        shell: Rscript {0}
+
+      # 版本探针：r_deps.R 打印每包版本，有 MISSING 退出码 1。
+      # 纯诊断步骤，失败不拖垮整条流水线 —— 真正的硬门禁在流水线与验收层。
+      - name: Record R environment
+        continue-on-error: true
+        run: |
+          Rscript -e 'cat(R.version.string, "\n")'
+          Rscript scripts/r_deps.R
+
+      # tenifold_knk.R 的六条断言里有三条是"转置必须被拦住"，而转置不会报错、
+      # 状态字段看着全正常 —— 所以这条自检必须独立于流水线存在。
+      - name: Self-test the tenifold bridge
+        run: Rscript scripts/lib/tenifold_knk.R --selftest
+
+      # ---- 静态检查（不依赖分析产物）----
+      - name: Static gates (R side)
+        run: |
+          node tools/check_r_syntax.mjs
+          node tools/check_fig_names.mjs
+          node tools/check_palette.mjs
+          node tools/check_legend_convention.mjs
+          node tools/check_legend_convention.mjs --selftest
+          node tools/check_artifact_paths.mjs --lang r
+
+      - name: Run R analysis pipeline
+        run: Rscript scripts/main_analysis.R --config assets/config.pbmc3k.yml
+
+      # 验收只判断文件存在，不判断图有没有画出来（geo 规则：白图在
+      # "文件存在/大小正常"眼里是合格的）。独立解码 PNG 像素再判一次。
+      - name: Verify figures are not blank
+        run: node tools/check_figures.mjs results/pbmc3k/figures
+
+      - name: Verify figure widths fit a journal column
+        run: node tools/check_fig_sizes.mjs results/pbmc3k/figures
+
+      - name: Verify figure resolution reaches 300 dpi
+        run: node tools/check_fig_dpi.mjs results/pbmc3k/figures
+
+      - name: Summarise run
+        if: always()
+        run: |
+          echo "===== results ====="
+          find results -type f 2>/dev/null | sort | head -60 || true
+          echo "===== data ====="
+          find data -type f 2>/dev/null | sort | head -30 || true
+          echo "===== 验收结论 ====="
+          cat results/pbmc3k/acceptance.json 2>/dev/null | head -40 || echo "（无 acceptance.json）"
+
+      # always()：分析失败也要能拿到中间产物排查。
+      # data/ 侧清单与 scripts/*.R 的 file.path(data_dir,"X") 写出清单由
+      # 上面的 check_artifact_paths.mjs --lang r 交叉核对 —— **这里必须逐个
+      # 列举**（geo 的实测教训：验收 PASS ≠ 进了 artifact）。
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrna-r-results-${{ github.run_number }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            results/pbmc3k/
+            data/pbmc3k/raw.rds
+            data/pbmc3k/dataset_info.json
+            data/pbmc3k/qc_filtered.rds
+            data/pbmc3k/integrated.rds
+            data/pbmc3k/clustered.rds
