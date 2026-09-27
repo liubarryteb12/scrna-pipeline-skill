@@ -105,6 +105,8 @@ jobs:
             any::DESeq2
             any::destiny
             any::slingshot
+            any::bluster
+            any::cowplot
             any::scTenifoldKnk
             any::yaml
             any::jsonlite

@@ -333,7 +333,7 @@ MANIFEST_NAME <- "run_manifest.json"
 KEY_PACKAGES <- c(
   # 本仓 R 版按立项文档 §3 选定的方法栈
   "Seurat", "harmony", "sva", "scDblFinder", "scater", "SingleR", "celldex",
-  "DESeq2", "destiny", "slingshot", "liana", "scTenifoldKnk",
+  "DESeq2", "destiny", "slingshot", "bluster", "cowplot", "liana", "scTenifoldKnk",
   # 基础设施
   "yaml", "jsonlite", "digest", "ggplot2", "Matrix", "patchwork"
 )

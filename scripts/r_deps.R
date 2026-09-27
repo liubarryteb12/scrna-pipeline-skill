@@ -31,6 +31,8 @@ r_deps_packages <- c(
   "DESeq2",        # 04: pseudobulk DE（pydeseq2 的母实现，04=A）
   "destiny",       # 05: DiffusionMap + DPT（dpt 槽位，05=C）
   "slingshot",     # 05: 主曲线树拟时序（scfates 槽位；CRAN 无 scFates，§11 未决 1）
+  "bluster",       # 03: 图聚类 clusterRows/NNGraphParam（leiden；曾靠 scater 依赖链偶得，显式声明）
+  "cowplot",       # 03/05: get_legend 框外单列图例（曾靠 Seurat 依赖链偶得，显式声明）
   "liana",         # 06: 细胞通讯（liana_wrap rank_aggregate，06=A/B）
   "scTenifoldKnk", # 08: 网络扰动引擎（08=D，两版共用 tenifold_knk.R）
   # ---- 基础设施 ----
