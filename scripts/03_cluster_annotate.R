@@ -364,7 +364,7 @@ run_03_cluster_annotate <- function(cfg) {
       ggplot2::geom_point(size = 0.4) + theme_paper())
   p <- ggplot2::ggplot(dfc, ggplot2::aes(u1, u2, colour = leiden)) +
     ggplot2::geom_point(size = 0.4, alpha = 0.75) +
-    ggplot2::scale_colour_manual(values = PAL_CYCLE) +
+    ggplot2::scale_colour_manual(values = rep_len(PAL_CYCLE, max(length(ucl), length(PAL_CYCLE)))) +
     ggplot2::geom_point(data = cent, ggplot2::aes(x, y), colour = "black",
                         alpha = 0, size = 0.001) +   # 保持图层占位
     ggplot2::geom_text(data = cent, ggplot2::aes(x, y, label = lab),
