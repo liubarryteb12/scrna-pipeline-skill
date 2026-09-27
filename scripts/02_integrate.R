@@ -72,12 +72,16 @@ run_02_integrate <- function(cfg) {
   # R 版约定：metrics 的行名就是细胞名（01_qc.R 已保证）
 
   if (identical(hvg_flavor_used, "seurat_v3")) {
-    # 必须在 normalize 之前：vst 对**原始计数**做均值-方差稳定化拟合
+    # FindVariableFeatures(selection.method="vst") 默认读 **counts 层**
+    #（NormalizeData 只写 data 层，不改 counts）—— 因此先 Normalize 再
+    # 选 HVG 对 vst **结果无影响**；而 mean.var.plot/dispersion 口味读
+    # data 层、必须在 normalize 之后跑。两种口味共用这个顺序正确且必要。
+    # （旧注释「必须在 normalize 之前」与代码顺序矛盾、日志谎称先算 —— 已改。）
     obj <- Seurat::NormalizeData(obj, normalization.method = "LogNormalize",
                                  scale.factor = target_sum, verbose = FALSE)
     obj <- Seurat::FindVariableFeatures(obj, selection.method = "vst",
                                         nfeatures = n_top, verbose = FALSE)
-    log_info("HVG (vst, 用原始计数) 先算，再 normalize")
+    log_info("HVG (vst, 读 counts 层，与 normalize 顺序无关)")
   } else {
     obj <- Seurat::NormalizeData(obj, normalization.method = "LogNormalize",
                                  scale.factor = target_sum, verbose = FALSE)
@@ -93,8 +97,11 @@ run_02_integrate <- function(cfg) {
   # HVG 图：均值-离散度，标出被选中的。
   # **不调 Seurat::VariableFeaturePlot**：高层 API 自己建 figure、figsize
   # 不受控（Python 版实测 177.8mm 非标宽），样式门禁无从约束。
-  # 直接用 Assay 的 meta.features（FindVariableFeatures 写回的口径）自己画。
-  hv_info <- obj[["RNA"]]@meta.features
+  # 直接用 Assay 的 feature-level metadata（FindVariableFeatures 写回的口径）画。
+  # **槽名跨版本不同**：v3 Assay 是 @meta.features；Seurat 5 的 Assay5 改名
+  # @meta.data（feature-level），直取 @meta.features 会 no slot named 错。
+  hv_slot <- if (inherits(obj[["RNA"]], "Assay5")) "meta.data" else "meta.features"
+  hv_info <- slot(obj[["RNA"]], hv_slot)
   means <- as.numeric(hv_info$mean %||% Matrix::rowMeans(counts))
   # vst 口味的"离散度"列：Seurat 存 variance.standardized；其它口味用 dispersion
   disp_col <- if (identical(hvg_flavor_used, "seurat_v3")) "variance.standardized" else "dispersion"
@@ -208,7 +215,15 @@ run_02_integrate <- function(cfg) {
     # 在 log 数据上跑：取 NormalizeData 之后的 data 层
     log_expr <- as.matrix(Seurat::GetAssayData(obj, layer = "data")[hvg, , drop = FALSE])
     combat_out <- sva::ComBat(dat = log_expr, batch = as.factor(meta[[batch_key]]))
-    obj@assays$RNA@data[hvg, ] <- combat_out
+    # 写回 data 层：Seurat 5（Assay5）没有 @data 槽（是 layers list），
+    # 用 v5 语法 obj[["RNA"]]$data <- ...；旧 v3 对象才走 @data 槽。
+    if (inherits(obj[["RNA"]], "Assay5")) {
+      d5 <- obj[["RNA"]]$data
+      d5[hvg, ] <- combat_out
+      obj[["RNA"]]$data <- d5
+    } else {
+      obj@assays$RNA@data[hvg, ] <- combat_out
+    }
     obj <- Seurat::ScaleData(obj, features = hvg, verbose = FALSE)
     obj <- Seurat::RunPCA(obj, features = hvg, npcs = n_comps, verbose = FALSE)
     emb <- Seurat::Embeddings(obj, "pca")
