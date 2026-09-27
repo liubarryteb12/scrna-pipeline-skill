@@ -166,7 +166,9 @@ set_seed <- function(cfg) {
 # 内存里的消费者读到的已经是 NA）。调用点判空一律 `is.na()` / `!is.finite()`，
 # **不能用 `is.null()` 或真值判断**（`0` 是有效值，`FALSE` 也是）。
 finite_round <- function(x, ndigits = 4L) {
-  if (is.null(x) || length(x) == 0L || is.na(x)) return(NA_real_)
+  # 只收标量；向量误传时 is.na(x) 会返回向量让 if() 崩（run18 实锤）——
+  # 非标量直接 NA 并保持"算不出来"语义（调用方应改用 round()）。
+  if (is.null(x) || length(x) != 1L || is.na(x)) return(NA_real_)
   x <- suppressWarnings(as.numeric(x))
   if (length(x) != 1L || is.na(x) || !is.finite(x)) return(NA_real_)
   round(x, ndigits)

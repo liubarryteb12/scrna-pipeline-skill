@@ -126,6 +126,10 @@ compute_slingshot <- function(pca_emb, clusters, root_cluster, log = log_info) {
   sce <- SingleCellExperiment::SingleCellExperiment(
     assays = list(counts = Matrix::Matrix(0, 1, ncol(pca_emb), sparse = TRUE)),
     reducedDims = list(PCA = pca_emb))
+  # 占位 counts 没有细胞名 → SCE colnames 是自动序号，而 reducedDim PCA 行名是
+  # 真细胞名；slingshot 内部写 reducedDims 时 dimnames 校验不过
+  # （invalid 'value' in 'reducedDims<-'，run17/18 两跑同错）。显式对齐细胞名。
+  colnames(sce) <- rownames(pca_emb)
   sce$cluster <- factor(clusters)
   sling <- slingshot::slingshot(sce, clusterLabels = "cluster",
                                 reducedDim = "PCA", start.clus = root_cluster)
@@ -948,9 +952,9 @@ run_05_trajectory <- function(cfg) {
 
   # ---- 10. 每细胞拟时序落盘（供 07_grn 做 regulon×拟时序）----------------
   cell_df <- data.frame(cell = rownames(logcounts), leiden = clusters,
-                        consensus_pseudotime = finite_round(consensus, 6))
+                        consensus_pseudotime = round(consensus, 6))
   for (n in names(corrected)) {
-    cell_df[[paste0("pseudotime_", n)]] <- finite_round(corrected[[n]], 6)
+    cell_df[[paste0("pseudotime_", n)]] <- round(corrected[[n]], 6)
   }
   utils::write.csv(cell_df, file.path(res_dir, "pseudotime_per_cell.csv"),
                    row.names = FALSE)
