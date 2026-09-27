@@ -265,6 +265,11 @@ run_03_cluster_annotate <- function(cfg) {
   }
   log_info(sprintf("读入 %d 细胞 x %d 基因（use_rep=%s）",
                    nrow(counts), ncol(counts), use_rep))
+  # 02 落盘的中间对象是 细胞x基因（Python adata 语义）；Seurat API 要 **基因x细胞**。
+  # CI run11（36340148115）实锤：直接 CreateSeuratObject(counts=细胞x基因) 会把基因
+  # 当细胞建对象，随后 obj[["pca"]] <- pca_dr 因细胞名不匹配报
+  # `Cannot add new cells with [[<-`。统一在这里转一次，下游 Seurat 调用全用这个。
+  counts_gxc <- Matrix::t(counts)   # 基因x细胞（Seurat API 方向）
 
   rd <- cfg$reduce
   n_pcs <- as.integer(rd$n_pcs)
@@ -277,7 +282,7 @@ run_03_cluster_annotate <- function(cfg) {
   # embedding 作 DimReduc -> RunUMAP(reduction="pca", dims=1:n_pcs_use)。
   # **不是** RunUMAP(reduction.model=...) —— 那是"用已训好的 UMAP 模型投影
   # 新数据"的接口，给它传 PCA 矩阵语义就错了。
-  obj <- Seurat::CreateSeuratObject(counts = counts)
+  obj <- Seurat::CreateSeuratObject(counts = counts_gxc)   # 基因x细胞
   emb <- as.matrix(pca[, seq_len(min(n_pcs_use, ncol(pca))), drop = FALSE])
   colnames(emb) <- sprintf("PC_%d", seq_len(ncol(emb)))
   rownames(emb) <- rownames(pca)
@@ -297,7 +302,9 @@ run_03_cluster_annotate <- function(cfg) {
   # `cluster.args$partition_args` 透传 leiden 的 resolution。
   need_pkg("bluster")
   .clus_at <- function(res) {
-    bluster::clusterRows(t(emb), bluster::NNGraphParam(
+    # clusterRows 聚**行** = 观测：emb 是 细胞xPC，行已是细胞 —— 直接传，
+    # **不能 t()**（t 后行=PC，会去聚 40 个主成分，返回长度 40 与 2574 细胞静默错配）。
+    bluster::clusterRows(emb, bluster::NNGraphParam(
       k = k, cluster.fun = "leiden", weights.type = "jaccard",
       cluster.args = list(objective_function = "modularity",
                           resolution = res)))
@@ -337,7 +344,7 @@ run_03_cluster_annotate <- function(cfg) {
   res_used <- as.numeric(rd$resolution)
   idx <- which.min(abs(scan_res - res_used))
   clusters <- as.character(clus_saved[[idx]])
-  names(clusters) <- colnames(counts)
+  names(clusters) <- rownames(counts)   # 行名 = 细胞名（counts 是 细胞x基因）
   n_clusters <- length(unique(clusters))
   log_info(sprintf("最终聚类: %d 个簇（resolution=%.1f -> 扫描档 %.1f）",
                    n_clusters, res_used, scan_res[idx]))
@@ -372,7 +379,7 @@ run_03_cluster_annotate <- function(cfg) {
            width = W_ONE_HALF, height = mm(84))
 
   # ---- 4. Marker 基因（Seurat FindAllMarkers，wilcoxon 同法）--------------
-  obj <- Seurat::CreateSeuratObject(counts = counts)
+  obj <- Seurat::CreateSeuratObject(counts = counts_gxc)   # 基因x细胞（Seurat API 方向）
   obj <- Seurat::NormalizeData(obj, verbose = FALSE)
   obj@meta.data$leiden <- factor(clusters, levels = ucl)
   Seurat::Idents(obj) <- "leiden"
@@ -391,7 +398,7 @@ run_03_cluster_annotate <- function(cfg) {
   top3res <- top_markers_per_cluster(markers, 3L)
   top3 <- top3res$ordered
   top3_diag <- top3res$diag
-  all_genes <- rownames(logcounts)
+  all_genes <- colnames(logcounts)   # logcounts 是 细胞x基因，基因名在**列**
   top3 <- head(intersect(top3, all_genes), 24L)
   top3_diag$n_columns_after_cap <- length(top3)
   top3_diag$width_cap_note <- paste0(
