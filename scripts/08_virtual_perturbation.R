@@ -512,7 +512,7 @@ run_08_virtual_perturbation <- function(cfg) {
         ggplot2::labs(x = "mean manifold distance after knockout (log scale)",
                       y = NULL,
                       title = "Virtual knockout: predicted effect size\n(scTenifoldKnk tensor network, manifold distance; log axis)") +
-        ggplot2::theme_paper(base_size = 8) +
+        theme_paper(base_size = 8) +
         ggplot2::theme(legend.position = "none")
       fig_w <- min(W_ONE_HALF, max(W_SINGLE, 0.30 * nrow(d) + 3.0 * 25.4))
     }
@@ -526,7 +526,7 @@ run_08_virtual_perturbation <- function(cfg) {
       ggplot2::geom_col(fill = PAL$primary, width = 0.7) +
       ggplot2::labs(x = "knockout magnitude |Δz| × √Σw²", y = NULL,
                     title = "Virtual knockout: predicted effect size\n(one-hop linear propagation on a co-expression GRN)") +
-      ggplot2::theme_paper(base_size = 8) +
+      theme_paper(base_size = 8) +
       ggplot2::theme(legend.position = "none")
     fig_w <- W_ONE_HALF
   }

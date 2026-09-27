@@ -237,7 +237,9 @@ plot_qc_figures <- function(cfg, metrics) {
                              draw_quantiles = c(0.25, 0.5, 0.75)) +
         ggplot2::ggtitle(label)
     }
-    p <- p + ggplot2::theme_paper() +
+    # theme_paper 是 common.R 自定义主题 —— **不是 ggplot2 导出**，
+    # 加 ggplot2:: 前缀会报 "not an exported object"（CI run7 实跑抓到）。
+    p <- p + theme_paper() +
       ggplot2::theme(axis.title.x = ggplot2::element_blank(),
                      axis.text.x = ggplot2::element_blank(),
                      axis.ticks.x = ggplot2::element_blank())

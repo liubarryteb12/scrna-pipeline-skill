@@ -323,7 +323,7 @@ run_03_cluster_annotate <- function(cfg) {
                         colour = PAL$highlight, linetype = "dashed") +
     ggplot2::labs(x = "Leiden resolution", y = "number of clusters",
                   title = "Cluster count vs resolution") +
-    ggplot2::theme_paper()
+    theme_paper()
   save_fig(cfg, "02-03-01-unit1-cluster-resolution-scan", p,
            width = W_SINGLE, height = mm(58))
 
@@ -350,7 +350,7 @@ run_03_cluster_annotate <- function(cfg) {
   # 图例规则 31：框外右侧单列
   leg <- cowplot::get_legend(
     ggplot2::ggplot(dfc, ggplot2::aes(u1, u2, colour = leiden)) +
-      ggplot2::geom_point(size = 0.4) + ggplot2::theme_paper())
+      ggplot2::geom_point(size = 0.4) + theme_paper())
   p <- ggplot2::ggplot(dfc, ggplot2::aes(u1, u2, colour = leiden)) +
     ggplot2::geom_point(size = 0.4, alpha = 0.75) +
     ggplot2::scale_colour_manual(values = PAL_CYCLE) +
@@ -362,7 +362,7 @@ run_03_cluster_annotate <- function(cfg) {
     ggplot2::labs(x = "UMAP1", y = "UMAP2",
                   title = sprintf("Leiden clusters (n=%d, resolution=%s)",
                                   n_clusters, rd$resolution)) +
-    ggplot2::theme_paper() + ggplot2::theme(legend.position = "none")
+    theme_paper() + ggplot2::theme(legend.position = "none")
   p <- patchwork::wrap_plots(p, leg, ncol = 2, widths = c(3, 0.5))
   save_fig(cfg, "02-03-02-unit1-umap-clusters", p,
            width = W_ONE_HALF, height = mm(84))
@@ -439,7 +439,7 @@ run_03_cluster_annotate <- function(cfg) {
         ggplot2::scale_colour_viridis_c(name = "expression") +
         ggplot2::labs(title = sprintf("%s on UMAP (grey = not detected)", g),
                       x = "UMAP1", y = "UMAP2") +
-        ggplot2::theme_paper()
+        theme_paper()
       save_fig(cfg, sprintf("02-03-03-unit%d-marker-%s", gi + 1L, tolower(g)),
                pm, width = W_SINGLE, height = mm(58))
     }
@@ -510,7 +510,7 @@ run_03_cluster_annotate <- function(cfg) {
       ggplot2::scale_fill_viridis_c(name = "score") +
       ggplot2::labs(x = "cell type signature", y = "cluster",
                     title = "Mean signature score per cluster") +
-      ggplot2::theme_paper() +
+      theme_paper() +
       ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
     save_fig(cfg, "02-03-04-unit1-celltype-scores-heatmap", ph,
              width = mm(gs$width), height = mm(gs$height))

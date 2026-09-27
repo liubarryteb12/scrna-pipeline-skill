@@ -110,7 +110,7 @@ run_02_integrate <- function(cfg) {
                   y = sprintf("%s of genes", disp_col),
                   title = sprintf("HVG selection (%s, n=%d)\norange = highly variable; grey = other genes",
                                   hvg_flavor_used, n_hvg)) +
-    ggplot2::theme_paper()
+    theme_paper()
   save_fig(cfg, "02-02-01-unit1-hvg-selection", p,
            width = W_ONE_HALF, height = mm(70))
 
@@ -144,7 +144,7 @@ run_02_integrate <- function(cfg) {
     ggplot2::labs(x = "Principal component (rank)",
                   y = "log10(variance ratio)",
                   title = "PCA variance ratio (elbow)") +
-    ggplot2::theme_paper() +
+    theme_paper() +
     ggplot2::theme(panel.grid.major.y = ggplot2::element_line(
       linewidth = 0.25, colour = "grey85"))
   save_fig(cfg, "02-02-02-unit1-pca-variance-ratio", p,
@@ -235,7 +235,7 @@ run_02_integrate <- function(cfg) {
         ggplot2::geom_point(size = 0.4, alpha = 0.5) +
         ggplot2::ggtitle(sprintf("%s by %s", rep_nm, batch_key)) +
         ggplot2::labs(x = "dim 1", y = "dim 2") +
-        ggplot2::theme_paper()
+        theme_paper()
     })
     # 双面板 before/after（W_DOUBLE×64mm）；图例规则 31：框外右侧单列
     leg <- cowplot::get_legend(plots[[1]] + ggplot2::theme(legend.position = "right"))

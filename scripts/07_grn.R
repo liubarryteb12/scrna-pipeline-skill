@@ -345,7 +345,7 @@ run_07_grn <- function(cfg) {
                                           name = "z-scored activity") +
             ggplot2::labs(x = "consensus pseudotime bin (higher = later)",
                           y = NULL, title = "Regulon activity along pseudotime (z-scored)") +
-            ggplot2::theme_paper(base_size = 8) +
+            theme_paper(base_size = 8) +
             ggplot2::theme(axis.text.y = ggplot2::element_text(size = 6))
           save_fig(cfg, "02-07-01-unit1-tf-activity-vs-pseudotime", p,
                    width =  W_ONE_HALF, height =  fig_h)
@@ -379,7 +379,7 @@ run_07_grn <- function(cfg) {
                             y = "regulon activity",
                             title = sprintf("%s activity along pseudotime\n(mean \u00b1 1 SD per bin)", tf),
                             subtitle = NULL) +
-              ggplot2::theme_paper(base_size = 7) +
+              theme_paper(base_size = 7) +
               ggplot2::theme(legend.position = "none")
             save_fig(cfg, paste0(TF_FIG_BASE, ui + 1L, "-tf-",
                                  tolower(tf), "-trend"), pt_,
@@ -431,7 +431,7 @@ run_07_grn <- function(cfg) {
                                     name = "mean AUCell-style score") +
       ggplot2::labs(x = NULL, y = NULL,
                     title = "TF regulon activity by cluster (top by specificity)") +
-      ggplot2::theme_paper(base_size = 8) +
+      theme_paper(base_size = 8) +
       ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1,
                                                          size = 7))
     save_fig(cfg, "02-07-02-unit1-tf-activity-heatmap", p,
@@ -456,7 +456,7 @@ run_07_grn <- function(cfg) {
                   y = "cluster specificity",
                   title = paste0("Regulon specificity vs TF detection\n",
                                  "labels = top 8 by cluster specificity (auto-placed, non-overlapping)")) +
-    ggplot2::theme_paper(base_size = 8)
+    theme_paper(base_size = 8)
   save_fig(cfg, "02-07-03-unit1-tf-specificity-scatter", p,
            width =  W_ONE_HALF, height =  mm(70))
 

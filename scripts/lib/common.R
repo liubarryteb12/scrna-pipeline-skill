@@ -668,7 +668,9 @@ build_marker_dotplot_figure <- function(frac_df, z_df, group_label, title,
     ggplot2::scale_x_discrete(labels = sort_unique_labels(genes)) +
     ggplot2::labs(x = "gene", y = group_label, title = title,
                   subtitle = subtitle) +
-    ggplot2::theme_paper(base_size = 8) +
+    # theme_paper 是本文件自定义主题，不是 ggplot2 导出 —— 不能加 ggplot2::
+    # 前缀（"not an exported object"，CI run7 实跑抓到）。
+    theme_paper(base_size = 8) +
     ggplot2::theme(axis.text.x = ggplot2::element_text(
       angle = 90, hjust = 1, vjust = 0.4, size = 7),
       legend.box = "horizontal",

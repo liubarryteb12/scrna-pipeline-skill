@@ -388,7 +388,7 @@ run_06_communication <- function(cfg) {
     ggplot2::labs(x = "receiver", y = "ligand-receptor pair",
                   title = sprintf("Top %d ligand-receptor pairs by summed score",
                                   nrow(mat))) +
-    ggplot2::theme_paper(base_size = 8) +
+    theme_paper(base_size = 8) +
     ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
   save_fig(cfg, "02-06-01-unit1-communication-heatmap", p,
            width =  W_ONE_HALF, height =  fig_h_mm)

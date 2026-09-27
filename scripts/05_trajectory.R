@@ -128,9 +128,12 @@ compute_slingshot <- function(pca_emb, clusters, root_cluster, log = log_info) {
                                 reducedDim = "PCA", start.clus = root_cluster)
   # 多谱系时取第一谱系（pbmc3k 单主干；多分支数据集的谱系选择记进 status）
   pt <- as.numeric(SingleCellExperiment::colData(sling)$slingPseudotime_1)
-  lineages <- slingParams <- NULL
-  lineages <- slingshot::slingParams(sling)$lineages
-  if (is.null(lineages)) lineages <- "Lineage1"
+  # 谱系统计：slingshot 导出的是 slingLineages()（slingParams 返回的是
+  # 拟合参数 ifs/omega 等，没有 $lineages 槽 —— 之前误写会在 pbmc3k 上
+  # 永远走 fallback 报 1 条谱系，多谱系数据集会错报）。
+  lineages <- tryCatch(slingshot::slingLineages(sling),
+                       error = function(e) NULL)
+  if (is.null(lineages) || length(lineages) == 0L) lineages <- "Lineage1"
   list(pseudotime = pt,
        n_lineages = length(lineages),
        lineages = as.character(lineages))
@@ -338,7 +341,7 @@ run_05_trajectory <- function(cfg) {
                        size = 2.4, vjust = -0.9) +
     ggplot2::labs(x = "UMAP1", y = "UMAP2",
                   title = "Cluster connectivity graph (edge width = connectivity)") +
-    ggplot2::theme_paper()
+    theme_paper()
   save_fig(cfg, "02-05-01-unit1-paga-graph", p, width = W_ONE_HALF, height = mm(66))
 
   # ---- 2. GCS：既是方法也是选根依据 ---------------------------------------
@@ -501,7 +504,7 @@ run_05_trajectory <- function(cfg) {
                                   midpoint = 0, limits = c(-1, 1), name = "Spearman") +
     ggplot2::labs(x = NULL, y = NULL,
                   title = "Pseudotime agreement (Spearman, direction-corrected)") +
-    ggplot2::theme_paper() +
+    theme_paper() +
     ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 40, hjust = 1))
   save_fig(cfg, "02-05-02-unit1-trajectory-method-correlation", p,
            width = W_SINGLE, height = mm(66))
@@ -640,7 +643,7 @@ run_05_trajectory <- function(cfg) {
       ggplot2::labs(x = "pseudotime bin", y = "gene (grouped by module)",
                     title = sprintf("Genes along pseudotime, %d modules\ncolour = z-scored mean expression (shared scale -2..2)",
                                     N_MODULES)) +
-      ggplot2::theme_paper() +
+      theme_paper() +
       ggplot2::theme(axis.text.y = ggplot2::element_blank(),
                      axis.ticks.y = ggplot2::element_blank())
     save_fig(cfg, "02-05-03-unit1-trajectory-modules-heatmap", p,
@@ -656,7 +659,7 @@ run_05_trajectory <- function(cfg) {
       ggplot2::geom_line(linewidth = 0.5) +
       ggplot2::labs(x = "pseudotime bin", y = "z-scored mean",
                     title = "Module profiles along pseudotime") +
-      ggplot2::theme_paper()
+      theme_paper()
     save_fig(cfg, "02-05-03-unit2-trajectory-module-profiles", p,
              width = W_ONE_HALF, height = mm(70))
   }
@@ -772,7 +775,7 @@ run_05_trajectory <- function(cfg) {
     ggplot2::scale_colour_viridis_c(name = "pseudotime (higher = later)") +
     ggplot2::labs(x = "UMAP1", y = "UMAP2",
                   title = sprintf("Consensus pseudotime (root = cluster %s)", root_cluster)) +
-    ggplot2::theme_paper()
+    theme_paper()
   save_fig(cfg, "02-05-04-unit1-pseudotime-consensus", p,
            width = W_ONE_HALF, height = mm(58))
 
@@ -799,7 +802,7 @@ run_05_trajectory <- function(cfg) {
     ggplot2::labs(x = "UMAP1", y = "UMAP2",
                   title = sprintf("Consensus pseudotime with PAGA skeleton (%d strong edges, width ∝ connectivity > 0.15)", n_edges),
                   subtitle = sprintf("arrows point along increasing pseudotime; open circle = root cluster %s", root_cluster)) +
-    ggplot2::theme_paper()
+    theme_paper()
   if (n_edges) {
     p <- p + ggplot2::geom_segment(data = arrows_df,
                                    ggplot2::aes(x = x, y = y, xend = xend, yend = yend,
@@ -826,7 +829,7 @@ run_05_trajectory <- function(cfg) {
       ggplot2::scale_colour_viridis_c(name = "pseudotime") +
       ggplot2::labs(x = "UMAP1", y = "UMAP2",
                     title = "DPT pseudotime (direction-corrected)") +
-      ggplot2::theme_paper()
+      theme_paper()
     save_fig(cfg, "02-05-04-unit2-pseudotime-dpt", p,
              width = W_ONE_HALF, height = mm(58))
   }
@@ -837,7 +840,7 @@ run_05_trajectory <- function(cfg) {
       ggplot2::geom_point(size = 0.4) +
       ggplot2::labs(x = "UMAP1", y = "UMAP2",
                     title = "celltype on the same UMAP (pseudotime context)") +
-      ggplot2::theme_paper()
+      theme_paper()
     save_fig(cfg, "02-05-04-unit3-celltype-on-umap", p,
              width = W_ONE_HALF, height = mm(58))
   } else {
@@ -869,7 +872,7 @@ run_05_trajectory <- function(cfg) {
     ggplot2::labs(x = "cluster (ordered by median consensus pseudotime)",
                   y = "consensus pseudotime (higher = later)",
                   title = "Pseudotime distribution per cluster") +
-    ggplot2::theme_paper() +
+    theme_paper() +
     ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 40, hjust = 1))
   # **ns 必须写出来**：全局 Kruskal-Wallis，不显著就写 ns
   ok_groups <- split(consensus[is.finite(consensus)], clusters[is.finite(consensus)])
@@ -926,7 +929,7 @@ run_05_trajectory <- function(cfg) {
         ggplot2::labs(x = "consensus pseudotime (higher = later)", y = "cluster",
                       title = "Pseudotime density per cluster (ridgeline)",
                       subtitle = "KDE per cluster, offset vertically; not a new dependency (stats::density)") +
-        ggplot2::theme_paper() +
+        theme_paper() +
         ggplot2::theme(axis.text.y = ggplot2::element_blank(),
                        axis.ticks.y = ggplot2::element_blank())
       save_fig(cfg, "02-05-05-unit2-pseudotime-ridgeline", p,
