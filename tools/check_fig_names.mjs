@@ -101,12 +101,21 @@ function collectLiterals(src) {
   const out = [];
   const lineOf = (idx) => src.slice(0, idx).split(/\r?\n/).length;
   // 只认"长得像图名"的字面量：以 <阶段>- 开头。
-  // **含 { } 的 f-string 模板跳过** —— 那是运行时拼名（须配 DYNAMIC_FIG_BASES
-  // 声明豁免），对它做格式校验只会逼人写绕过式拼接。
+  // **含 { } 的 f-string 模板跳过**（Python 运行时拼名）；**含 %d/%s 等
+  // sprintf 占位符的同样跳过**（R 运行时拼名，`sprintf("...-unit%d-...")`）
+  // —— 两者都是动态名（须配 DYNAMIC_FIG_BASES 声明豁免），对模板做
+  // 格式校验只会逼人写绕过式拼接。
   const re = new RegExp(`"(${PART}-[^"]*)"`, "g");
   let m;
   while ((m = re.exec(src)) !== null) {
     if (m[1].includes("{") || m[1].includes("}")) continue;
+    if (/%(?:\d+\$)?[-#0 +]*\d*(?:\.\d+)?[dioxXufeEgGcs]/.test(m[1])) continue;
+    // **拼接前缀跳过**：Python `"-".join(["02","07","01","unit"])` 与 R
+    // `TF_FIG_BASE <- "02-07-01-unit"` 都是把 base 存成变量、运行时拼
+    // unit 号——它是 DYNAMIC_FIG_BASES 的配套物，不是完整图名。判据：
+    // 以 `-unit` 结尾且后面没有 slug，NAME_RE 必然拒绝它。跳过它，
+    // 让动态账目走 DYNAMIC_FIG_BASES 豁免，而不是逼人把前缀藏进绕过式写法。
+    if (/-unit$/.test(m[1])) continue;
     out.push({ name: m[1].replace(/\.(pdf|png)$/i, ""), line: lineOf(m.index) });
   }
   return out;
@@ -130,6 +139,9 @@ function collectCalls(src) {
       byLine.set(lineOf(m.index), m[1].replace(/\.(pdf|png)$/i, ""));
     }
   }
+  // R 侧 `save_fig(cfg, sprintf("...-unit%d-...", ...))`：调用点存在、
+  // 名字是运行时拼的 —— 匹配不到字面量自然记 null（账目对齐用），
+  // 由 DYNAMIC_FIG_BASES 豁免。无需额外处理：lit 正则匹配不到 sprintf 行。
   for (const { re } of patterns) {
     let m;
     while ((m = re.exec(src)) !== null) {
@@ -184,23 +196,38 @@ for (const f of scripts) {
     byName.set(item.name, item.line);
     figs.push({ fig: Number(m[2]), unit: Number(m[3]), name: item.name, line: item.line });
 
-    // **跨脚本重名才算问题**（同一脚本内重复是记账引用）
-    if (seen.has(item.name)) {
+    // **跨脚本重名才算问题**（同一脚本内重复是记账引用）。
+    // **§6.1 语言分域**：仓库同时含 `.py` 与 `.R` 时（R 版与 Python 版
+    // 并存，r_version.md §4 图名集合相等是**设计目标**），重名判定按
+    // 语言分域 —— `seen` 的键是 `<lang>:<name>`。同名图两版各写一份
+    // 不算冲突：两版互斥运行（config 顶层 pipeline.language 决定跑哪版）。
+    const lang = f.endsWith(".R") ? "r" : "py";
+    const seenKey = `${lang}:${item.name}`;
+    if (seen.has(seenKey)) {
       problems.push(
-        `${f}:${item.line} 名字 "${item.name}" 与 ${seen.get(item.name)} 重复 —— 两个脚本写同一个文件`
+        `${f}:${item.line} 名字 "${item.name}" 与 ${seen.get(seenKey)} 重复 —— 两个脚本写同一个文件`
       );
     } else {
-      seen.set(item.name, `${f}:${item.line}`);
+      seen.set(seenKey, `${f}:${item.line}`);
     }
   }
 
   // **声明式动态名豁免**：脚本可写 DYNAMIC_FIG_BASES = {"<figNo>": <count>}
   // 声明某图号下有 N 张运行时命名的单图。豁免账目差并把该图号计为存在。
+  // Python 写法 `DYNAMIC_FIG_BASES = {"03": 8}`；R 写法
+  // `DYNAMIC_FIG_BASES <- list("03" = 8L)` —— 两个赋值符都认。
   let dynBases = {};
-  const dynM = src.match(/DYNAMIC_FIG_BASES\s*=\s*\{([^}]*)\}/);
+  let dynM = src.match(/DYNAMIC_FIG_BASES\s*=\s*\{([^}]*)\}/);
   if (dynM) {
     for (const [, k, v] of dynM[1].matchAll(/"(\d{2})"\s*:\s*(\d+)/g)) {
       dynBases[k] = Number(v);
+    }
+  } else {
+    dynM = src.match(/DYNAMIC_FIG_BASES\s*<-\s*list\(([^)]*)\)/);
+    if (dynM) {
+      for (const [, k, v] of dynM[1].matchAll(/"(\d{2})"\s*=\s*(\d+)/g)) {
+        dynBases[k] = Number(v);
+      }
     }
   }
 
@@ -258,7 +285,7 @@ for (const f of scripts) {
 }
 
 console.log(`检查 ${repoName}（阶段 ${PART}）`);
-console.log(`  ${scripts.length} 个脚本，${nCallsTotal} 处出图调用，${seen.size} 个唯一图名`);
+console.log(`  ${scripts.length} 个脚本，${nCallsTotal} 处出图调用，${seen.size} 个唯一图名（按语言分域）`);
 const multi = [...seen.keys()].filter((n) => /-unit[2-9]/.test(n));
 console.log(`  多单元图：${multi.length ? multi.join(", ") : "（无）"}`);
 if (notes.length) {

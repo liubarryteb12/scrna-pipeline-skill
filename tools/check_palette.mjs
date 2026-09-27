@@ -21,6 +21,11 @@
  *      "rcParams 说 A、样式文件说 B"，而 `apply_style()` 里
  *      `rcParams["axes.prop_cycle"] = cycler(color=PAL_CYCLE)` 会让
  *      common.py 那一份悄悄赢 —— 样式文件于是变成一句谎话。
+ *   6. **R 侧双语一致性（r_version.md §6.3）。** `scripts/lib/common.R`
+ *      里的 `PAL <- list(...)` / `PAL_CYCLE <- c(...)` 与 Python 侧必须
+ *      **逐位相同**（键集 + 每个色值 + 循环顺序）。两份独立定义改一处
+ *      不改另一处，同一簇在 Python 图和 R 图上就是两种颜色 ——
+ *      跨语言对照（"两版产物可逐图比对"）会静默失效。
  *
  * 用法：node tools/check_palette.mjs
  */
@@ -31,6 +36,7 @@ import { dirname, join } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = join(here, "..");
 const commonPath = join(repo, "scripts", "lib", "common.py");
+const commonRPath = join(repo, "scripts", "lib", "common.R");
 const stylePath = join(repo, "assets", "publication.mplstyle");
 
 // ---- 色彩空间（与 geo 侧逐行相同）-----------------------------------------
@@ -136,6 +142,33 @@ for (const tok of cycBlock[1].matchAll(/PAL\[\s*"(\w+)"\s*\]|"(#[0-9A-Fa-f]{6})"
 }
 if (CYCLE.length === 0) throw new Error("PAL_CYCLE 解析出 0 个色值");
 
+// ---- 从 common.R 解析 R 侧色板（r_version.md §6.3 双语判据）-----------------
+// R 形态：PAL <- list(name = "#RRGGBB", ...)（带引号/不带引号的键都要认）
+//         PAL_CYCLE <- c(PAL$blue, PAL$vermillion, ..., "#A8A8A8")
+// 与 Python 解析同样的陷阱：PAL$xxx 引用要解引用，字面量要直读。
+const rSrc = readFileSync(commonRPath, "utf8");
+
+const rPalBlock = rSrc.match(/^PAL\s*<-\s*list\(([\s\S]*?)^\)/m);
+if (!rPalBlock) throw new Error("common.R 里找不到 PAL <- list( ... )");
+const PAL_R = {};
+for (const m of rPalBlock[1].matchAll(/(?:"(\w+)"|(\w+))\s*=\s*"(#[0-9A-Fa-f]{6})"/g)) {
+  PAL_R[(m[1] ?? m[2])] = m[3].toUpperCase();
+}
+if (Object.keys(PAL_R).length === 0) throw new Error("common.R 的 PAL 解析出 0 个色值");
+
+const rCycBlock = rSrc.match(/^PAL_CYCLE\s*<-\s*c\(([\s\S]*?)\)\s*(?:#.*)?$/m);
+if (!rCycBlock) throw new Error("common.R 里找不到 PAL_CYCLE <- c( ... )");
+const CYCLE_R = [];
+for (const tok of rCycBlock[1].matchAll(/PAL\$(\w+)|"(#[0-9A-Fa-f]{6})"/g)) {
+  if (tok[1] !== undefined) {
+    if (!(tok[1] in PAL_R)) throw new Error(`common.R 的 PAL_CYCLE 引用了不存在的 PAL$${tok[1]}`);
+    CYCLE_R.push(PAL_R[tok[1]]);
+  } else {
+    CYCLE_R.push(tok[2].toUpperCase());
+  }
+}
+if (CYCLE_R.length === 0) throw new Error("common.R 的 PAL_CYCLE 解析出 0 个色值");
+
 // ---- 从 .mplstyle 解析分类循环色 -------------------------------------------
 const styleSrc = readFileSync(stylePath, "utf8");
 const cycLine = styleSrc.match(/^axes\.prop_cycle:.*$/m);
@@ -219,9 +252,33 @@ for (const [n, hx] of Object.entries(PAL)) {
   }
 }
 
+// ---- 判据 6：R 侧 PAL/PAL_CYCLE 与 Python 逐位相同（r_version.md §6.3）------
+// 键集、每个色值、循环顺序三者都比对。顺序也重要：同一簇号在两版图上
+// 必须映射到同一种颜色，否则跨语言对照失效。
+const pyKeys = Object.keys(PAL);
+const rKeys = Object.keys(PAL_R);
+const onlyPy = pyKeys.filter((k) => !(k in PAL_R));
+const onlyR = rKeys.filter((k) => !(k in PAL));
+for (const k of onlyPy) problems.push(`R 侧 PAL 缺键 "${k}"（Python 侧 = ${PAL[k]}）—— 两版色板必须逐位相同`);
+for (const k of onlyR) problems.push(`Python 侧 PAL 缺键 "${k}"（R 侧 = ${PAL_R[k]}）—— 两版色板必须逐位相同`);
+for (const k of pyKeys.filter((k) => k in PAL_R)) {
+  if (PAL[k] !== PAL_R[k]) {
+    problems.push(`PAL["${k}"] 两版不同：common.py ${PAL[k]} vs common.R ${PAL_R[k]}`);
+  }
+}
+if (CYCLE.join(",") !== CYCLE_R.join(",")) {
+  problems.push(
+    `PAL_CYCLE 两版循环顺序/取值不一致 ——\n` +
+      `      common.py : ${CYCLE.join(" ")}\n` +
+      `      common.R  : ${CYCLE_R.join(" ")}\n` +
+      `      同一簇号在两版图上映射到不同颜色，跨语言对照失效`
+  );
+}
+
 // ---- 报告 ------------------------------------------------------------------
 console.log(`检查 ${commonPath}`);
-console.log(`PAL ${Object.keys(PAL).length} 个色值 / PAL_CYCLE ${CYCLE.length} 色 / 样式文件 ${STYLE_CYCLE.length} 色`);
+console.log(`检查 ${commonRPath}（R 侧双语判据 §6.3）`);
+console.log(`PAL ${Object.keys(PAL).length} 个色值 / PAL_CYCLE ${CYCLE.length} 色 / 样式文件 ${STYLE_CYCLE.length} 色 / R 侧 PAL ${rKeys.length} 个 / R 侧 CYCLE ${CYCLE_R.length} 色`);
 console.log(`\n白底对比度：\n${rows.join("\n")}`);
 console.log(`\n分类循环色（按 draw 顺序）：`);
 CYCLE.forEach((hx, i) => {

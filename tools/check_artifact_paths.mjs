@@ -13,21 +13,35 @@
  *
  * 做法：
  *   1. 从 workflow 里解析 artifact 的 `path:` 块
- *   2. 从 scripts/**.py 里抓 `data_dir / "X"` 与 `Path(...data_dir...) / "X"` 字面量
+ *   2. 从 scripts/**.py 与 scripts/**.R 里抓 data_dir 下的文件名字面量：
+ *      Python 形态 `data_dir / "X"`，R 形态 `file.path(data_dir, "X")`
  *   3. 差集 = 写了但没上传的文件
  *
  * 只检查 data/（大文件、二进制、真正会被漏的那一类）。
  * results/ 整个目录上传，不需要逐文件核对。
  *
- * 用法: node tools/check_artifact_paths.mjs
- * 退出码: 0 = 一致；1 = 有文件写了但不在 artifact 清单里
+// 用法: node tools/check_artifact_paths.mjs [--lang py|r] [--wf <workflow 文件名>]
+//       缺省 --lang py + scrna_analysis.yml（Python 流水线，只扫 .py）；
+//       R 流水线用 --lang r --wf scrna_r_analysis.yml（只扫 .R）。
+//       **语言必须分域**：中间对象不跨语言（r_version.md §5，.h5ad vs .rds），
+//       一份混合扫描对任何单一 workflow 清单都永远红（E-29：常红门禁=没门禁）。
+// 退出码: 0 = 一致；1 = 有文件写了但不在 artifact 清单里
  */
 
 import { readdirSync, readFileSync, existsSync } from "node:fs";
 import { join, relative } from "node:path";
 
+const argv = process.argv.slice(2);
+function argOf(name, dflt) {
+  const i = argv.indexOf(name);
+  return i >= 0 && argv[i + 1] ? argv[i + 1] : dflt;
+}
+const LANG = argOf("--lang", "py");
+const WF_NAME = argOf("--wf", LANG === "r" ? "scrna_r_analysis.yml" : "scrna_analysis.yml");
+const EXT = LANG === "r" ? ".R" : ".py";
+
 const REPO = new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
-const WF = join(REPO, ".github", "workflows", "scrna_analysis.yml");
+const WF = join(REPO, ".github", "workflows", WF_NAME);
 
 if (!existsSync(WF)) {
   console.error(`找不到 workflow: ${WF}`);
@@ -65,22 +79,25 @@ function walk(dir, out = []) {
     if (e.isDirectory()) {
       if (e.name === "__pycache__" || e.name.startsWith(".")) continue;
       walk(p, out);
-    } else if (e.name.endsWith(".py")) {
+    } else if (e.name.endsWith(EXT)) {
       out.push(p);
     }
   }
   return out;
 }
 
-const pyFiles = walk(join(REPO, "scripts"));
+const srcFiles = walk(join(REPO, "scripts"));
 const written = new Map();   // 文件名 -> 首次出现的 文件:行
-// 匹配:  data_dir / "X"
-const RE = /data_dir\s*\/\s*"([^"]+)"/g;
+// Python:  data_dir / "X"；R: file.path(data_dir, "X")
+// 两个 regex 都保留（R 脚本里不会出现 Python 形态，反之亦然，互不干扰）。
+const RE = /data_dir\s*\/\s*"([^"]+)"/g;               // Python 形态
+const RE_R = /file\.path\(\s*data_dir\s*,\s*"([^"]+)"\s*\)/g;  // R 形态
 
-for (const f of pyFiles) {
+for (const f of srcFiles) {
   const rel = relative(REPO, f).replace(/\\/g, "/");
   readFileSync(f, "utf8").split(/\r?\n/).forEach((line, i) => {
-    for (const m of line.matchAll(RE)) {
+    const res = [...line.matchAll(RE), ...line.matchAll(RE_R)];
+    for (const m of res) {
       const name = m[1];
       if (name.includes("/")) continue;          // 只关心 data/ 顶层文件
       // **跳过目录。** `data_dir / "cache"` 是解压/下载缓存目录，
@@ -107,6 +124,7 @@ const missing = [...written.entries()]
   .filter(([name]) => !inArtifact.has(name))
   .sort();
 
+console.log(`检查 workflow: ${WF_NAME}`);
 console.log(`artifact 清单: ${artifactPaths.length} 项，其中 data/ 下 ${inArtifact.size} 项`);
 console.log(`脚本写出的 data/ 文件: ${written.size} 个`);
 

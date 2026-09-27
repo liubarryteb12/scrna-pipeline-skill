@@ -296,7 +296,7 @@ R 版入口脚本的验收层必须复刻 `scripts/main_analysis.py` 的 `run_ac
 
 ## 11. 未决问题（R-07/R-09 要回来拍板的）
 
-1. **`scFates` 是否在 CRAN 上可装**（§3 05 行）—— 装不上退 `monocle3`/`slingshot`。
+1. **`scFates` 是否在 CRAN 上可装**（§3 05 行）—— **已核实（2026-09-26，R-07）：CRAN 上没有 `scFates`（HTTP 404，带 Chrome UA 复核非拦截），也没有任何同名 R 包 —— "CRAN 原版 scFates" 这个说法本身不成立**（Python `scFates` 从未发布 R 版）。按预案退回 Bioconductor：`slingshot`（HTTP 200）作主曲线树实现 + `TSCAN`（HTTP 200）备选；`destiny`（HTTP 200）承接 DPT。**裁决：05 行的 R 版方法集 = 自实现 GCS（与 Python 逐行同式）+ `destiny::DiffusionMap`+DPT + `slingshot`（主曲线拟时序，对应 scfates 槽位）；`stable_methods = ["dpt","slingshot","cytotrace"]`。** 方法学等级仍记 C（实现全换）；slingshot 的可复现性**没有六轮 CI 证据**，`reproducibility` 段的 stable/unstable 名单与证据文字必须改写、不能照抄 Python 版的 scfates 段。
 2. **`liana` R 版从 GitHub 装**的版本漂移（§3 06 行）—— 是否要钉 commit。
 3. **`AddModuleScore` 与 `score_genes` 的 bin 数**（§3 03 行）—— 配置里显式对齐，
    还是文档里标注差异。
