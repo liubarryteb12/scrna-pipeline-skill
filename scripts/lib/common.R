@@ -53,9 +53,14 @@ if (is.na(Sys.getenv("PYTHONHASHSEED", unset = NA))) Sys.setenv(PYTHONHASHSEED =
 # R 自身的 RNG 也要钉：默认 Mersenne-Twister + Inversion 是稳定的，
 # 但 `sample()` 的特殊分支（sample(1:n) vs sample(x)）随版本变过 ——
 # 这里把 kind 显式写死，不赌 R 版本默认值。
+# **第三个参数（sample_kind）只接受 "Rejection"/"Rounding"** ——
+# 曾写过的 "Reproducible" 不是合法 choice，R 4.6（CI 实跑 run 36308546495）
+# 直接 stop("'NA' is not a valid choice")：R 把非法值替换成 NA 再校验，
+# 报错文本里看到的是 NA 不是原值，grep 原值是搜不到的。9 个步骤每步都调
+# set_seed → 全部以同一错误失败。
 options(stringsAsFactors = FALSE)
 ScrnaRNGKind <- function() {
-  RNGkind("Mersenne-Twister", "Inversion", "Reproducible")
+  RNGkind("Mersenne-Twister", "Inversion", "Rejection")
 }
 
 # ============================================================================
