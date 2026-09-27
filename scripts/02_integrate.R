@@ -102,10 +102,23 @@ run_02_integrate <- function(cfg) {
   # @meta.data（feature-level），直取 @meta.features 会 no slot named 错。
   hv_slot <- if (inherits(obj[["RNA"]], "Assay5")) "meta.data" else "meta.features"
   hv_info <- slot(obj[["RNA"]], hv_slot)
-  means <- as.numeric(hv_info$mean %||% Matrix::rowMeans(counts))
-  # vst 口味的"离散度"列：Seurat 存 variance.standardized；其它口味用 dispersion
-  disp_col <- if (identical(hvg_flavor_used, "seurat_v3")) "variance.standardized" else "dispersion"
-  disp <- as.numeric(hv_info[[disp_col]] %||% rep(NA_real_, ncol(counts)))
+  # Seurat 5（Assay5/StdAssay）FVF 写回 feature-level metadata 时列名带
+  # key 前缀：vst.mean / vst.variance.standardized（v3 是裸 mean/dispersion）。
+  # 直取裸名拿不到 → NULL → 触发 fallback；而 fallback rowMeans(counts)
+  # 是"每细胞"（2574），与每基因（13714）列混排 → data.frame 报
+  # "differing number of rows: 2574, 13714"（CI run10 实跑抓到）。
+  # 统一做法：两种前缀都容错；fallback 一律按**每基因**方向（colMeans）。
+  hv_cols <- colnames(slot(obj[["RNA"]], hv_slot))
+  pick_col <- function(bare, prefixed) {
+    for (cn in c(prefixed, bare)) if (cn %in% hv_cols) return(cn)
+    NULL
+  }
+  mean_col <- pick_col("mean", "vst.mean")
+  # 离散度列：vst 口味存 variance.standardized（v3 口味才叫 dispersion）
+  disp_col_used <- pick_col("dispersion",
+                            if (identical(hvg_flavor_used, "vst")) "vst.variance.standardized" else "variance.standardized")
+  means <- if (!is.null(mean_col)) as.numeric(hv_info[[mean_col]]) else as.numeric(Matrix::colMeans(counts))
+  disp  <- if (!is.null(disp_col_used)) as.numeric(hv_info[[disp_col_used]]) else rep(NA_real_, ncol(counts))
   hv_flag <- colnames(counts) %in% hvg
   df <- data.frame(means = means, disp = disp,
                    hv = ifelse(hv_flag, "highly variable genes", "other genes"))
@@ -114,7 +127,7 @@ run_02_integrate <- function(cfg) {
     ggplot2::scale_colour_manual(values = c("highly variable genes" = PAL$highlight,
                                             "other genes" = PAL$muted)) +
     ggplot2::labs(x = "mean expression of genes",
-                  y = sprintf("%s of genes", disp_col),
+                  y = sprintf("%s of genes", disp_col_used %||% "dispersion"),
                   title = sprintf("HVG selection (%s, n=%d)\norange = highly variable; grey = other genes",
                                   hvg_flavor_used, n_hvg)) +
     theme_paper()
