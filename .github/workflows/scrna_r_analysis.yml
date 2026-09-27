@@ -87,6 +87,10 @@ jobs:
 
       # setup-r-dependencies 自己读包清单装；清单的唯一事实源是
       # scripts/r_deps.R（r_version.md §6.4：不新增清单门禁，靠这份文件）。
+      # **liana 不在这里**：它不在 CRAN/BioC，pak 的 solver 会直接
+      # "Can't find package called any::liana"，而且一个包无解会让整个
+      # lockfile_create 整体失败、把其他包也拖成 "dependency conflict"
+      # （首跑 36304329555 的实测报错形态）。liana 在下面单独装。
       - name: Install R packages
         uses: r-lib/actions/setup-r-dependencies@v2
         with:
@@ -101,7 +105,6 @@ jobs:
             any::DESeq2
             any::destiny
             any::slingshot
-            any::liana
             any::scTenifoldKnk
             any::yaml
             any::jsonlite
@@ -111,8 +114,9 @@ jobs:
             any::patchwork
           cache-version: 1
 
-      # liana 不在 CRAN（r_version.md §3 06 行的 A/B 裁决：走 GitHub 包）。
-      # 放在 setup-r-dependencies 之后单独装，避免它的 remotes 依赖拖慢主安装。
+      # liana 不在 CRAN/BioC（r_version.md §3 06 行的 A/B 裁决：走 GitHub 包）。
+      # remotes 可能在装依赖时已被带出，缺了就补装。放在
+      # setup-r-dependencies 之后：主 solver 只认 CRAN/BioC，GitHub 包不放进去。
       - name: Install liana from GitHub
         run: |
           if (!requireNamespace("remotes", quietly=TRUE)) install.packages("remotes")
