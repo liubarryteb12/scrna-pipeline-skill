@@ -68,16 +68,20 @@ get_full_expression <- function(clu) {
       "  修法: 确认 02_integrate.R 落盘了 logcounts_all、03_cluster_annotate.R",
       "透传到 clustered.rds。"), call. = FALSE)
   }
-  list(X = X, genes = colnames(X))
+  # **logcounts_all 布局 = 基因 x 细胞**（02_integrate.R:284 落盘 t(data 层)，
+  # 03 透传日志 ncol=基因数同口径）。基因名在 rownames，不在 colnames ——
+  # 之前写 colnames(X) 拿到的是细胞名，配体/受体基因全部 miss，
+  # 主链会静默退化成 0 分（正是本函数要防的假阴性形态）。
+  list(X = X, genes = rownames(X))
 }
 
 # 给定基因集与细胞下标，返回平均表达（log 后）—— 语义对齐
 # 06_communication.py:82-89；R 版主链用 score_combo（子矩阵索引），本函数
 # 保留供外部核查（与 Python 版同名同语义的对照物）。
 mean_expression <- function(genes, idx_cells, X) {
-  hit <- genes[genes %in% colnames(X)]
+  hit <- genes[genes %in% rownames(X)]
   if (!length(hit)) return(0)
-  mean(X[idx_cells, hit, drop = FALSE])
+  mean(X[hit, idx_cells, drop = FALSE])
 }
 
 # ---------------------------------------------------------------------------
@@ -104,7 +108,13 @@ try_liana <- function(clu, group_labels, cfg) {
   out <- tryCatch({
     sce <- SingleCellExperiment::SingleCellExperiment(
       assays = list(counts = Matrix::t(clu$counts),
-                    logcounts = Matrix::t(clu$logcounts_all %||% clu$logcounts)))
+                    # logcounts_all 在 02 落盘时已是 基因x细胞（t(data 层)，见
+                    # 02_integrate.R:284），SCE assays 约定行=基因列=细胞 ——
+                    # 直接用，**不要再 t**（再 t 一次变回 细胞x基因，与 counts
+                    # 的方向相反，liana 读表达矩阵会张冠李戴）。
+                    # clu$counts 恰好相反：02 落盘成 细胞x基因，这里 t 一次
+                    # 才是 基因x细胞。两个矩阵落盘方向相反，处理也相反。
+                    logcounts = clu$logcounts_all %||% Matrix::t(clu$logcounts)))
     SummarizedExperiment::colLabels(sce) <- factor(group_labels)
     # reducedDim 供 liana 的表达方式选择；PCA 已在 02 算好
     SummarizedExperiment::reducedDims(sce) <- list(PCA = clu$pca)
@@ -241,7 +251,7 @@ run_06_communication <- function(cfg) {
   full <- get_full_expression(clu)
   X <- full$X; var_names <- full$genes
   lookup <- var_names
-  log_info(sprintf("表达矩阵（全基因集）: %d 细胞 x %d 基因", nrow(X), ncol(X)))
+  log_info(sprintf("表达矩阵（全基因集）: %d 基因 x %d 细胞", nrow(X), ncol(X)))
 
   # **L7（R-03 裁决）**：score 的量纲由上游标准化决定，target_sum 不落盘
   # 读者无法复现量级。从 integration_status.json 读**实际用的**值。
@@ -281,21 +291,22 @@ run_06_communication <- function(cfg) {
 
   masks <- lapply(groups, function(g) which(clusters_vec == g))
   names(masks) <- groups
-  n_cells <- nrow(X)
+  n_cells <- ncol(X)
   seed <- as.integer(cfg$analysis$seed)
 
-  # **只抽涉及的配体/受体基因列**（06_communication.py:310-317 同优化）。
+  # **只抽涉及的配体/受体基因行**（06_communication.py:310-317 同优化；
+  # X = 基因x细胞，基因按行取）。masks 的细胞下标做**列**下标。
   needed <- sort(unique(unlist(lapply(present, function(pr) c(pr$ligand, pr$receptor)))))
-  small <- X[, needed, drop = FALSE]
-  log_info(sprintf("置换用子矩阵: %d 细胞 x %d 个配体/受体基因",
+  small <- X[needed, , drop = FALSE]
+  log_info(sprintf("置换用子矩阵: %d 个配体/受体基因 x %d 细胞",
                    nrow(small), ncol(small)))
 
   score_combo <- function(lig_genes, rec_genes, s_idx, d_idx) {
-    li <- intersect(lig_genes, colnames(small))
-    ri <- intersect(rec_genes, colnames(small))
+    li <- intersect(lig_genes, rownames(small))
+    ri <- intersect(rec_genes, rownames(small))
     if (!length(li) || !length(ri)) return(0)
-    a <- mean(small[s_idx, li, drop = FALSE])
-    b <- mean(small[d_idx, ri, drop = FALSE])
+    a <- mean(small[li, s_idx, drop = FALSE])
+    b <- mean(small[ri, d_idx, drop = FALSE])
     as.numeric(a * b)
   }
 

@@ -60,7 +60,9 @@ get_full_expression <- function(clu) {
       "  修法: 确认 02_integrate.R 落盘了 logcounts_all、03_cluster_annotate.R",
       "透传到 clustered.rds。"), call. = FALSE)
   }
-  list(X = X, genes = colnames(X))
+  # **logcounts_all 布局 = 基因 x 细胞**（02_integrate.R:284 落盘 t(data 层)，
+  # 与 06_communication.R 同口径）。基因名在 rownames。
+  list(X = X, genes = rownames(X))
 }
 
 # ---------------------------------------------------------------------------
@@ -74,13 +76,14 @@ get_full_expression <- function(clu) {
 # 版 score_genes 同一实现家族（bin 数 25 对齐）。
 # ---------------------------------------------------------------------------
 aucell_style_score <- function(log_counts, gene_set) {
-  hit <- intersect(gene_set, colnames(log_counts))
-  if (!length(hit)) return(rep(NA_real_, nrow(log_counts)))
+  # log_counts = 基因x细胞；每**细胞**一个活性值（列聚合）
+  hit <- intersect(gene_set, rownames(log_counts))
+  if (!length(hit)) return(rep(NA_real_, ncol(log_counts)))
   # 每细胞：命中基因的平均表达 z-score 化（对全基因的均值/SD 校正深度）
-  m <- Matrix::rowMeans(log_counts[, hit, drop = FALSE])
-  all_m <- Matrix::rowMeans(log_counts)
-  all_sd <- apply(log_counts, 1L, sd)  # 慢；用稀疏行平方和替代
-  all_sd <- sqrt(pmax(Matrix::rowMeans(log_counts^2) - all_m^2, 0))
+  m <- Matrix::colMeans(log_counts[hit, , drop = FALSE])
+  all_m <- Matrix::colMeans(log_counts)
+  all_sd <- apply(log_counts, 2L, sd)  # 慢；用稀疏列平方和替代
+  all_sd <- sqrt(pmax(Matrix::colMeans(log_counts^2) - all_m^2, 0))
   ifelse(all_sd > 0, (m - all_m) / all_sd, 0)
 }
 
@@ -109,7 +112,7 @@ run_07_grn <- function(cfg) {
   clu <- readRDS(clu_path)
   full <- get_full_expression(clu)
   X <- full$X; var_names <- full$genes
-  log_info(sprintf("表达矩阵（全基因集）: %d 细胞 x %d 基因", nrow(X), ncol(X)))
+  log_info(sprintf("表达矩阵（全基因集）: %d 基因 x %d 细胞", nrow(X), ncol(X)))
 
   # **L15**：一次调用、两个用途（筛 TF + 算分母）。两次调用是"碰巧相同"，
   # 文件被改或第二次读失败就会打出"12/8 在数据里存在"这种自相矛盾。
@@ -129,8 +132,8 @@ run_07_grn <- function(cfg) {
   # **方差必须用无偏式除以 (n-1)**（与 R 的 var 一致；Python np.var 默认
   # ddof=0 —— 两版差一个常数因子，选 top 基因时几乎不影响排序，但
   # 记录在此防止以后被当成"两版数值不同"的 bug）。
-  n_cells <- nrow(X)
-  gene_var <- Matrix::colMeans(X^2) - Matrix::colMeans(X)^2
+  n_cells <- ncol(X)
+  gene_var <- Matrix::rowMeans(X^2) - Matrix::rowMeans(X)^2   # 每**基因**（行）方差
   gene_var <- pmax(gene_var * n_cells / (n_cells - 1), 0)
   order_top <- order(gene_var, decreasing = TRUE)
   tf_pos <- match(tfs, var_names)
@@ -138,12 +141,13 @@ run_07_grn <- function(cfg) {
   log_info(sprintf("推断用基因: %d 个（含全部 %d 个 TF）",
                    length(cand), length(tfs)))
 
-  Xc <- as.matrix(X[, cand, drop = FALSE])
-  # 中心化 + 标准化，相关系数就等于内积 / n
-  Xc <- sweep(Xc, 2L, colMeans(Xc))
-  sdv <- apply(Xc, 2L, sd)
+  # cand 是 var_names（rownames）下标 → 按**行**取基因；布局仍 基因x细胞。
+  # 每基因中心化/标准化（sweep margin 1），相关 = 两基因标准化向量的内积 / n_cells。
+  Xc <- as.matrix(X[cand, , drop = FALSE])
+  Xc <- sweep(Xc, 1L, rowMeans(Xc))
+  sdv <- apply(Xc, 1L, sd)
   sdv[sdv == 0] <- 1
-  Xc <- sweep(Xc, 2L, sdv, "/")
+  Xc <- sweep(Xc, 1L, sdv, "/")
   cand_names <- var_names[cand]
   pos <- setNames(seq_along(cand_names), cand_names)
 
@@ -155,8 +159,9 @@ run_07_grn <- function(cfg) {
 
   for (tf in tfs) {
     j <- pos[[tf]]
-    # 与所有候选基因的相关（已标准化：内积 / n）
-    corr <- as.numeric(crossprod(Xc, Xc[, j])) / nrow(Xc)
+    # 与所有候选基因的相关（已标准化：内积 / n_cells；tcrossprod 的
+    # (i,j) 元 = 基因 i 与基因 j 的标准化向量内积）
+    corr <- as.numeric(tcrossprod(Xc, Xc[j, ])) / ncol(Xc)
     corr[j] <- -Inf          # 排除自己
     top <- order(corr, decreasing = TRUE)[seq_len(min(N_TARGETS, length(corr)))]
     # **靶基因和权重必须成对取。** 分开写在过滤 corr>0 后会错位 ——
@@ -183,7 +188,7 @@ run_07_grn <- function(cfg) {
                           corr = round(weights[k], 4))
     }
     ri <- ri + 1L
-    n_expr <- sum(X[, match(tf, var_names)] > 0)
+    n_expr <- sum(X[match(tf, var_names), ] > 0)
     rows[[ri]] <- list(
       tf = tf,
       n_targets = length(targets),
@@ -195,7 +200,7 @@ run_07_grn <- function(cfg) {
       best_cluster_activity = round(as.numeric(per_cluster[[best]]), 4),
       cluster_specificity = round(spec, 3),
       n_cells_expressing_tf = n_expr,
-      frac_cells_expressing_tf = round(n_expr / nrow(X), 4))
+      frac_cells_expressing_tf = round(n_expr / ncol(X), 4))
   }
 
   if (!length(rows)) {
