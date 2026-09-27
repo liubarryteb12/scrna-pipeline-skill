@@ -142,8 +142,11 @@ read_10x_tar <- function(tar_path, cache_dir) {
   log_info(sprintf("10x 矩阵目录: %s", mtx_dir))
 
   need_pkg("Seurat", "读 10x 三件套")
-  m <- Seurat::Read10X(data.dir = mtx_dir, var.names.repair = "unique",
-                       strip.suffix = FALSE)
+  # **Read10X 没有 var.names.repair 参数**（那是 scanpy read_10x_mtx 的
+  # var_names= 语义；CI run5 实跑报 unused argument）。重复基因名的修复
+  # 用显式 make.unique —— 与 Python 00_fetch.py:290 var_names_make_unique()
+  # 同语义，且不赌 Read10X 的内置默认行为。
+  m <- Seurat::Read10X(data.dir = mtx_dir, strip.suffix = FALSE)
   # Read10X 返回单个矩阵或按 feature 类型分层的 list（Gene Expression 在前）。
   if (is.list(m)) {
     # 取第一个（"Gene Expression"），与 scanpy read_10x_mtx 的 gene 层一致。
@@ -151,6 +154,10 @@ read_10x_tar <- function(tar_path, cache_dir) {
   }
   # scanpy 语义：细胞 x 基因（obs x var）。Seurat 给 基因 x 细胞 —— 转置。
   # **稀疏矩阵不物化成 dense**：dgCMatrix 转置在 Matrix 内部完成，内存安全。
+  # 重复基因名显式去重（Python L290 var_names_make_unique 的 R 等效）。
+  if (anyDuplicated(rownames(m))) {
+    rownames(m) <- make.unique(rownames(m))
+  }
   counts <- Matrix::t(m)
   list(counts = counts, extract_filter = extract_filter)
 }
