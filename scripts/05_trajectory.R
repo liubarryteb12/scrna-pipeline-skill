@@ -600,11 +600,15 @@ run_05_trajectory <- function(cfg) {
       qs <- stats::quantile(consensus, probs = seq(0, 1, length.out = nb + 1L), na.rm = TRUE)
       bins <- cut(consensus, breaks = unique(qs), include.lowest = TRUE, labels = FALSE)
       nb <- max(bins, na.rm = TRUE)
+      # prof = **基因 x 分箱**（行=基因，与下方 rowMeans/sweep margin=1 的
+      # 「沿分箱轴标准化」一致）。原写法 prof[b,] <- colMeans(...) 是把 bin 当行
+      # ——20 长槽位接 2000 长向量，"number of items to replace is not a
+      # multiple of replacement length"（run19 实锤）。
       prof <- matrix(NA_real_, nrow = ncol(gene_mat), ncol = nb)
       for (b in seq_len(nb)) {
         m <- which(bins == b)
         if (!length(m)) next
-        prof[b, ] <- Matrix::colMeans(gene_mat[m, , drop = FALSE])
+        prof[, b] <- Matrix::colMeans(gene_mat[m, , drop = FALSE])
       }
       # 行 z-score（行=基因：prof 是 基因 x 分箱，沿**分箱轴**标准化）
       mu <- Matrix::rowMeans(prof, na.rm = TRUE)

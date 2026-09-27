@@ -313,18 +313,44 @@ run_06_communication <- function(cfg) {
     if (!length(li) || !length(ri)) return(0)
     a <- mean(small[li, s_idx, drop = FALSE])
     b <- mean(small[ri, d_idx, drop = FALSE])
-    as.numeric(a * b)
+    val <- as.numeric(a * b)
+    # Python 版 NaN<=0 判 False 静默续跑；R if(NaN) 直接 fatal（run19 实锤
+    # missing value where TRUE/FALSE needed）。这里把非有限显式传出去，
+    # 调用端如实记 NA + note，不让 NaN 静默变 0（谎报）也不让步骤崩。
+    if (length(val) != 1L || !is.finite(val)) return(NA_real_)
+    val
   }
 
   rows <- list(); ri_ <- 0L
   n_evaluated <- 0L    # 真正做过置换检验的组合数
   n_zero_dropped <- 0L # 打分恒为 0、未做置换的组合数
+  n_nonfinite <- 0L    # 打分非有限（NA/NaN）的组合数 —— 如实入账，不静默归 0
   p_res <- round(1.0 / (N_PERMUTATIONS + 1L), 8)
   for (pr in present) {
     for (src in groups) {
       for (dst in groups) {
         if (identical(src, dst)) next
         obs <- score_combo(pr$ligand, pr$receptor, masks[[src]], masks[[dst]])
+        if (is.na(obs)) {
+          # 非有限打分：第一次打诊断日志（定位 NaN 源头用），组合如实记 NA。
+          if (n_nonfinite == 0L) {
+            log_warn(sprintf(
+              "首个非有限打分诊断: pair=%s %s->%s ligand=[%s] receptor=[%s] n_src=%d n_dst=%d small_NA=%d",
+              pr$name, src, dst, paste(pr$ligand, collapse = ","),
+              paste(pr$receptor, collapse = ","),
+              length(masks[[src]]), length(masks[[dst]]),
+              sum(is.na(small[intersect(pr$ligand, rownames(small)), , drop = FALSE]))))
+          }
+          n_nonfinite <- n_nonfinite + 1L
+          ri_ <- ri_ + 1L
+          rows[[ri_]] <- list(pair = pr$name, sender = src, receiver = dst,
+                              ligand = paste(pr$ligand, collapse = ","),
+                              receptor = paste(pr$receptor, collapse = ","),
+                              score = NA, null_mean = NA,
+                              p_value = NA, n_permutations = 0L, tested = FALSE,
+                              note = "obs 非有限（NA/NaN）—— 未检验，不得当 0 分")
+          next
+        }
         if (obs <= 0) {
           # **零分组合仍要进 rows（审计 S4 / 台账 E-58）。**
           # 掉它们 = BH 分母凭空小 43%，p_adj_bh 系统性偏小。
@@ -377,25 +403,29 @@ run_06_communication <- function(cfg) {
     r$null_mean <- if (is.na(r$null_mean)) NA_real_ else r$null_mean
     as.data.frame(r, stringsAsFactors = FALSE)
   }))
-  res <- res[order(-res$score), , drop = FALSE]
-  # BH 校正：**检验家庭 = 全部组合，含零分那些**（审计 S4）
-  res$p_adj_bh <- stats::p.adjust(res$p_value, method = "BH")
+  res <- res[order(-res$score, na.last = TRUE), , drop = FALSE]
+  # BH 校正：**检验家庭 = 全部组合，含零分那些**（审计 S4）。
+  # NA p（非有限 obs）不能进 p.adjust —— NA 会传染整列全 NA（p.adjust(na.rm 不存在)）。
+  # 语义：NA p 的组合**没有参与检验**，从检验家庭剔除；p_adj_bh 记 NA + note 列已说明。
+  has_p <- !is.na(res$p_value)
+  res$p_adj_bh <- NA_real_
+  res$p_adj_bh[has_p] <- stats::p.adjust(res$p_value[has_p], method = "BH")
   res$p_adj_bh <- round(res$p_adj_bh, 5)
   utils::write.csv(res, file.path(res_dir, "cell_communication.csv"),
                    row.names = FALSE, na = "")
-  n_sig <- sum(res$p_adj_bh < 0.05)
-  log_info(sprintf("通讯打分: %d 个组合（%d 做了置换，%d 打分恒为 0），BH 后 %d 个 p<0.05",
-                   nrow(res), n_evaluated, n_zero_dropped, n_sig))
+  n_sig <- sum(res$p_adj_bh < 0.05, na.rm = TRUE)
+  log_info(sprintf("通讯打分: %d 个组合（%d 做了置换，%d 打分恒为 0，%d 打分非有限未检验），BH 后 %d 个 p<0.05",
+                   nrow(res), n_evaluated, n_zero_dropped, n_nonfinite, n_sig))
 
   # 热图：配体-受体对 x 接收细胞类型 的总分
   # **按 pair 选前 20，不是按三元组选**（head(20) 拿到 20 个组合，
   # pivot 后塌成 3 个 pair —— 实测图 8/8 空白）。行序按总分从高到低。
-  pair_score <- tapply(res$score, res$pair, sum)
+  pair_score <- tapply(res$score, res$pair, sum, na.rm = TRUE)   # NA score 组合不拖垮 pair 总分
   pair_score <- sort(pair_score, decreasing = TRUE)
   n_pairs <- min(20L, length(pair_score))
   top_pairs <- utils::head(names(pair_score), n_pairs)
   top <- res[res$pair %in% top_pairs, , drop = FALSE]
-  mat <- tapply(top$score, list(pair = top$pair, receiver = top$receiver), sum)
+  mat <- tapply(top$score, list(pair = top$pair, receiver = top$receiver), sum, na.rm = TRUE)
   mat[is.na(mat)] <- 0
   mat <- mat[intersect(top_pairs, rownames(mat)), , drop = FALSE]
 

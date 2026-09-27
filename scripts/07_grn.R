@@ -161,7 +161,17 @@ run_07_grn <- function(cfg) {
   rows <- list(); activities <- list(); edges <- list()
   ri <- 0L; ei <- 0L
   cluster <- as.character(if (!is.null(clu$clusters)) clu$clusters else clu$cell_meta$leiden)
-  clusters <- cluster_order(unique(cluster))
+  # Python 07_grn.py:130: clusters = sorted(set(cluster), 数字簇按数值序)。
+  # cluster_order 定义在 03（sys.source 独立环境互相看不见，run19 实锤
+  # could not find function）—— 这里补同款定义；且它返回**下标**，要套 unique() 取标签。
+  cluster_order <- function(labels) {
+    s <- as.character(labels)
+    is_num <- grepl("^[0-9]+$", s)
+    num_val <- ifelse(is_num, as.integer(s), NA_integer_)
+    str_val <- ifelse(is_num, "", s)
+    order(ifelse(is_num, 0L, 1L), num_val, str_val)
+  }
+  clusters <- unique(cluster)[cluster_order(unique(cluster))]
 
   for (tf in tfs) {
     j <- pos[[tf]]
