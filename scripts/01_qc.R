@@ -149,6 +149,9 @@ run_doublet <- function(counts, metrics, cfg) {
     cd <- SummarizedExperiment::colData(out)
     is_db <- as.logical(cd$scDblFinder.class %in% c("doublet"))
     scores <- as.numeric(cd$scDblFinder.score)
+    # 命名向量（细胞名）—— metrics 子集后按行名对齐取值
+    names(is_db) <- colnames(out)
+    names(scores) <- colnames(out)
     n_db <- sum(is_db)
     list(status = "ok",
          expected_doublet_rate = round(rate, 4),
@@ -355,9 +358,12 @@ run_01_qc <- function(cfg) {
   # ---- 4. 双细胞 ----------------------------------------------------------
   db <- run_doublet(counts, metrics, cfg)
   n_after_db <- n_final_pre_doublet
-  db_flag <- rep(FALSE, n_final_pre_doublet)
+  # db_flag 按移除前 metrics 的行名（细胞名）命名 —— metrics 随后会被子集，
+  # 落盘 qc_cells.csv 时按留存细胞名取值（与 Python adata.obs 子集后
+  # predicted_doublet 语义一致：留存细胞的该列全为 FALSE）。
+  db_flag <- setNames(rep(FALSE, n_final_pre_doublet), rownames(metrics))
   if (identical(db$status, "ok")) {
-    db_flag <- db$is_doublet
+    db_flag <- setNames(db$is_doublet, rownames(metrics))
     if (db$n_predicted_doublets > 0) {
       counts <- counts[!db_flag, , drop = FALSE]
       metrics <- metrics[!db_flag, , drop = FALSE]
@@ -386,11 +392,15 @@ run_01_qc <- function(cfg) {
   saveRDS(list(counts = counts, metrics = metrics), out)
   log_info(sprintf("已写出 %s（%d 细胞 x %d 基因）", out, nrow(counts), ncol(counts)))
 
-  # QC 汇总表：每个细胞一行，便于事后复查"到底滤掉了谁"
+  # QC 汇总表：每个细胞一行（**过滤后**留存细胞，与 Python adata.obs 一致），
+  # predicted_doublet 按**移除前的行名命名向量**取值 —— 之前误用
+  # db_flag[seq_len(nrow(metrics))]，长度侥幸对上时位置错位
+  #（run9 报 differing number of rows 2574 vs 2694）。
   qc_cells <- data.frame(
     cell = rownames(metrics), metrics, row.names = NULL,
-    predicted_doublet = db_flag[seq_len(nrow(metrics))],
-    doublet_score = if (identical(db$status, "ok")) db$doublet_score else NA_real_)
+    predicted_doublet = unname(db_flag[rownames(metrics)]),
+    doublet_score = if (identical(db$status, "ok"))
+      unname(db$doublet_score[rownames(metrics)]) else NA_real_)
   utils::write.csv(qc_cells, file.path(res_dir, "qc_cells.csv"), row.names = FALSE)
 
   status <- list(
