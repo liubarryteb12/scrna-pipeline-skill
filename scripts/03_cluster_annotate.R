@@ -444,10 +444,9 @@ run_03_cluster_annotate <- function(cfg) {
       g <- top3[gi]
       expr <- as.numeric(logcounts[, g])
       dfm <- data.frame(u1 = umap[, 1], u2 = umap[, 2],
-                        grey = 1, expr = ifelse(expr > 0, expr, NA_real_))
+                        expr = ifelse(expr > 0, expr, NA_real_))
       pm <- ggplot2::ggplot(dfm, ggplot2::aes(u1, u2)) +
-        ggplot2::geom_point(aes(colour = grey), size = 0.4, alpha = 0.25,
-                            colour = "grey80") +
+        ggplot2::geom_point(size = 0.4, alpha = 0.25, colour = "grey80") +
         ggplot2::geom_point(data = dfm[!is.na(dfm$expr), ],
                             ggplot2::aes(u1, u2, colour = expr), size = 0.5) +
         ggplot2::scale_colour_viridis_c(name = "expression") +
