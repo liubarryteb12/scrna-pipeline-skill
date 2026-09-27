@@ -55,6 +55,28 @@
  * "内容比画布宽、被 savefig 切掉"的信号。
  * 暗底图（照片类整幅都是"墨"）外接框必是满幅，量不出边距，跳过。
  *
+ * ── 大面积空白检查（E-72，2026-09-26 新增）────────────────────────
+ *
+ * "贴边"查的是**画布太小、内容装不下**；它的反面一直没人查：**画布太大**。
+ * `01_qc.py` 等 10 处画的是单面板散点 + colorbar，axes 被
+ * `set_aspect("equal")` 锁成数据的真实长宽比，而 figsize 的**高是写死的
+ * 毫米数** —— 宽度档（89 / 136 mm）里放不下的部分全变成空白，最差的一张
+ * 左边 54.8% 是白的。这类图墨迹占比正常、贴边距离也正常，旧判据**结构上
+ * 看不见**：修复前把 76 张全喂进来，`exit=0` 全绿。
+ *
+ * 判据：非背景像素外接框到**任一边**的距离 > 画布该边长度的 20% 判红。
+ * 阈值是实测挑的，不是拍脑袋（CI artifact `spatial-results-68` 的 76 张）：
+ *   缺陷图 56 张的"最大单侧空白"落在 **32.1% ~ 54.8%**；
+ *   其余 20 张落在 **0% ~ 4.2%**（最大 `03-03-02-unit1-domains` 4.2%）。
+ *   中间 4.2% → 32.1% 是空档，取 20% 距两侧各 ≥4 倍余量。
+ * 合成标定（`D:\tmp\_e72\probe`）修复前后左边距：830 / 291 / 466 / 961 px
+ * → 12 / 12 / 23 / 12 px。
+ *
+ * **四边都查**：横向空白来自"画布被撑宽"、纵向空白来自"画布被撑高"，是同一
+ * 根因的两个方向。贴边检查只查左右，因为纵向顶边常是布局取舍（见上）；
+ * 空白检查没这个顾虑 —— 20% 的高度空白不可能是取舍。暗底图同样跳过
+ * （整幅都是"墨"，外接框必是满幅，量不出边距）。
+ *
  * ── WARN 落盘（P1-9，2026-09-24 新增；E-63 修好，2026-09-26）──────
  *
  * WARN 必须有稳定消费入口，否则等于噪声：写 `warn_report.json`
@@ -89,6 +111,10 @@ const INK_FAIL_MAX = 0.96;
 // 实测 110 张图（scrna 34 + spatial 76）里，除被裁的 02-08-01（0 px）外
 // 最小的也有 10 px —— 3 px 零误伤。
 const EDGE_MIN_PX = 3;
+// 大面积空白判红阈值（E-72）：非背景像素外接框到任一边的距离 / 该边长度。
+// 实测 76 张（spatial-results-68）缺陷图 32.1%~54.8%、正常图 0%~4.2%，
+// 取 20% 落在空档正中，距两侧各 ≥4 倍余量。
+const BLANK_MAX_FRAC = 0.20;
 
 function decodePng(buf) {
   if (buf.readUInt32BE(0) !== 0x89504e47) throw new Error("不是 PNG");
@@ -187,6 +213,15 @@ function inkFraction(png) {
   return { frac: ink / total, bgLuma, margins };
 }
 
+// 四边里空白占比超过 BLANK_MAX_FRAC 的边，按占比从大到小（E-72）。
+// 空数组 = 通过。抽成函数是为了 `--selftest` 能直接断言（E-63 的教训）。
+function blankSides(margins, width, height) {
+  return [["left", width], ["right", width], ["top", height], ["bottom", height]]
+    .map(([side, span]) => ({ side, px: margins[side], span }))
+    .filter((s) => s.px > s.span * BLANK_MAX_FRAC)
+    .sort((a, b) => b.px / b.span - a.px / a.span);
+}
+
 // ---- 核心：扫描目录集合，返回结构化结果（不 print、不 exit）------------------
 // 抽成函数是为了 `--selftest` 能直接断言。**这是 E-63 的教训**：
 // 只活在 WARN 分支里的代码需要一个能强制走到它的入口。
@@ -194,6 +229,7 @@ function checkDirs(dirs, { log = console.log, err = console.error } = {}) {
   let n = 0, blank = 0;
   const warnings = [];
   const edgeHits = [];
+  const blankHits = [];
   for (const dir of dirs) {
     if (!existsSync(dir)) continue;
     for (const e of readdirSync(dir, { withFileTypes: true })) {
@@ -229,12 +265,27 @@ function checkDirs(dirs, { log = console.log, err = console.error } = {}) {
             blank++;
             edgeHits.push({ figure: e.name, left: margins.left, right: margins.right });
           } else {
-            log(`  [OK]   ${e.name}  ${png.width}x${png.height}  ` +
-                `墨迹 ${(frac * 100).toFixed(2)}%` +
-                (margins ? `  边距 L/R ${margins.left}/${margins.right}` : ""));
-            // 双向提示：超出常见范围但不判红
-            if (frac < INK_WARN_MIN || frac > INK_WARN_MAX) {
-              warnings.push(`${e.name}  ${(frac * 100).toFixed(2)}%`);
+            // 大面积空白（E-72）：画布比内容大太多。与"贴边"是同一根因的两个
+            // 方向 —— 那个查画布太小，这个查画布太大。
+            const blanks = !darkBg && margins ? blankSides(margins, png.width, png.height) : [];
+            if (blanks.length) {
+              const b = blanks[0];
+              err(`  [空白过多] ${e.name}  ${png.width}x${png.height}  ` +
+                  `${b.side} 边空白 ${b.px} px = ${(b.px / b.span * 100).toFixed(1)}% > ` +
+                  `${(BLANK_MAX_FRAC * 100).toFixed(0)}%  ← 画布比内容大太多：axes 被 ` +
+                  `set_aspect("equal") 锁成数据长宽比，画布高却是写死的毫米数（E-72）`);
+              blank++;
+              blankHits.push({ figure: e.name, side: b.side, px: b.px, span: b.span,
+                               sides: blanks.map((s) => s.side) });
+            } else {
+              log(`  [OK]   ${e.name}  ${png.width}x${png.height}  ` +
+                  `墨迹 ${(frac * 100).toFixed(2)}%` +
+                  (margins ? `  边距 L/R/T/B ${margins.left}/${margins.right}/` +
+                             `${margins.top}/${margins.bottom}` : ""));
+              // 双向提示：超出常见范围但不判红
+              if (frac < INK_WARN_MIN || frac > INK_WARN_MAX) {
+                warnings.push(`${e.name}  ${(frac * 100).toFixed(2)}%`);
+              }
             }
           }
         }
@@ -244,7 +295,7 @@ function checkDirs(dirs, { log = console.log, err = console.error } = {}) {
       }
     }
   }
-  return { n, blank, warnings, edgeHits };
+  return { n, blank, warnings, edgeHits, blankHits };
 }
 
 // WARN 集合 → 报告对象。**gates 里引用的每个常量都必须真实存在** ——
@@ -255,7 +306,8 @@ function buildWarnReport({ n, blank, warnings }) {
     generatedAt: new Date().toISOString(),
     tool: "check_figures.mjs",
     gates: { inkFailBlank: MIN_INK, inkFailSaturated: INK_FAIL_MAX,
-            inkWarnBand: [INK_WARN_MIN, INK_WARN_MAX] },
+            inkWarnBand: [INK_WARN_MIN, INK_WARN_MAX],
+            edgeMinPx: EDGE_MIN_PX, blankMaxFrac: BLANK_MAX_FRAC },
     summary: { total: n, blank: blank, warn: warnings.length },
     items: warnings.map((w) => {
       const m = w.match(/^(\S+)\s+([\d.]+)%$/);
@@ -338,15 +390,34 @@ function encodePng(width, height, rgbAt) {
   ]);
 }
 
-// 白底 + 指定比例的深色像素（按行填充），可控地落进任一档
-function synth(width, height, inkFrac, { margin = 6 } = {}) {
+// 白底 + 指定比例的深色像素（按行填充），可控地落进任一档。
+//
+// **四边都要留出 `margin` 的空白，所以默认画一圈"边框"**（模拟真实图的
+// axes 脊线 / 刻度文字）：没有它，墨迹只占画布左上角，E-72 的大面积空白
+// 判据会（正确地）把它判红，用例就考不出原本要考的东西了 —— 这个合成器
+// 原来正是这样，加上新判据后用例 1 和 3 当场变红，改的是用例不是判据。
+// 边框本身算墨迹，所以 `need` 先扣掉它，占比才准。
+function synth(width, height, inkFrac, { margin = 6, frame = true } = {}) {
   const inner = width - 2 * margin;
-  const need = Math.round(inkFrac * width * height);
+  const framePx = frame ? 2 * inner + 2 * (inner - 2) : 0;
+  const need = Math.max(0, Math.round(inkFrac * width * height) - framePx);
   return encodePng(width, height, (x, y) => {
     if (x < margin || x >= width - margin || y < margin || y >= height - margin) {
       return [255, 255, 255];
     }
-    const idx = (y - margin) * inner + (x - margin);
+    if (frame && (x === margin || x === width - margin - 1 ||
+                  y === margin || y === height - margin - 1)) {
+      return [40, 40, 40];
+    }
+    // 真正能放"内容"的是边框以内那 (inner-2)² 个像素。**索引必须从它自己的
+    // 原点算** —— 早先写成 `(y - margin - 1) * (inner - 2) + (x - margin - 1)`
+    // 而没把边框那一行先排除，`frame: false` 时 y = margin 那一行索引为负、
+    // 整行被判成"有内容"（120×120 上 108 px = 0.75% > MIN_INK）。后果是
+    // "全白判红"用例其实靠 E-72 判据才变红 —— **它一直在考另一件事**，
+    // 反向标定（停用 E-72 判据）当场把它照出来了。
+    const x0 = margin + 1, y0 = margin + 1, w = inner - 2;
+    if (x < x0 || x >= x0 + w || y < y0 || y >= y0 + w) return [255, 255, 255];
+    const idx = (y - y0) * w + (x - x0);
     return idx < need ? [40, 40, 40] : [255, 255, 255];
   });
 }
@@ -358,6 +429,13 @@ function synthEdge(width, height) {
 // 整幅暗底（模拟"糊死"，四角取背景会把黑当背景 → 必须靠 bgLuma 分出来）
 function synthDark(width, height) {
   return encodePng(width, height, () => [10, 10, 10]);
+}
+// 白底 + 一个矩形"内容盒"（坐标含端点），盒外全是空白（E-72）。
+// 盒到画布四边的距离就是待量的边距 —— 用例里把边距写成显式的像素数，
+// 这样阈值改了几倍、比较运算符是 `>` 还是 `>=` 都能一眼钉住。
+function synthBox(width, height, { x0, y0, x1, y1 }) {
+  return encodePng(width, height, (x, y) =>
+    (x >= x0 && x <= x1 && y >= y0 && y <= y1) ? [40, 40, 40] : [255, 255, 255]);
 }
 
 function selftest() {
@@ -391,9 +469,10 @@ function selftest() {
     cases.push(["0.4% 落 WARN 带且不判红", r.warnings.length === 1 && r.blank === 0,
                 `warn=${r.warnings.length} blank=${r.blank}`]);
 
-    // 用例 4：全白 → 判红（空白）
+    // 用例 4：全白 → 判红（空白）。**不能画边框** —— 边框自己就有约 2% 墨迹，
+    // 高于 MIN_INK，那就成了一张"有内容"的图，考不出空白档。
     clear();
-    put("d-blank.png", synth(120, 120, 0.0));
+    put("d-blank.png", synth(120, 120, 0.0, { frame: false }));
     r = scan();
     cases.push(["全白判红", r.blank >= 1, `blank=${r.blank}`]);
 
@@ -447,12 +526,54 @@ function selftest() {
     }
     cases.push(["尾斜杠目录报告不落进 figures/（E-63 回归 3）", tailOk, tailDetail]);
 
+    // 用例 10（E-72 回归 1）：画布比内容宽一倍 → 判红（大面积空白）。
+    // 左边距 100/200 = 50%，右边距刻意留 13 px 以**不**触发贴边判据
+    // （贴边是另一个缺陷），这样用例只考"大面积空白"这一条。
+    clear();
+    put("g-wide.png", synthBox(200, 200, { x0: 100, y0: 6, x1: 186, y1: 193 }));
+    r = scan();
+    cases.push(["大面积空白判红（E-72 回归 1）",
+                r.blankHits.length === 1 && r.blankHits[0].side === "left" &&
+                r.edgeHits.length === 0 && r.blank === 1,
+                `blankHits=${JSON.stringify(r.blankHits)} edge=${r.edgeHits.length} blank=${r.blank}`]);
+
+    // 用例 11（E-72 回归 2）：同样画布、内容几乎填满 → 不判红。
+    // 没有这条，把判据写成"永远判红"也能过用例 10。
+    clear();
+    put("h-fill.png", synthBox(200, 200, { x0: 7, y0: 6, x1: 186, y1: 193 }));
+    r = scan();
+    cases.push(["内容填满不判红（E-72 回归 2）",
+                r.blankHits.length === 0 && r.blank === 0,
+                `blankHits=${r.blankHits.length} blank=${r.blank}`]);
+
+    // 用例 12（E-72 回归 3）：阈值边界 —— 左边距 41/200 = 20.5% 判红、
+    // 39/200 = 19.5% 不判红。钉住比较运算符是 `>` 而不是 `>=`，也钉住 20%。
+    clear();
+    put("i-over.png", synthBox(200, 200, { x0: 41, y0: 6, x1: 186, y1: 193 }));
+    r = scan();
+    const overRed = r.blankHits.length === 1 && r.blankHits[0].px === 41;
+    clear();
+    put("j-under.png", synthBox(200, 200, { x0: 39, y0: 6, x1: 186, y1: 193 }));
+    r = scan();
+    cases.push(["阈值边界 20.5% 判红 / 19.5% 不判红（E-72 回归 3）",
+                overRed && r.blankHits.length === 0 && r.blank === 0,
+                `over=${overRed} under=${r.blankHits.length}`]);
+
+    // 用例 13（E-72 回归 4）：纵向也要查 —— 画布被撑高是同一根因的另一方向。
+    // 贴边检查只查左右，所以这里必须单独钉一条，否则"四边都查"是句空话。
+    clear();
+    put("k-tall.png", synthBox(200, 200, { x0: 6, y0: 60, x1: 193, y1: 140 }));
+    r = scan();
+    cases.push(["纵向空白也判红（E-72 回归 4）",
+                r.blankHits.length === 1 && r.blankHits[0].side === "top",
+                `blankHits=${JSON.stringify(r.blankHits)}`]);
+
     let failed = 0;
     for (const [name, pass, detail] of cases) {
       if (!pass) failed++;
       console.log(`  ${pass ? "[OK]  " : "[FAIL]"} ${name}${pass ? "" : `  ← ${detail}`}`);
     }
-    console.log(`\n自检${failed === 0 ? "通过" : "失败"}（${cases.length} 个用例，含 3 条 E-63 回归）`);
+    console.log(`\n自检${failed === 0 ? "通过" : "失败"}（${cases.length} 个用例，含 3 条 E-63 回归 + 4 条 E-72 回归）`);
     return failed === 0 ? 0 : 1;
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -467,7 +588,7 @@ function main() {
     process.exit(1);
   }
 
-  const { n, blank, warnings, edgeHits } = checkDirs(dirs);
+  const { n, blank, warnings, edgeHits, blankHits } = checkDirs(dirs);
 
   if (warnings.length > 0) {
     console.log(`\n[WARN] ${warnings.length} 张图墨迹占比超出常见范围 ` +
@@ -501,10 +622,22 @@ function main() {
       console.error("  修法：调大 figsize 宽度、或把标题/图例改短（折行）。" +
                     "注意宽度仍要落在 89/136/183 mm 三档之内。");
     }
+    if (blankHits.length > 0) {
+      console.error(`\n其中 ${blankHits.length} 张画布比内容大太多（单侧空白 > ` +
+                    `${(BLANK_MAX_FRAC * 100).toFixed(0)}%）—— axes 被 ` +
+                    `set_aspect("equal") 锁成数据长宽比，画布高却是写死的毫米数：`);
+      for (const h of blankHits) {
+        console.error(`    ${h.figure}  ${h.side} ${h.px}/${h.span} px = ` +
+                      `${(h.px / h.span * 100).toFixed(1)}%` +
+                      (h.sides.length > 1 ? `（共 ${h.sides.length} 边超标：${h.sides.join("/")}）` : ""));
+      }
+      console.error("  修法：别写死 figsize 的高，改成 fit_fig_to_scatter(fig, ax, width_mm)" +
+                    " 让高度由数据长宽比推出（宽度仍要落在 89/136/183 mm 三档之内）。");
+    }
     console.error(`\n${blank}/${n} 张图有问题`);
     process.exit(1);
   }
-  console.log(`\n${n} 张图全部非空白、非糊死、内容不贴边`);
+  console.log(`\n${n} 张图全部非空白、非糊死、内容不贴边、无大面积空白`);
 }
 
 if (process.argv.includes("--selftest")) {
