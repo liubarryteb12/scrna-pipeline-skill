@@ -464,13 +464,18 @@ run_03_cluster_annotate <- function(cfg) {
   raw_path <- file.path(data_dir, "raw.rds")
   raw_counts <- if (file.exists(raw_path)) readRDS(raw_path) else counts
   # 打分在 log 化全基因集矩阵上做（签名基因交集 + 补全其它基因做对照 bin）
-  common_cells <- intersect(colnames(raw_counts), rownames(logcounts))
-  lg_full <- logcounts[common_cells, , drop = FALSE]  # 仅为行名/列名对齐
+  # raw_counts（raw.rds）是 **细胞x基因**（00_fetch 落盘）→ 细胞名在 **rownames**；
+  # logcounts 是 细胞x基因 → 细胞名在 rownames。run20 实锤：写成 colnames(raw_counts)
+  # 得到基因名 ∩ 细胞名 = 空 → 签名基因"一个都不在数据里" → 打分 not_possible。
+  common_cells <- intersect(rownames(raw_counts), rownames(logcounts))
   raw_sub <- raw_counts[common_cells, , drop = FALSE]
-  # log 化（与 02_integrate 的 target_sum 一致）
+  # log 化（与 02_integrate 的 target_sum 一致）。产出保持 **基因x细胞**：
+  # score_celltypes 的 CreateSeuratObject 要 Seurat API 方向，且
+  # all_genes <- rownames(log_counts_all) 取基因名（run20 实锤：外面多套一层 t()
+  # 让 lg_all 变 细胞x基因 → rownames 全是细胞名 → 同样全 miss）。
   target_sum <- (cfg$norm %||% list())$target_sum %||% 1e4
-  lg_all <- Matrix::t(log1p(Matrix::t(raw_sub) /
-                              pmax(Matrix::colSums(raw_sub), 1) * target_sum))
+  lg_all <- log1p(Matrix::t(raw_sub) /
+                    pmax(Matrix::colSums(raw_sub), 1) * target_sum)
   st <- score_celltypes(lg_all, clusters[common_cells], sig, seed = 42L)
   per_cell <- st$per_cell; assign <- st$assign; diag <- st$diag
   annot_record <- list(

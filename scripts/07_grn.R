@@ -88,7 +88,8 @@ aucell_style_score <- function(log_counts, gene_set) {
   # 每细胞：命中基因的平均表达 z-score 化（对全基因的均值/SD 校正深度）
   m <- Matrix::colMeans(log_counts[hit, , drop = FALSE])
   all_m <- Matrix::colMeans(log_counts)
-  all_sd <- apply(log_counts, 2L, sd)  # 慢；用稀疏列平方和替代
+  # 列 SD 用平方和公式（L91 旧版 apply(log_counts,2,sd) 是死代码且会把
+  # 13714x2574 稀疏矩阵密化 ≈283MB —— 既慢又有内存风险）
   all_sd <- sqrt(pmax(Matrix::colMeans(log_counts^2) - all_m^2, 0))
   ifelse(all_sd > 0, (m - all_m) / all_sd, 0)
 }
@@ -149,9 +150,13 @@ run_07_grn <- function(cfg) {
 
   # cand 是 var_names（rownames）下标 → 按**行**取基因；布局仍 基因x细胞。
   # 每基因中心化/标准化（sweep margin 1），相关 = 两基因标准化向量的内积 / n_cells。
+  # SD 用平方和公式（与 aucell_style_score 同式）：apply(Xc,1,sd) 对 3139x2574
+  # 密阵要跑 3139 次 sd，慢；公式一次矩阵运算完成，结果与 apply 版一致
+  #（apply sd 用 n-1 分母，这里显式补 (n-1)/n 因子对齐）。
   Xc <- as.matrix(X[cand, , drop = FALSE])
   Xc <- sweep(Xc, 1L, rowMeans(Xc))
-  sdv <- apply(Xc, 1L, sd)
+  nc_ <- ncol(Xc)
+  sdv <- sqrt(pmax(Matrix::rowMeans(Xc^2) * nc_ / (nc_ - 1L), 0))   # 已中心化 → 方差=mean(x^2)
   sdv[sdv == 0] <- 1
   Xc <- sweep(Xc, 1L, sdv, "/")
   cand_names <- var_names[cand]
@@ -173,11 +178,17 @@ run_07_grn <- function(cfg) {
   }
   clusters <- unique(cluster)[cluster_order(unique(cluster))]
 
+  tf_iter <- 0L
   for (tf in tfs) {
+    tf_iter <- tf_iter + 1L
     j <- pos[[tf]]
     # 与所有候选基因的相关（已标准化：内积 / n_cells；tcrossprod 的
     # (i,j) 元 = 基因 i 与基因 j 的标准化向量内积）
-    corr <- as.numeric(tcrossprod(Xc, Xc[j, ])) / ncol(Xc)
+    corr <- tryCatch(as.numeric(tcrossprod(Xc, Xc[j, ])) / ncol(Xc),
+      error = function(e) stop(sprintf(
+        "tcrossprod 失败 (tf=%s iter=%d): %s [Xc=%dx%d, Xc[j,]=%d]",
+        tf, tf_iter, conditionMessage(e), nrow(Xc), ncol(Xc), length(Xc[j, ])),
+        call. = FALSE))
     corr[j] <- -Inf          # 排除自己
     top <- order(corr, decreasing = TRUE)[seq_len(min(N_TARGETS, length(corr)))]
     # **靶基因和权重必须成对取。** 分开写在过滤 corr>0 后会错位 ——

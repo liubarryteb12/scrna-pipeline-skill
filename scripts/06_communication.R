@@ -112,15 +112,13 @@ try_liana <- function(clu, group_labels, cfg) {
   info$version <- tryCatch(as.character(utils::packageVersion("liana")),
                            error = function(e) "unknown")
   out <- tryCatch({
+    # **SCE assays 必须同尺寸**（run20 实锤 all assays must have the same
+    # nrow and ncol）：counts(HVG 2000x2574) 与 logcounts_all(全基因集) 尺寸
+    # 永远不同。logcounts_all 落盘是 细胞x基因（run17 实锤），t() 成 SCE 约定
+    # 的 基因x细胞。单 assay 全基因集 = Python 版 use_raw=True 同语义（raw 才是
+    # 干净 log 表达，主 X 可能被 scale 污染）。
     sce <- SingleCellExperiment::SingleCellExperiment(
-      assays = list(counts = Matrix::t(clu$counts),
-                    # logcounts_all 在 02 落盘时已是 基因x细胞（t(data 层)，见
-                    # 02_integrate.R:284），SCE assays 约定行=基因列=细胞 ——
-                    # 直接用，**不要再 t**（再 t 一次变回 细胞x基因，与 counts
-                    # 的方向相反，liana 读表达矩阵会张冠李戴）。
-                    # clu$counts 恰好相反：02 落盘成 细胞x基因，这里 t 一次
-                    # 才是 基因x细胞。两个矩阵落盘方向相反，处理也相反。
-                    logcounts = clu$logcounts_all %||% Matrix::t(clu$logcounts)))
+      assays = list(logcounts = Matrix::t(clu$logcounts_all)))
     SummarizedExperiment::colLabels(sce) <- factor(group_labels)
     # reducedDim 供 liana 的表达方式选择；PCA 已在 02 算好
     SummarizedExperiment::reducedDims(sce) <- list(PCA = clu$pca)
