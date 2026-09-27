@@ -87,8 +87,11 @@ mean_expression <- function(genes, idx_cells, X) {
 # 但必须让人看见它跑不动。
 # ---------------------------------------------------------------------------
 try_liana <- function(clu, group_labels, cfg) {
+  # 注意：LIANA_N_PERMS 只是**登记意图**（Python 侧 n_perms=100 的对照），
+  # liana_wrap 顶层没有 n_perms 参数，实际走 liana 默认值 —— 不谎报为已生效。
   info <- list(attempted = TRUE, status = NULL, reason = "",
-               n_perms = LIANA_N_PERMS)
+               n_perms_intended = LIANA_N_PERMS,
+               n_perms_actual = "liana 默认")
   has <- requireNamespace("liana", quietly = TRUE)
   if (!has) {
     info$status <- "package_missing"
@@ -105,9 +108,11 @@ try_liana <- function(clu, group_labels, cfg) {
     SummarizedExperiment::colLabels(sce) <- factor(group_labels)
     # reducedDim 供 liana 的表达方式选择；PCA 已在 02 算好
     SummarizedExperiment::reducedDims(sce) <- list(PCA = clu$pca)
+    # liana_wrap 顶层没有 n_perms/seed 参数（那是 natmi 等各 method 的内部
+    # 参数，liana_wrap 的 ... 不做透传登记，多余参数直接 unused argument ——
+    # 与 Read10X var.names.repair 同类的 scanpy 语义误置）。
     res <- liana::liana_wrap(sce, idents_col = "label",
-                             resource = "Consensus",
-                             n_perms = LIANA_N_PERMS, seed = cfg$analysis$seed)
+                             resource = "Consensus")
     agg <- liana::liana_aggregate(res)
     info$status <- "ok"
     info$n_rows <- nrow(agg)
