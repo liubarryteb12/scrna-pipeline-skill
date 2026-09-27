@@ -119,8 +119,12 @@ score_celltypes <- function(log_counts_all, clusters, sig, seed = 42L) {
   obj <- Seurat::CreateSeuratObject(counts = log_counts_all)
   obj@meta.data$leiden <- factor(clusters)
   set.seed(seed)
+  # **slot="counts" 必须显式**：AddModuleScore 默认 slot="data"，而
+  # CreateSeuratObject 只填 counts 层、不产 data 层（没跑 NormalizeData）——
+  # 默认值会找不到 data 层直接报错。喂进来的本来就是 log 后矩阵，语义即
+  # 打分输入。
   obj <- Seurat::AddModuleScore(obj, features = list(present),
-                                ctrl = 25L, name = "score_")
+                                ctrl = 25L, name = "score_", slot = "counts")
   # AddModuleScore 列名是 score_1..score_n（name 参数只做前缀）
   score_cols <- paste0("score_", seq_along(present))
   sc_mat <- obj@meta.data[, score_cols, drop = FALSE]
