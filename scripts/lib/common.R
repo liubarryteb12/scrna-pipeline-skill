@@ -667,7 +667,7 @@ build_marker_dotplot_figure <- function(frac_df, z_df, group_label, title,
     ggplot2::theme(axis.text.x = ggplot2::element_text(
       angle = 90, hjust = 1, vjust = 0.4, size = 7),
       legend.box = "horizontal",
-      legend.position = "bottom")   # 底部横带 = do_DotPlot 范式
+      legend.position = "bottom") # LEGEND_DIFF: 底部横带 = do_DotPlot 范式（R-06 定版，双图例横排）
   p
 }
 # 基因列原顺序展示（ggplot scale_x_discrete 的 labels 需与 levels 对齐，

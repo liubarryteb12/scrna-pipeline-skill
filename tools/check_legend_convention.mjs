@@ -186,14 +186,27 @@ const problems = [];
 const notes = [];
 
 function scanR(file) {
-  const src = stripComments(readFileSync(file, "utf8"));
-  src.split("\n").forEach((line, idx) => {
+  const rawLines = readFileSync(file, "utf8").split("\n");
+  // E-72b 教训：豁免标记写在**注释**里，而判定走的是 stripComments 后的
+  // 源码 —— 标记自己先被剥掉，豁免永远不触发（假阳性常驻）。所以违规
+  // 判定用剥注释后的行，豁免判定必须回看**原始行**。
+  const src = stripComments(rawLines.join("\n")).split("\n");
+  src.forEach((line, idx) => {
     const m = /legend\.position\s*=\s*([^,)\n]+)/.exec(line);
     if (!m) return;
     const val = m[1].trim();
     if (VERBOSE) notes.push(`${basename(file)}:${idx + 1}  legend.position = ${val}`);
     // 约定明确禁止：顶部 / 底部 / 框内坐标
     if (/^["'](top|bottom)["']$/.test(val) || /^c\s*\(/.test(val)) {
+      // 显式同行标记豁免（对齐 check_fig_names.mjs 的 R_FIG_DIFF 哲学：
+      // 豁免必须可见、可计数，不许静默白名单）：
+      //   # LEGEND_DIFF: <理由>
+      // 目前唯一合法场景：build_marker_dotplot_figure 的底部横带图例
+      // （colorbar+size 双图例横排 = Seurat do_DotPlot 范式，R-06 定版）。
+      if (/LEGEND_DIFF\s*:/.test(rawLines[idx] || "")) {
+        notes.push(`${basename(file)}:${idx + 1}  legend.position = ${val}  [LEGEND_DIFF 豁免]`);
+        return;
+      }
       problems.push(`${basename(file)}:${idx + 1}  legend.position = ${val}` +
                     `  —— 约定 v2 要求框外右侧（"right"）`);
     }

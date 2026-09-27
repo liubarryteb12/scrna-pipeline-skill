@@ -83,6 +83,8 @@ download <- function(url, dest, retries = 3L) {
     ok <- tryCatch({
       log_info(sprintf("下载 (%d/%d): %s", attempt, retries, url))
       tmp <- paste0(dest, ".part")
+      # _download_allow: 仅 CI 执行（main_analysis.R 编排 / R workflow job 内），
+      # 本地不跑分析（R1 纪律）——与 Python 版 download() 的逃生舱标记对齐。
       status <- download.file(url, tmp, mode = "wb", quiet = TRUE,
                               method = "libcurl", cacheOK = FALSE)
       if (status != 0L) stop(sprintf("download.file 返回状态 %d", status), call. = FALSE)
