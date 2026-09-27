@@ -120,16 +120,15 @@ compute_dpt <- function(expr_hvg, pca_emb, root_idx, seed, log = log_info) {
 # ---------------------------------------------------------------------------
 compute_slingshot <- function(pca_emb, clusters, root_cluster, log = log_info) {
   need_pkg("slingshot", "主曲线拟时序")
-  # slingshot 只需要 reducedDim + 簇标签。**counts 占位必须 1 基因 x n 细胞** ——
-  # SingleCellExperiment 要求 reducedDim 的行数 = 细胞数；run17 实测 1x1 占位
-  # 会让 slingshot 内部 reducedDims<- 报 invalid 'value'（尺寸校验不过）。
+  # 构造顺序关键（run17-19 三跑同错 invalid 'value' in 'reducedDims<-'
+  # 的根因假设）：占位 counts 无 dimnames → SCE 构造时把 reducedDims 里
+  # pca_emb 的 dimnames 剥掉/错配 → slingshot 内部写回 reducedDim 时校验
+  # 失败。先建 SCE（只放 counts）→ 定 colnames（真细胞名）→ **再**赋
+  # reducedDim（SCE 的 reducedDim<- 校验 nrow==ncol(sce) 并对齐）。
   sce <- SingleCellExperiment::SingleCellExperiment(
-    assays = list(counts = Matrix::Matrix(0, 1, ncol(pca_emb), sparse = TRUE)),
-    reducedDims = list(PCA = pca_emb))
-  # 占位 counts 没有细胞名 → SCE colnames 是自动序号，而 reducedDim PCA 行名是
-  # 真细胞名；slingshot 内部写 reducedDims 时 dimnames 校验不过
-  # （invalid 'value' in 'reducedDims<-'，run17/18 两跑同错）。显式对齐细胞名。
+    assays = list(counts = Matrix::Matrix(0, 1, ncol(pca_emb), sparse = TRUE)))
   colnames(sce) <- rownames(pca_emb)
+  SingleCellExperiment::reducedDim(sce, "PCA") <- pca_emb
   sce$cluster <- factor(clusters)
   sling <- slingshot::slingshot(sce, clusterLabels = "cluster",
                                 reducedDim = "PCA", start.clus = root_cluster)
