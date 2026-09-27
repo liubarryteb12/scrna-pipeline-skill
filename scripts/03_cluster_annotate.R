@@ -304,8 +304,11 @@ run_03_cluster_annotate <- function(cfg) {
   .clus_at <- function(res) {
     # clusterRows 聚**行** = 观测：emb 是 细胞xPC，行已是细胞 —— 直接传，
     # **不能 t()**（t 后行=PC，会去聚 40 个主成分，返回长度 40 与 2574 细胞静默错配）。
+    # jaccard 权重经 makeSNNGraph 的 **type="jaccard"**（run13 实锤：weights.type
+    # 是虚构参数名 → unused argument）。leiden 的 objective_function/resolution
+    # 经 cluster.args 透传 igraph::cluster_leiden（拼写已对 igraph 源码核实）。
     bluster::clusterRows(emb, bluster::NNGraphParam(
-      k = k, cluster.fun = "leiden", weights.type = "jaccard",
+      k = k, type = "jaccard", cluster.fun = "leiden",
       cluster.args = list(objective_function = "modularity",
                           resolution = res)))
   }
