@@ -233,7 +233,7 @@ run_tenifold_engine <- function(cfg, X_counts, var_names, targets, tk) {
     tget <- data.frame(gene = cand, stringsAsFactors = FALSE)
     utils::write.csv(tget, file.path(tmp_dir, "targets.csv"), row.names = FALSE)
 
-    rscript <- file.path(get_script_path(), "lib", TENIFOLD_R)
+    rscript <- file.path(dirname(get_script_path()), "lib", TENIFOLD_R)
     if (!file.exists(rscript)) {
       return(list(ok = FALSE, reason = sprintf("缺 %s", rscript)))
     }
@@ -437,7 +437,7 @@ run_08_virtual_perturbation <- function(cfg) {
   td <- NULL; td_ok <- FALSE; td_reason <- NULL; td_res <- NULL
   if (engine %in% c("tenifold", "both")) {
     tools_probe <- list(tenifold_r = file.exists(
-      file.path(get_script_path(), "lib", TENIFOLD_R)))
+      file.path(dirname(get_script_path()), "lib", TENIFOLD_R)))
     if (!tools_probe$tenifold_r) {
       td_reason <- sprintf("缺 lib/%s", TENIFOLD_R)
     } else {

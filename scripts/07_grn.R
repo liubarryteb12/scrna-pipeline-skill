@@ -39,7 +39,7 @@ MAX_GENES_FOR_INFERENCE <- 3000L
 # TF 清单（assets/tf_list.yml）
 # ---------------------------------------------------------------------------
 load_tfs <- function() {
-  p <- file.path(get_script_path(), "..", "assets", "tf_list.yml")
+  p <- file.path(dirname(get_script_path()), "..", "assets", "tf_list.yml")
   if (!file.exists(p)) stop(sprintf("缺 TF 清单 %s", p), call. = FALSE)
   need_pkg("yaml", "读 assets/tf_list.yml")
   doc <- yaml::read_yaml(p)

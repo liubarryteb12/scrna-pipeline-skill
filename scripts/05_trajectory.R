@@ -80,7 +80,7 @@ compute_cytotrace_gcs <- function(expr_all, log = log_info) {
   top_idx <- order(-corr)[seq_len(top_n)]
   sub <- expr_all[, top_idx, drop = FALSE]
   # 秩均值（列方向），归一 [0,1]
-  ranks <- Matrix::apply(sub, 2, function(c) rank(c, ties.method = "average"))
+  ranks <- apply(as.matrix(sub), 2, function(c) rank(c, ties.method = "average"))  # base::apply；Matrix 无 apply 导出（run16 实锤）。50 列小矩阵密化可接受
   gcs <- as.numeric(rowMeans(ranks))
   rng <- max(gcs) - min(gcs)
   gcs <- (gcs - min(gcs)) / (if (rng > 0) rng else 1)

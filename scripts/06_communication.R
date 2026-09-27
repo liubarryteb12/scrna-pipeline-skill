@@ -43,7 +43,7 @@ LIANA_N_PERMS <- 100L
 # 内置配体-受体对（assets/ligand_receptor.yml）
 # ---------------------------------------------------------------------------
 load_lr_pairs <- function() {
-  p <- file.path(get_script_path(), "..", "assets", "ligand_receptor.yml")
+  p <- file.path(dirname(get_script_path()), "..", "assets", "ligand_receptor.yml")
   if (!file.exists(p)) stop(sprintf("缺内置配体-受体库 %s", p), call. = FALSE)
   need_pkg("yaml", "读 assets/ligand_receptor.yml")
   doc <- yaml::read_yaml(p)
