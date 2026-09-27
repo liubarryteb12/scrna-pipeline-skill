@@ -97,7 +97,9 @@ compute_dpt <- function(expr_hvg, pca_emb, root_idx, seed, log = log_info) {
   # destiny 吃细胞 x 特征；给 PCA embedding（与 scanpy 的 diffmap 输入同思路）
   dm <- destiny::DiffusionMap(pca_emb, n_pcs = NA, n_local = 5L, verbose = FALSE)
   dpt <- destiny::DPT(dm)
-  pt <- as.numeric(dpt[[1L]])
+  # destiny 的 [[ 只定义了 character 索引（'dpt'/'DPT1'…），numeric [[1]] 会报
+  # "this S4 class is not subsettable"（run17 实锤，destiny 源码 methods-extraction.r 确认）。
+  pt <- as.numeric(dpt[["DPT1"]])
   # destiny 的 DPT 以**密度最高**的细胞（tip1）为根，不是我们的 GCS 根。
   # scanpy 版（05_trajectory.py:109-114）用 `adata.uns["iroot"] = root_idx`
   # 让 DPT 直接从 GCS 根出发 —— destiny 没有等价的"指定根"接口，
@@ -118,10 +120,11 @@ compute_dpt <- function(expr_hvg, pca_emb, root_idx, seed, log = log_info) {
 # ---------------------------------------------------------------------------
 compute_slingshot <- function(pca_emb, clusters, root_cluster, log = log_info) {
   need_pkg("slingshot", "主曲线拟时序")
-  # slingshot 只需要 reducedDim + 簇标签；assays 里的占位矩阵不会被读
-  #（slingshot 走 reducedDim），用 1x1 零矩阵避免复制整个 embedding 两份
+  # slingshot 只需要 reducedDim + 簇标签。**counts 占位必须 1 基因 x n 细胞** ——
+  # SingleCellExperiment 要求 reducedDim 的行数 = 细胞数；run17 实测 1x1 占位
+  # 会让 slingshot 内部 reducedDims<- 报 invalid 'value'（尺寸校验不过）。
   sce <- SingleCellExperiment::SingleCellExperiment(
-    assays = list(counts = Matrix::Matrix(0, 1, 1, sparse = TRUE)),
+    assays = list(counts = Matrix::Matrix(0, 1, ncol(pca_emb), sparse = TRUE)),
     reducedDims = list(PCA = pca_emb))
   sce$cluster <- factor(clusters)
   sling <- slingshot::slingshot(sce, clusterLabels = "cluster",

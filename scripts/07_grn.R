@@ -62,6 +62,12 @@ get_full_expression <- function(clu) {
   }
   # **logcounts_all 布局 = 基因 x 细胞**（02_integrate.R:284 落盘 t(data 层)，
   # 与 06_communication.R 同口径）。基因名在 rownames。
+    # **logcounts_all 实际布局 = 细胞 x 基因**：02_integrate.R:284 对 Seurat data 层
+  #（基因x细胞）做 t()，得到的是 Python adata.raw 语义（细胞x基因）。
+  # run17 实锤：直接 rownames(X) 拿到的是**细胞名**（"2574 基因 x 13714 细胞"），
+  # 配体/受体/TF 全部 miss → no_pairs_in_data / no_tfs_in_data。
+  # 这里统一转成 **基因 x 细胞** 再交出去（下游消费方 b4ee9a6 起全部按基因x细胞写）。
+  X <- Matrix::t(X)
   list(X = X, genes = rownames(X))
 }
 
