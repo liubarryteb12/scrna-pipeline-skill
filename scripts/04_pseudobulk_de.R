@@ -217,9 +217,11 @@ run_04_pseudobulk_de <- function(cfg) {
     }
 
     idx <- match(rownames(sub), rownames(mat))
-    cts <- round(mat[idx, , drop = FALSE])
-    colnames(cts) <- colnames(mat)
-    rownames(cts) <- rownames(sub)
+    # mat 布局是 拟bulk样本 x 基因；DESeq2 的 countData 要求 **基因 x 样本**，
+    # 所以这里必须转置（CI 实跑必踩的维度错位，静态门禁抓不到）。
+    cts <- t(round(mat[idx, , drop = FALSE]))
+    colnames(cts) <- rownames(sub)   # 样本名（与 colData 行名一致）
+    rownames(cts) <- colnames(mat)   # 基因名
     # DESeq2 不接受全零基因
     cts <- cts[, colSums(cts) > 0, drop = FALSE]
 

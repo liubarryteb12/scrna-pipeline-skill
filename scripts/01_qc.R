@@ -98,7 +98,10 @@ add_qc_metrics <- function(counts, organism = "Homo sapiens") {
          pct_counts_mt = as.numeric(pct(n_detected(mt_hit))),
          pct_counts_ribo = as.numeric(pct(n_detected(ribo_hit))),
          pct_counts_hb = as.numeric(pct(n_detected(hb_hit))),
-         row.names = rownames(counts)),
+         # row.names 是**细胞名**：counts 布局 细胞x基因，指标按列（每细胞一行）
+         # —— 不能用 rownames(counts)（那是基因名，长度不匹配直接
+         # "row names supplied are of the wrong length"，CI run6 实跑抓到）。
+         row.names = colnames(counts)),
        qc_vars = c("mt", "ribo", "hb")[c(any(mt_hit), any(ribo_hit), any(hb_hit))],
        gene_sets = list(
          source = sets$source,
