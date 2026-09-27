@@ -117,7 +117,12 @@ jobs:
       # liana 不在 CRAN/BioC（r_version.md §3 06 行的 A/B 裁决：走 GitHub 包）。
       # remotes 可能在装依赖时已被带出，缺了就补装。放在
       # setup-r-dependencies 之后：主 solver 只认 CRAN/BioC，GitHub 包不放进去。
+      # GITHUB_PAT 必须显式给：remotes 自带的 bundled PAT 已失效
+      # （HTTP 401 Bad credentials，run 36304831565 实测），公共仓库用
+      # 内置 GITHUB_TOKEN 即可。
       - name: Install liana from GitHub
+        env:
+          GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if (!requireNamespace("remotes", quietly=TRUE)) install.packages("remotes")
           if (!requireNamespace("liana", quietly=TRUE))

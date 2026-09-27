@@ -76,6 +76,28 @@ python scripts/main_analysis.py --config assets/config.pbmc3k.yml
 **云端运行**（推荐）：推到 GitHub，workflow 自动跑，结果在 Actions 页面的
 artifact 里下载。
 
+## R 语言版本（可选）
+
+同一套分析在 `scripts/*.R` 里有一份 **R 语言版本**（与 Python 版并存，
+任选其一，产物互不依赖）：
+
+```bash
+Rscript scripts/main_analysis.R --config assets/config.pbmc3k.yml
+```
+
+- CI 入口：`.github/workflows/scrna_r_analysis.yml`（只认 `.R`/tools/assets
+  的改动，Python 文件提交不会触发 R job，反之亦然）。
+- 依赖清单：`scripts/r_deps.R`（18 包；liana 走 GitHub，装包唯一事实源是
+  workflow 的包名清单）。
+- 与 Python 版的差异逐条记录在
+  [`references/r_version.md`](references/r_version.md)（选型等级
+  D 零差异 / A 同方法不同实现 / B 换实现同思路 / C 真方法差异）：
+  例如 01 双细胞检测用 scDblFinder（Python 是 scrublet）、05 轨迹用
+  destiny DPT + slingshot（Palantir/scFates 无 R 实现）、08 虚拟扰动
+  与 Python 逐字节同款（共用 `scripts/lib/tenifold_knk.R`）。
+- 图名集合与 Python 版**相等**（`R_FIG_DIFF` 豁免机制保证逐张对齐），
+  中间对象 R 版走 `.rds`（不跨语言读 `.h5ad`，对照表走 CSV）。
+
 ## 换成自己的数据
 
 ```bash
