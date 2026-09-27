@@ -34,7 +34,7 @@
 .load_common_for_local <- function() {
   argv0 <- grep("^--file=", commandArgs(FALSE), value = TRUE)
   if (length(argv0)) {
-    self <- normalizePath(sub("^--file=", argv0[1]), mustWork = FALSE)
+    self <- normalizePath(sub("^--file=", "", argv0[1]), mustWork = FALSE)
     lib <- file.path(dirname(self), "lib", "common.R")
     if (file.exists(lib) && !exists("record_step", envir = globalenv())) {
       sys.source(lib, envir = globalenv())
@@ -72,7 +72,7 @@ DYNAMIC_FIG_BASES <- list("03" = 8L)
 # Rscript 03 时会在 L70 NameError）。
 get_script_path <- function() {
   argv0 <- grep("^--file=", commandArgs(FALSE), value = TRUE)
-  if (length(argv0)) return(normalizePath(sub("^--file=", argv0[1]), mustWork = FALSE))
+  if (length(argv0)) return(normalizePath(sub("^--file=", "", argv0[1]), mustWork = FALSE))
   getOption("scrna.script_path", "")
 }
 

@@ -42,7 +42,7 @@
 # ---------------------------------------------------------------------------
 .scripts_dir <- local({
   a <- grep("^--file=", commandArgs(FALSE), value = TRUE)
-  if (length(a)) dirname(normalizePath(sub("^--file=", a[1L]), mustWork = FALSE))
+  if (length(a)) dirname(normalizePath(sub("^--file=", "", a[1L]), mustWork = FALSE))
   else getOption("scrna.main_scripts_dir", "scripts")
 })
 REPO <- dirname(.scripts_dir)

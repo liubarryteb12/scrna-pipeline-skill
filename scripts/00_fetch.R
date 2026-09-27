@@ -39,7 +39,7 @@ MAX_CELLS_WARN <- 200000L
   # 独立 Rscript 运行时：把 lib/common.R source 进本环境。
   argv0 <- grep("^--file=", commandArgs(FALSE), value = TRUE)
   if (length(argv0)) {
-    self <- normalizePath(sub("^--file=", argv0[1]), mustWork = FALSE)
+    self <- normalizePath(sub("^--file=", "", argv0[1]), mustWork = FALSE)
     lib <- file.path(dirname(self), "lib", "common.R")
     if (file.exists(lib) && !exists("record_step", envir = globalenv())) {
       sys.source(lib, envir = globalenv())
@@ -291,7 +291,7 @@ run_00_fetch <- function(cfg) {
   set_seed(cfg)
   argv0 <- grep("^--file=", commandArgs(FALSE), value = TRUE)
   repo_root <- if (length(argv0)) {
-    dirname(dirname(normalizePath(sub("^--file=", argv0[1]))))
+    dirname(dirname(normalizePath(sub("^--file=", "", argv0[1]))))
   } else {
     normalizePath(".")
   }
