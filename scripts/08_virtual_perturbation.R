@@ -244,8 +244,13 @@ run_tenifold_engine <- function(cfg, X_counts, var_names, targets, tk) {
     if (!file.exists(rscript)) {
       return(list(ok = FALSE, reason = sprintf("缺 %s", rscript)))
     }
-    out_csv <- file.path(tmp_dir, "dist.csv")
-    rmeta_json <- file.path(tmp_dir, "run_meta.json")
+    # 落盘文件名必须与 tenifold_knk.R 的契约一致（tenifold_knk.R:316/347）：
+    # 距离表 = tenifold_perturbation_distances.csv（Python 08_virtual_perturbation.py:629
+    # 同名；曾错写 dist.csv → 包成功跑完 300 s 后 file.exists 仍 FALSE，误报
+    # 「未产出 dist.csv」）；运行元数据 = tenifold_meta.json（曾错写 run_meta.json
+    # → empty_knockout_genes/engine_version 静默落 fallback）。
+    out_csv <- file.path(tmp_dir, "tenifold_perturbation_distances.csv")
+    rmeta_json <- file.path(tmp_dir, "tenifold_meta.json")
     cmd <- sprintf(paste(
       '"%s" "%s" --input "%s" --meta "%s" --targets "%s" --out_dir "%s"',
       "--n_net %d --n_cells %d --n_comp %d --td_k %d --ma_n_dim %d --n_cores %d"),
@@ -261,11 +266,11 @@ run_tenifold_engine <- function(cfg, X_counts, var_names, targets, tk) {
                                    st, tmp_dir)))
     }
     if (!file.exists(out_csv)) {
-      return(list(ok = FALSE, reason = "tenifold_knk.R 未产出 dist.csv"))
+      return(list(ok = FALSE, reason = sprintf(
+        "tenifold_knk.R 未产出 %s", basename(out_csv))))
     }
     dist_df <- utils::read.csv(out_csv, stringsAsFactors = FALSE, check.names = FALSE)
-    rmeta <- tryCatch(read_json(file.path(tmp_dir, "run_meta.json")),
-                      error = function(e) list())
+    rmeta <- tryCatch(read_json(rmeta_json), error = function(e) list())
     empty_ko <- as.character(unlist(rmeta$empty_knockout_genes %||% list()))
     # 成功才清理临时目录（失败时矩阵是「R 吃到了什么」的唯一证据）
     unlink(tmp_dir, recursive = TRUE)
@@ -283,7 +288,7 @@ run_tenifold_engine <- function(cfg, X_counts, var_names, targets, tk) {
 
 # 距离矩阵 -> 每基因一行（compress_tenifold_distances 同语义）
 compress_tenifold_distances <- function(dist_df, res) {
-  # dist.csv：第 1 列基因名，其余列同名基因（对称矩阵）
+  # 距离表：第 1 列基因名，其余列同名基因（对称矩阵）
   m <- as.matrix(dist_df[, -1L, drop = FALSE])
   rownames(m) <- dist_df[[1L]]
   rows <- list()
