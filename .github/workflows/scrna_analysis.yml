@@ -185,13 +185,14 @@ jobs:
       # **改了下面的 packages 列表就必须递增这个 vN。**
       # cache key 一旦存在就不再写回 —— 沿用旧 key 时新装的包每次被丢掉，
       # 于是每轮 CI 都重装一遍，看起来像"缓存没命中"，其实是 key 没换。
+      # restore-keys 不能写宽前缀 rlib-${{ runner.os }}-：R workflow 的
+      # rlib-Linux-scrna-r-v2（R 全家桶）落盘后会反向污染这里，38MB 的
+      # tenifold 库被换成 ~2GB 的错误内容（run30 排障实锤的镜像问题）。
       - name: 缓存 R 包
         uses: actions/cache@v4
         with:
           path: ${{ env.R_LIBS_USER }}
           key: rlib-${{ runner.os }}-sc-tenifold-v1
-          restore-keys: |
-            rlib-${{ runner.os }}-
 
       - name: 安装 R 包（scTenifoldKnk）
         uses: r-lib/actions/setup-r-dependencies@v2

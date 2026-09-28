@@ -44,9 +44,12 @@ jobs:
   pipeline-r:
     runs-on: ubuntu-latest
     # 首轮（冷缓存）要装 18 个包（含 Seurat/DESeq2/destiny/liana 这些大家伙，
-    # geo 全冷缓存实测约 720s），暖缓存整轮参照 geo 约 9 分钟。写 45 留余量：
-    # 被掐死的 job 存不下缓存，下一轮又是冷缓存 → "每次都超时"死循环。
-    timeout-minutes: 45
+    # geo 全冷缓存实测约 720s），暖缓存整轮参照 geo 约 9 分钟。
+    # 45 是实测死值（run30 两次 36384083043 实锤：冷缓存装包 ~40min，pipeline
+    # 刚跑到 08 tenifold 就被 45min 整点掐死，连砍两轮）；且被掐死的 job
+    # 存不下缓存 → 下一轮又是冷缓存 → "每次都超时"死循环。放开到 90：
+    # 第一轮冷启动成功后缓存落盘，后续恢复 ~15min 量级。
+    timeout-minutes: 90
 
     # 与 common.R env 钉定段同源的浮点钉定（geo_analysis.yml 同款）：
     # 线程数与 OpenBLAS 内核是**两组独立问题**，只钉线程数不够（geo 规则 12 实测）。
@@ -77,13 +80,17 @@ jobs:
           use-public-rspm: true
 
       # **改 scripts/r_deps.R 的清单必须递增这里的 vN。**
+      # restore-keys **不能写 `rlib-${{ runner.os }}-` 这种宽前缀**（run30 实锤）：
+      # Python workflow 的 tenifold 缓存 key 是 rlib-Linux-sc-tenifold-v1（38MB，
+      # 只有两个包），宽前缀每次都"假命中"它 → actions/cache@v4 的 post 判定
+      # 已命中、跳过保存 → rlib-*-scrna-r-v1 从未被写入 → 每轮 34-40min 冷装 →
+      # 45min timeout 连砍两轮（36384083043 attempt 1/2）。删掉 restore-keys，
+      # 只允许精确匹配；v1→v2 与假命中隔离。
       - name: Cache R library
         uses: actions/cache@v4
         with:
           path: ${{ env.R_LIBS_USER }}
-          key: rlib-${{ runner.os }}-scrna-r-v1
-          restore-keys: |
-            rlib-${{ runner.os }}-
+          key: rlib-${{ runner.os }}-scrna-r-v2
 
       # setup-r-dependencies 自己读包清单装；清单的唯一事实源是
       # scripts/r_deps.R（r_version.md §6.4：不新增清单门禁，靠这份文件）。
