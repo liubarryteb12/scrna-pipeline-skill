@@ -404,6 +404,21 @@ run_06_communication <- function(cfg) {
   n_zero_dropped <- 0L # 打分恒为 0、未做置换的组合数
   n_nonfinite <- 0L    # 打分非有限（NA/NaN）的组合数 —— 如实入账，不静默归 0
   p_res <- round(1.0 / (N_PERMUTATIONS + 1L), 8)
+  # run37 实锤：rbind 报 numbers of columns of arguments do not match ——
+  # NA 行(11 字段含 note) / 零分行(10 字段) / 置换行(12 字段) 三种字段集，
+  # run34-36 全行同型（全 NA 或全 0）掩盖了它，置换分支首次真跑后 rbind 炸。
+  # 修法：统一构造函数 —— 所有行固定 13 字段（note 可为 ""）。
+  mk_row <- function(pair, sender, receiver, ligand, receptor, score,
+                     null_mean, p_value, n_perm, tested, note = "",
+                     p_at_floor = NA) {
+    list(pair = pair, sender = sender, receiver = receiver,
+         ligand = ligand, receptor = receptor, score = score,
+         null_mean = null_mean, p_value = p_value,
+         n_permutations = n_perm,
+         p_value_resolution = p_res,
+         p_value_at_floor = p_at_floor,
+         tested = tested, note = note)
+  }
   for (pr in present) {
     for (src in groups) {
       for (dst in groups) {
@@ -431,12 +446,12 @@ run_06_communication <- function(cfg) {
           }
           n_nonfinite <- n_nonfinite + 1L
           ri_ <- ri_ + 1L
-          rows[[ri_]] <- list(pair = pr$name, sender = src, receiver = dst,
-                              ligand = paste(pr$ligand, collapse = ","),
-                              receptor = paste(pr$receptor, collapse = ","),
-                              score = NA, null_mean = NA,
-                              p_value = NA, n_permutations = 0L, tested = FALSE,
-                              note = "obs 非有限（NA/NaN）—— 未检验，不得当 0 分")
+          rows[[ri_]] <- mk_row(pr$name, src, dst,
+                                paste(pr$ligand, collapse = ","),
+                                paste(pr$receptor, collapse = ","),
+                                score = NA, null_mean = NA,
+                                p_value = NA, n_perm = 0L, tested = FALSE,
+                                note = "obs 非有限（NA/NaN）—— 未检验，不得当 0 分")
           next
         }
         if (obs <= 0) {
@@ -445,11 +460,12 @@ run_06_communication <- function(cfg) {
           # 零分组合的 p=1.0 是它在这个检验家庭里的正确取值。
           n_zero_dropped <- n_zero_dropped + 1L
           ri_ <- ri_ + 1L
-          rows[[ri_]] <- list(pair = pr$name, sender = src, receiver = dst,
-                              ligand = paste(pr$ligand, collapse = ","),
-                              receptor = paste(pr$receptor, collapse = ","),
-                              score = 0, null_mean = NA,
-                              p_value = 1.0, n_permutations = 0L, tested = FALSE)
+          rows[[ri_]] <- mk_row(pr$name, src, dst,
+                                paste(pr$ligand, collapse = ","),
+                                paste(pr$receptor, collapse = ","),
+                                score = 0, null_mean = NA,
+                                p_value = 1.0, n_perm = 0L, tested = FALSE,
+                                p_at_floor = TRUE)
           next
         }
         # 置换：打乱细胞标签，看这个分数有多容易随机出现
@@ -465,16 +481,14 @@ run_06_communication <- function(cfg) {
         p <- (sum(null >= obs) + 1L) / (N_PERMUTATIONS + 1L)
         n_evaluated <- n_evaluated + 1L
         ri_ <- ri_ + 1L
-        rows[[ri_]] <- list(pair = pr$name, sender = src, receiver = dst,
-                            ligand = paste(pr$ligand, collapse = ","),
-                            receptor = paste(pr$receptor, collapse = ","),
-                            score = round(obs, 5),
-                            null_mean = round(mean(null), 5),
-                            p_value = round(p, 5),
-                            n_permutations = N_PERMUTATIONS,
-                            p_value_resolution = p_res,
-                            p_value_at_floor = abs(p - p_res) < 1e-12,
-                            tested = TRUE)
+        rows[[ri_]] <- mk_row(pr$name, src, dst,
+                              paste(pr$ligand, collapse = ","),
+                              paste(pr$receptor, collapse = ","),
+                              score = round(obs, 5),
+                              null_mean = round(mean(null), 5),
+                              p_value = round(p, 5),
+                              n_perm = N_PERMUTATIONS, tested = TRUE,
+                              p_at_floor = abs(p - p_res) < 1e-12)
       }
     }
   }
