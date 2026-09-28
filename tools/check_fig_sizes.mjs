@@ -44,6 +44,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import zlib from 'node:zlib'
 
 const PT_PER_MM = 72 / 25.4
 const W_SINGLE_MM = 89
@@ -65,10 +66,10 @@ if (!fs.existsSync(target) || !fs.statSync(target).isDirectory()) {
 }
 
 /** 读 PDF 的 /MediaBox，返回 { widthMM, heightMM }；读不到返回 null。 */
-function mediaBoxMM(file) {
-  // latin1 保证字节到字符一一对应，不会因为非 UTF-8 内容丢字节。
-  const text = fs.readFileSync(file).toString('latin1')
-  const m = /\/MediaBox\s*\[\s*([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s*\]/.exec(text)
+const MEDIA_BOX_RE =
+  /\/MediaBox\s*\[\s*([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s*\]/
+
+function matchToMM(m) {
   if (!m) return null
   const x0 = parseFloat(m[1])
   const x1 = parseFloat(m[3])
@@ -79,6 +80,46 @@ function mediaBoxMM(file) {
     widthMM: Math.abs(x1 - x0) / PT_PER_MM,
     heightMM: Math.abs(y1 - y0) / PT_PER_MM,
   }
+}
+
+// cairo_pdf 写 PDF 1.7：页面字典装进 **对象流（/ObjStm）**，FlateDecode 压缩，
+// 正文明文搜不到 /MediaBox（run32 实锤：39/39 全部"读不到"）。
+// 解压每个 ObjStm 的 stream，在解压文本里再搜一遍。matplotlib 的 PDF 1.4
+// 不用 ObjStm，走下面的明文路径 —— 两种后端都覆盖。
+function extractObjStmText(text, buf) {
+  const parts = []
+  const re = /<<[^>]*?\/Type\s*\/ObjStm[^>]*?>>\s*stream\r?\n?/g
+  for (const m of text.matchAll(re)) {
+    const end = text.indexOf('endstream', m.index + m[0].length)
+    if (end < 0) continue
+    const start = m.index + m[0].length
+    try {
+      parts.push(zlib.inflateSync(buf.subarray(start, end)).toString('latin1'))
+    } catch {
+      // 流尾可能有脏字节 —— 截短一字节再试一次（PDF 流常以 \r\n 结尾多算）
+      try {
+        parts.push(
+          zlib.inflateSync(buf.subarray(start, end - 1)).toString('latin1'),
+        )
+      } catch {
+        /* 解不开的流跳过 —— 解不开就必须判红，不能静默放行 */
+      }
+    }
+  }
+  return parts.join('\n')
+}
+
+function mediaBoxMM(file) {
+  // latin1 保证字节到字符一一对应，不会因为非 UTF-8 内容丢字节。
+  const buf = fs.readFileSync(file)
+  const text = buf.toString('latin1')
+  // 1) 明文（matplotlib / R pdf() 设备）
+  let mm = matchToMM(MEDIA_BOX_RE.exec(text))
+  if (mm) return mm
+  // 2) 对象流（cairo_pdf 的 PDF 1.7）
+  const objStmText = extractObjStmText(text, buf)
+  mm = matchToMM(MEDIA_BOX_RE.exec(objStmText))
+  return mm
 }
 
 // `__<短SHA>` 是 workflow 事后写的带版本号副本，和规范名内容相同 —— 不重复检查。
