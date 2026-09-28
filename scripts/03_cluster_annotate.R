@@ -112,6 +112,17 @@ score_celltypes <- function(log_counts_all, clusters, sig, seed = 42L) {
     return(list(per_cell = NULL, assign = NULL,
                 diag = list(reason = "签名里的基因一个都不在数据里")))
   }
+  # 诊断（run21 实锤：present 非空但 Seurat 报签名基因 not present ——
+  # 行名在进入 CreateSeuratObject 前后发生了改写。把两边各打几个出来定位）
+  log_info(sprintf("打分诊断: present %d 类型 / %d 基因; all_genes 头3=%s; CD3D 在 all_genes=%s",
+                   length(present), length(unlist(present)),
+                   paste(utils::head(all_genes, 3L), collapse = ","),
+                   "CD3D" %in% all_genes))
+  obj_probe <- Seurat::CreateSeuratObject(counts = log_counts_all[intersect(unlist(present), rownames(log_counts_all)), , drop = FALSE])
+  log_info(sprintf("打分诊断: CreateSeuratObject 后 feature 头3=%s; n_features=%d",
+                   paste(utils::head(rownames(obj_probe[["RNA"]]$counts), 3L), collapse = ","),
+                   nrow(obj_probe[["RNA"]]$counts)))
+  rm(obj_probe)
 
   # Seurat AddModuleScore：ctrl = 每个签名基因配 25 个对照基因（bin 数对齐
   # scanpy score_genes n_bins=25，未决 3）；seed 固定保证对照抽取可复现。
@@ -123,11 +134,30 @@ score_celltypes <- function(log_counts_all, clusters, sig, seed = 42L) {
   # CreateSeuratObject 只填 counts 层、不产 data 层（没跑 NormalizeData）——
   # 默认值会找不到 data 层直接报错。喂进来的本来就是 log 后矩阵，语义即
   # 打分输入。
-  obj <- Seurat::AddModuleScore(obj, features = list(present),
-                                ctrl = 25L, name = "score_", slot = "counts")
-  # AddModuleScore 列名是 score_1..score_n（name 参数只做前缀）
-  score_cols <- paste0("score_", seq_along(present))
-  sc_mat <- obj@meta.data[, score_cols, drop = FALSE]
+  # **bin 数降级链（run21 实锤）**：全基因集里大量零表达基因 → Seurat 内部
+  # cut(mean.expr, breaks=ctrl+1) 分位数重复 → `Insufficient data values to
+  # produce 24 bins`。scanpy 对空 bin 静默容忍，Seurat 严格报错 —— 同一数据
+  # Python 能过 R 不能。降级重试并如实记录实际用到的 ctrl 值。
+  sc_mat <- NULL; ctrl_used <- NA_integer_; ctrl_err <- NULL
+  for (ctrl_n in c(25L, 10L, 5L, 3L, 1L)) {
+    set.seed(seed)   # 每次 try 重置，保证降级结果可复现
+    r <- tryCatch({
+      o <- Seurat::AddModuleScore(obj, features = list(present),
+                                  ctrl = ctrl_n, name = "score_", slot = "counts")
+      o@meta.data[, paste0("score_", seq_along(present)), drop = FALSE]
+    }, error = function(e) { ctrl_err <<- conditionMessage(e); NULL })
+    if (!is.null(r)) { sc_mat <- r; ctrl_used <- ctrl_n; break }
+  }
+  if (is.null(sc_mat)) {
+    return(list(per_cell = NULL, assign = NULL,
+                diag = list(reason = sprintf(
+                  "AddModuleScore 全部 bin 档位失败（ctrl 25->1）：%s",
+                  ctrl_err %||% "unknown"))))
+  }
+  if (!identical(ctrl_used, 25L)) {
+    log_warn(sprintf("AddModuleScore ctrl 从 25 降到 %d（全基因集零表达基因多，Seurat 严格分箱报错；scanpy 空 bin 静默容忍，两版行为差异如实记录）：%s",
+                     ctrl_used, ctrl_err %||% ""))
+  }
   colnames(sc_mat) <- names(present)
 
   # 按簇均值
