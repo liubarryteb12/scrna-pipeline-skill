@@ -184,7 +184,9 @@ run_07_grn <- function(cfg) {
     j <- pos[[tf]]
     # 与所有候选基因的相关（已标准化：内积 / n_cells；tcrossprod 的
     # (i,j) 元 = 基因 i 与基因 j 的标准化向量内积）
-    corr <- tryCatch(as.numeric(tcrossprod(Xc, Xc[j, ])) / ncol(Xc),
+    # Xc[j,] 标量 j 默认 drop=TRUE 降成向量 → tcrossprod(矩阵, 向量) non-conformable
+    # （run22 实锤 [Xc=3139x2574, Xc[j,]=2574]）。必须 drop=FALSE 保 1x2574 矩阵。
+    corr <- tryCatch(as.numeric(tcrossprod(Xc, Xc[j, , drop = FALSE])) / ncol(Xc),
       error = function(e) stop(sprintf(
         "tcrossprod 失败 (tf=%s iter=%d): %s [Xc=%dx%d, Xc[j,]=%d]",
         tf, tf_iter, conditionMessage(e), nrow(Xc), ncol(Xc), length(Xc[j, ])),

@@ -138,11 +138,16 @@ score_celltypes <- function(log_counts_all, clusters, sig, seed = 42L) {
   # cut(mean.expr, breaks=ctrl+1) 分位数重复 → `Insufficient data values to
   # produce 24 bins`。scanpy 对空 bin 静默容忍，Seurat 严格报错 —— 同一数据
   # Python 能过 R 不能。降级重试并如实记录实际用到的 ctrl 值。
+  # **features 直接传 present，不能再包 list()**：present 已是 list（每个细胞
+  # 类型一个基因向量）；包成 list(present) 变双层嵌套，Seurat 匹配不到任何
+  # 基因 → run21/22 的 "features are not present" warning 全表（诊断证实
+  # CD3D 在 all_genes、probe obj 里也可见 —— 问题出在 features 形状不在矩阵）。
+  # meta.data 列名 score_1..score_n 与 seq_along(present) 对齐 ✓。
   sc_mat <- NULL; ctrl_used <- NA_integer_; ctrl_err <- NULL
   for (ctrl_n in c(25L, 10L, 5L, 3L, 1L)) {
     set.seed(seed)   # 每次 try 重置，保证降级结果可复现
     r <- tryCatch({
-      o <- Seurat::AddModuleScore(obj, features = list(present),
+      o <- Seurat::AddModuleScore(obj, features = present,
                                   ctrl = ctrl_n, name = "score_", slot = "counts")
       o@meta.data[, paste0("score_", seq_along(present)), drop = FALSE]
     }, error = function(e) { ctrl_err <<- conditionMessage(e); NULL })
