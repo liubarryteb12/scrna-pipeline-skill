@@ -223,15 +223,22 @@ run_tenifold_engine <- function(cfg, X_counts, var_names, targets, tk) {
     gene_sums_before <- rowSums(sub)
 
     mat_file <- file.path(tmp_dir, "expr_matrix.txt")
-    writeLines(c(paste(colnames(sub), collapse = "\t"),
+    # 表头必须是**基因名**（n_genes 个）—— read_counts 把第 1 行当行名挂到
+    # genes x cells 矩阵上（与 Python 08_virtual_perturbation.py:589 同契约）。
+    # 曾错写 colnames(sub)（细胞名 2574 个）→ dimnames 长度不等直接崩。
+    writeLines(c(paste(rownames(sub), collapse = "\t"),
                  apply(sub, 1L, paste, collapse = "\t")), mat_file)
+    # meta 字段名与 tenifold_knk.R assert_orientation 的契约一致：
+    # genes（有序全量）/ gene_sums（每基因总计数，方向见证），不是别名。
     meta <- list(n_genes = nrow(sub), n_cells = ncol(sub),
-                 gene_names = sel_names,
-                 gene_sums_first5 = head(gene_sums_before, 5L))
+                 genes = sel_names,
+                 gene_sums = as.numeric(gene_sums_before))
     write_json(file.path(tmp_dir, "meta.json"), meta)
 
-    tget <- data.frame(gene = cand, stringsAsFactors = FALSE)
-    utils::write.csv(tget, file.path(tmp_dir, "targets.csv"), row.names = FALSE)
+    # targets 文件是**纯文本每行一个基因**（readLines 读，L243）——
+    # 不能写 CSV 表头 `gene`，否则第一个"基因"就是字面量 "gene"（Python
+    # 08_virtual_perturbation.py:599 同契约 write_text("\n".join(cand))）。
+    writeLines(cand, file.path(tmp_dir, "targets.txt"))
 
     rscript <- file.path(dirname(get_script_path()), "lib", TENIFOLD_R)
     if (!file.exists(rscript)) {
@@ -243,7 +250,7 @@ run_tenifold_engine <- function(cfg, X_counts, var_names, targets, tk) {
       '"%s" "%s" --input "%s" --meta "%s" --targets "%s" --out_dir "%s"',
       "--n_net %d --n_cells %d --n_comp %d --td_k %d --ma_n_dim %d --n_cores %d"),
       file.path(R.home("bin"), "Rscript"), rscript, mat_file,
-      file.path(tmp_dir, "meta.json"), file.path(tmp_dir, "targets.csv"),
+      file.path(tmp_dir, "meta.json"), file.path(tmp_dir, "targets.txt"),
       tmp_dir, tk$n_net, tk$n_cells, tk$n_comp, tk$td_k, tk$ma_n_dim, tk$n_cores)
     log_info(sprintf("Tenifold 引擎: %d 基因 x %d 细胞, n_net=%d（CI 预算内）",
                      nrow(sub), ncol(sub), tk$n_net))
