@@ -578,3 +578,24 @@ PAL_CYCLE**（与 `axes.prop_cycle` 同源），需要就加显式图例。
 判据：`For` / `AsyncFor` / `While` 的**同作用域**子树里建了图（`subplots` / `figure` / `sc.pl.*`）却没有保存调用（`save_fig` / `savefig` / `close` / 本文件内含保存调用的帮助函数）⇒ 判红。**已知局限：跨模块的保存帮助函数仍判红。**
 
 台账：governance/15_ERROR_LEDGER.md E-70（任务行 governance/02_TASKLIST.md R-04h）
+
+## 32. R 语言版本与 Python 版并存：契约与差异登记（R-10，2026-09-28）
+
+**规则：`scripts/*.R` 是同一套分析的可选 R 版（与 Python 版并存，不替换）。两版共用
+`assets/config.*.yml`、`data/`、`results/` 契约与图名规范，改任何一侧契约必须同步另一侧。**
+
+- **语言开关**：配置顶层 `pipeline.language`；两版各读到对方语言即报错退出，不许静默改跑。
+- **图名集合相等**：R/Python 产出的图名集合必须一致（`check_fig_names.mjs` 的
+  `figures:parity` 判据）；确有差异的图用 `# R_FIG_DIFF:` 注释登记豁免理由。
+- **中间对象**：R 版走 `.rds`，不走 `.h5ad`（避免 basilisk/conda）；跨语言对照一律走 CSV。
+- **验收层 check id 集合必须与 Python 版一致**（n_checks 可不同，差异记 `R_CHK_DIFF:`）。
+- **HUMAN_REVIEW 节点 pending 不许自动确认**；`chk()` 第 2 位置参是 kind 不是 severity
+  （E-53 同族，两语言都栽过）。
+- **CI**：`scrna_r_analysis.yml` 与 Python workflow 按 paths 隔离（改 .py 不触发 R job）；
+  装包唯一事实源 = workflow 清单（`r_deps.R` 只报告不安装——本地禁止 install.packages，
+  R1 纪律）。
+- **经验证的方法学差异**已登记 `references/r_version.md`（各步选型等级 D 零差异/A 同方法
+  不同实现/B 换实现同思路/C 真方法差异）；打分 bins 塌缩一类「库行为差异」修后必须把
+  §3 选型表与 §11 未决项一并收口，不许只改代码。
+
+台账：governance/02_TASKLIST.md R-05..R-10b；排障全链见 R-10b 行备查的 governance git 历史。
