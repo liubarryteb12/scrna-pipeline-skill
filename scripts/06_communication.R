@@ -223,10 +223,20 @@ compare_with_liana <- function(liana_res, own) {
     out$n_own_only <- length(setdiff(names(ow_score), names(lr_score)))
     out$n_liana_only <- length(setdiff(names(lr_score), names(ow_score)))
     if (length(common) >= 5L) {
-      rho <- stats::cor(ow_score[common], lr_score[common],
-                        method = "spearman",
-                        use = "complete.obs")
-      out$spearman_rho <- round(as.numeric(rho), 4)
+      # run35 实锤：自建 score 全 NA 时 cor(use="complete.obs") 抛
+      # "no complete element pairs" —— 不是对比逻辑错，是上游打分全 NA 的
+      # 连带症状。防御：完整对 <2 时如实记 reason，不抛错淹没根因。
+      n_complete <- sum(is.finite(ow_score[common]) & is.finite(lr_score[common]))
+      if (n_complete < 2L) {
+        out$comparison_reason <- sprintf(
+          "完整对 %d（自建侧非有限 %d/%d）—— 上游打分全 NA 的连带，先修打分根因",
+          n_complete, sum(!is.finite(ow_score[common])), length(common))
+      } else {
+        rho <- stats::cor(ow_score[common], lr_score[common],
+                          method = "spearman",
+                          use = "complete.obs")
+        out$spearman_rho <- round(as.numeric(rho), 4)
+      }
     }
     for (n in c(10L, 25L, 50L)) {
       if (length(common) >= n) {
@@ -355,11 +365,28 @@ run_06_communication <- function(cfg) {
     # Python 版 NaN<=0 判 False 静默续跑；R if(NaN) 直接 fatal（run19 实锤
     # missing value where TRUE/FALSE needed）。这里把非有限显式传出去，
     # 调用端如实记 NA + note，不让 NaN 静默变 0（谎报）也不让步骤崩。
-    if (length(val) != 1L || !is.finite(val)) return(NA_real_)
+    if (length(val) != 1L || !is.finite(val)) {
+      # run35 诊断实锤：CD274 行 @x 无 NA、全细胞均值有限（0.0041），但组合
+      # 仍 NA —— a/b 谁是 NA 必须当场拆开。列子集 mean 出 NA 的两个候选：
+      # 列子集里混进显式 NA（@x 路径）或 mean 分派异常。首例打印全部输入。
+      if (n_nonfinite == 0L) {
+        la <- small[li, s_idx, drop = FALSE]
+        lb <- small[ri, d_idx, drop = FALSE]
+        log_warn(sprintf(
+          paste0("首个非有限打分拆解: pair=%s a_NA=%s b_NA=%s ",
+                 "a_anyNA_x=%s a_len_x=%d a_sum=%s a_len=%d ",
+                 "b_anyNA_x=%s b_len_x=%d b_sum=%s b_len=%d"),
+          pr_name_cur, is.na(a), is.na(b),
+          anyNA(la@x), length(la@x), sprintf("%.6g", sum(la@x)), length(la),
+          anyNA(lb@x), length(lb@x), sprintf("%.6g", sum(lb@x)), length(lb)))
+      }
+      return(NA_real_)
+    }
     val
   }
 
   rows <- list(); ri_ <- 0L
+  pr_name_cur <- ""   # 诊断用：当前 pair 名（score_combo 拆解日志引用）
   n_evaluated <- 0L    # 真正做过置换检验的组合数
   n_zero_dropped <- 0L # 打分恒为 0、未做置换的组合数
   n_nonfinite <- 0L    # 打分非有限（NA/NaN）的组合数 —— 如实入账，不静默归 0
@@ -368,6 +395,7 @@ run_06_communication <- function(cfg) {
     for (src in groups) {
       for (dst in groups) {
         if (identical(src, dst)) next
+        pr_name_cur <- pr$name
         obs <- score_combo(pr$ligand, pr$receptor, masks[[src]], masks[[dst]])
         if (is.na(obs)) {
           # 非有限打分：第一次打诊断日志（定位 NaN 源头用），组合如实记 NA。
