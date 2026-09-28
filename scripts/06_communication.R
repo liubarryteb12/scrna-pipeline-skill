@@ -359,26 +359,39 @@ run_06_communication <- function(cfg) {
     li <- intersect(lig_genes, rownames(small))
     ri <- intersect(rec_genes, rownames(small))
     if (!length(li) || !length(ri)) return(0)
-    a <- mean(small[li, s_idx, drop = FALSE])
-    b <- mean(small[ri, d_idx, drop = FALSE])
+    # run36 拆解实锤（拆解日志：a_NA=TRUE 而 a_anyNA_x=FALSE / a_sum=4.75989 /
+    # a_len=1151 全部有限、06 步段 0 个 R 原生 Warning）—— 输入全有限而 mean 返回
+    # NA，毒源只能 mean 自身对稀疏子矩阵的分派（Matrix 1.7-3 起 mean() 有 S4 方法，
+    # 其稀疏实现对本仓这批 1 行 x N 列子矩阵返回 NA 的机制未明，且本地无 R 无法
+    # 复现）。修法**绕开 mean 分派**：mean = sum/length 的显式展开（数学等价，
+    # sum 的 S4 方法已证实走 @x 且有限 —— 诊断行 mean_direct 同式算出有限值）。
+    la <- small[li, s_idx, drop = FALSE]
+    lb <- small[ri, d_idx, drop = FALSE]
+    a <- sum(la) / length(la)
+    b <- sum(lb) / length(lb)
     val <- as.numeric(a * b)
     # Python 版 NaN<=0 判 False 静默续跑；R if(NaN) 直接 fatal（run19 实锤
     # missing value where TRUE/FALSE needed）。这里把非有限显式传出去，
     # 调用端如实记 NA + note，不让 NaN 静默变 0（谎报）也不让步骤崩。
     if (length(val) != 1L || !is.finite(val)) {
       # run35 诊断实锤：CD274 行 @x 无 NA、全细胞均值有限（0.0041），但组合
-      # 仍 NA —— a/b 谁是 NA 必须当场拆开。列子集 mean 出 NA 的两个候选：
-      # 列子集里混进显式 NA（@x 路径）或 mean 分派异常。首例打印全部输入。
+      # 仍 NA —— a/b 谁是 NA 必须当场拆开。run36 拆解已出（a_NA=TRUE 而 @x 干净），
+      # 本段改为「sum/length 修后若仍 NA」的实证取证：打印 class、mean 分派方法、
+      # sum/length/as.matrix 各自的值，一轮定位残余毒源。
       if (n_nonfinite == 0L) {
-        la <- small[li, s_idx, drop = FALSE]
-        lb <- small[ri, d_idx, drop = FALSE]
         log_warn(sprintf(
           paste0("首个非有限打分拆解: pair=%s a_NA=%s b_NA=%s ",
-                 "a_anyNA_x=%s a_len_x=%d a_sum=%s a_len=%d ",
-                 "b_anyNA_x=%s b_len_x=%d b_sum=%s b_len=%d"),
+                 "a_class=%s a_sum=%s a_len=%d a_mean_sum_len=%s ",
+                 "a_mean_as_matrix=%s a_anyNA_x=%s b_class=%s ",
+                 "b_sum=%s b_len=%d b_anyNA_x=%s anyNA_s_idx=%s"),
           pr_name_cur, is.na(a), is.na(b),
-          anyNA(la@x), length(la@x), sprintf("%.6g", sum(la@x)), length(la),
-          anyNA(lb@x), length(lb@x), sprintf("%.6g", sum(lb@x)), length(lb)))
+          paste(class(la), collapse = "+"),
+          sprintf("%.6g", sum(la)), length(la),
+          sprintf("%.6g", sum(la) / length(la)),
+          sprintf("%.6g", mean(as.matrix(la))),
+          anyNA(la@x), paste(class(lb), collapse = "+"),
+          sprintf("%.6g", sum(lb)), length(lb), anyNA(lb@x),
+          anyNA(s_idx)))
       }
       return(NA_real_)
     }
