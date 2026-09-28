@@ -316,10 +316,14 @@ compress_tenifold_distances <- function(dist_df, res) {
       next
     }
     o <- order(v, decreasing = TRUE)
+    # **order() 返回无名整数向量** —— names(o) 是 NULL，NULL[1L] = NULL，
+    # data.frame(gene=NULL) 0 行 → rbind 报 `differing number of rows: 1, 0`
+    # （run29 实锤，tenifold 386s 跑完后 60ms 崩）。top 基因从 **v 的名字**取
+    # （= 网络基因列名，Python dist.columns[j] 同语义）。
     rows[[length(rows) + 1L]] <- list(
       gene = g, tenifold_n_genes_scored = length(v),
       mean_distance = sig6(mean(v)), max_distance = sig6(max(v)),
-      top_gene = names(o)[1L], top_distance = sig6(v[o[1L]]),
+      top_gene = names(v)[o[1L]], top_distance = sig6(v[o[1L]]),
       target_outdegree = length(v), empty_knockout = FALSE,
       top_distance_real = sig6(v[o[1L]]))
   }

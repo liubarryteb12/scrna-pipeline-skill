@@ -112,13 +112,19 @@ try_liana <- function(clu, group_labels, cfg) {
   info$version <- tryCatch(as.character(utils::packageVersion("liana")),
                            error = function(e) "unknown")
   out <- tryCatch({
-    # **SCE assays 必须同尺寸**（run20 实锤 all assays must have the same
-    # nrow and ncol）：counts(HVG 2000x2574) 与 logcounts_all(全基因集) 尺寸
-    # 永远不同。logcounts_all 落盘是 细胞x基因（run17 实锤），t() 成 SCE 约定
-    # 的 基因x细胞。单 assay 全基因集 = Python 版 use_raw=True 同语义（raw 才是
-    # 干净 log 表达，主 X 可能被 scale 污染）。
+    # **liana 硬性要求 SCE 同时有 counts + logcounts 两个 assay**（run29 实锤
+    # `liana expects counts and logcounts to be present in the SCE object`）。
+    # SCE assays 必须同尺寸（run20 实锤）→ 只能用 HVG 对（counts/logcounts
+    # 同为 HVG 子集）；logcounts_all 全基因集配不出同尺寸 counts。
+    # 代价：LR 基因不在 HVG 时 liana 会低估 —— 记进 info$gene_scope，
+    # 不静默（Python 版 liana 走 raw 全基因集，这是两版的真实差距）。
+    # 落盘方向：counts/logcounts 都是 细胞x基因（run17 实锤），t() 成 SCE
+    # 约定的 基因x细胞。
     sce <- SingleCellExperiment::SingleCellExperiment(
-      assays = list(logcounts = Matrix::t(clu$logcounts_all)))
+      assays = list(counts = Matrix::t(clu$counts),
+                    logcounts = Matrix::t(clu$logcounts)))
+    info$gene_scope <- "HVG 子集（liana 要求 counts+logcounts 同尺寸，
+                        全基因集 logcounts_all 配不出同尺寸原始计数）"
     # colLabels / reducedDims 是 **SingleCellExperiment 包**的导出（run25 实锤
     # 'colLabels<-' is not an exported object from 'namespace:SummarizedExperiment'
     # —— SummarizedExperiment 只提供 colData 等， SCE 的簇标签/降维槽要挂 SCE 命名空间）。
