@@ -119,9 +119,27 @@ try_liana <- function(clu, group_labels, cfg) {
     # 干净 log 表达，主 X 可能被 scale 污染）。
     sce <- SingleCellExperiment::SingleCellExperiment(
       assays = list(logcounts = Matrix::t(clu$logcounts_all)))
-    SummarizedExperiment::colLabels(sce) <- factor(group_labels)
-    # reducedDim 供 liana 的表达方式选择；PCA 已在 02 算好
-    SummarizedExperiment::reducedDims(sce) <- list(PCA = clu$pca)
+    # colLabels / reducedDims 是 **SingleCellExperiment 包**的导出（run25 实锤
+    # 'colLabels<-' is not an exported object from 'namespace:SummarizedExperiment'
+    # —— SummarizedExperiment 只提供 colData 等， SCE 的簇标签/降维槽要挂 SCE 命名空间）。
+    # 簇标签按 SCE **列名（细胞名）显式匹配重排** —— clusters 向量的名序与
+    # t(logcounts_all) 的列序来自不同落盘对象，集合相同不代表顺序相同；
+    # colLabels<- 按位置赋值，顺序错 = 标签错配且不报错（比崩更危险）。
+    cells_sce <- colnames(sce)
+    miss <- sum(!cells_sce %in% names(group_labels))
+    if (miss > 0L) {
+      stop(sprintf("liana SCE 有 %d 个细胞在簇标签向量里找不到 —— 无法对齐", miss),
+           call. = FALSE)
+    }
+    labels_aligned <- factor(group_labels[cells_sce])
+    names(labels_aligned) <- NULL
+    SingleCellExperiment::colLabels(sce) <- labels_aligned
+    # reducedDim 的行（细胞）同样按列名对齐，缺行名的 PCA 直接不给（liana 只在
+    # 需要表达方式时才用 reducedDim，缺了退默认 logcounts，不硬塞错位矩阵）。
+    if (!is.null(rownames(clu$pca)) &&
+        setequal(rownames(clu$pca), cells_sce)) {
+      SingleCellExperiment::reducedDims(sce) <- list(PCA = clu$pca[cells_sce, , drop = FALSE])
+    }
     # liana_wrap 顶层没有 n_perms/seed 参数（那是 natmi 等各 method 的内部
     # 参数，liana_wrap 的 ... 不做透传登记，多余参数直接 unused argument ——
     # 与 Read10X var.names.repair 同类的 scanpy 语义误置）。
