@@ -43,6 +43,7 @@ const MIN_DPI = 300;
 /** 允许的舍入余量：matplotlib 写 MediaBox 时可能少几个 ulp。 */
 const TOL = 1.0;
 const PT_PER_IN = 72;
+import { inflateSync } from "node:zlib";
 
 function readPngSize(buf) {
   if (buf.readUInt32BE(0) !== 0x89504e47) throw new Error("不是 PNG");
@@ -59,16 +60,52 @@ function readPngSize(buf) {
  * 用 latin1 读：PDF 的交叉引用表里可能有二进制字节，按 utf8 解码会
  * 替换成 U+FFFD 并**改变字节偏移**，而 MediaBox 是 ASCII 文本、
  * 用 latin1 逐字节保留原样，正则照样能匹配。
+ *
+ * cairo_pdf 写 PDF 1.7：页面字典装进压缩对象流（/ObjStm，FlateDecode），
+ * 明文搜不到 /MediaBox（run32/33 实锤）—— 解压每个 ObjStm 流再搜。
+ * matplotlib 与 R pdf()（geo）是 PDF 1.4 明文，走下面的直接路径。
  */
-function readMediaBox(buf) {
-  const txt = buf.toString("latin1");
-  const m = /\/MediaBox\s*\[\s*([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s*\]/.exec(txt);
-  if (!m) throw new Error("读不到 /MediaBox");
+const MEDIA_BOX_RE =
+  /\/MediaBox\s*\[\s*([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s*\]/;
+
+function matchToBox(m) {
   const [, x0, y0, x1, y1] = m.map(Number);
   const w = Math.abs(x1 - x0);
   const h = Math.abs(y1 - y0);
   if (!w || !h) throw new Error("MediaBox 尺寸为 0");
   return { w, h };
+}
+
+function objStmText(buf) {
+  const txt = buf.toString("latin1");
+  const parts = [];
+  const re = /<<[^>]*?\/Type\s*\/ObjStm[^>]*?>>\s*stream\r?\n?/g;
+  for (const m of txt.matchAll(re)) {
+    const end = txt.indexOf("endstream", m.index + m[0].length);
+    if (end < 0) continue;
+    const start = m.index + m[0].length;
+    try {
+      parts.push(inflateSync(buf.subarray(start, end)).toString("latin1"));
+    } catch {
+      try {
+        parts.push(
+          inflateSync(buf.subarray(start, end - 1)).toString("latin1"),
+        );
+      } catch {
+        /* 解不开的流跳过 —— 上层读不到 MediaBox 会判红，不静默放行 */
+      }
+    }
+  }
+  return parts.join("\n");
+}
+
+function readMediaBox(buf) {
+  const txt = buf.toString("latin1");
+  const m = MEDIA_BOX_RE.exec(txt);
+  if (m) return matchToBox(m);
+  const stm = MEDIA_BOX_RE.exec(objStmText(buf));
+  if (stm) return matchToBox(stm);
+  throw new Error("读不到 /MediaBox");
 }
 
 function main() {
