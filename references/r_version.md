@@ -300,6 +300,13 @@ R 版入口脚本的验收层必须复刻 `scripts/main_analysis.py` 的 `run_ac
 2. **`liana` R 版从 GitHub 装**的版本漂移（§3 06 行）—— 是否要钉 commit。
 3. **`AddModuleScore` 与 `score_genes` 的 bin 数**（§3 03 行）—— 配置里显式对齐，
    还是文档里标注差异。
+   **2026-09-28 run21 实锤补充**：除 bin 数外还有**行为差异** —— 全基因集上大量
+   零表达基因使 `cut(mean.expr, breaks=ctrl+1)` 的分位数塌缩，Seurat 报
+   `Insufficient data values to produce 24 bins` 直接失败；scanpy `score_genes`
+   对空 bin 静默容忍。R 版已按降级链 25→10→5→3→1 处理（seed 每档重置、实际档位
+   诚实记录）。两版同数据时 R 可能用更少 bin —— 结果数值不可逐位比，验收层
+   `n_cells_expressing_tf` 类内容检查不受影响。**待拍板**：降级后是否在
+   `cluster_status.json` 加 `ctrl_used` 字段显式记录（当前只进日志）。
 4. **HVG 准则**（§3 02 行）—— `seurat_v3` 与 Seurat 的 `vst` 是否等价，
    需要一个实测对照。
 5. `qc_status.json` 的双细胞字段两版数值不可直接比（§3 01 行）——
