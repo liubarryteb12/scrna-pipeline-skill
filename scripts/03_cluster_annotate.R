@@ -605,7 +605,10 @@ run_03_cluster_annotate <- function(cfg) {
       theme_paper() +
       ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
     save_fig(cfg, "02-03-04-unit1-celltype-scores-heatmap", ph,
-             width = mm(gs$width), height = mm(gs$height))
+             width = gs$width, height = gs$height)
+    # **gs$width/height 已是英寸**（grid_size 内部完成 mm→inch 换算）——
+    # 不能再包一层 mm()：run31 实锤 136mm 图被二次换算成 0.21 英寸 →
+    # 85x34 像素糊死图，墨迹 99.24% 被 check_figures 拦下。
   }
 
   # ---- 7. CellTypist（R 版记 not_run）-------------------------------------
