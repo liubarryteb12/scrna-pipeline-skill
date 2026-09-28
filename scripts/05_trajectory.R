@@ -120,23 +120,19 @@ compute_dpt <- function(expr_hvg, pca_emb, root_idx, seed, log = log_info) {
 # ---------------------------------------------------------------------------
 compute_slingshot <- function(pca_emb, clusters, root_cluster, log = log_info) {
   need_pkg("slingshot", "主曲线拟时序")
-  # 构造顺序关键（run17-19 三跑同错 invalid 'value' in 'reducedDims<-'
-  # 的根因假设）：占位 counts 无 dimnames → SCE 构造时把 reducedDims 里
-  # pca_emb 的 dimnames 剥掉/错配 → slingshot 内部写回 reducedDim 时校验
-  # 失败。先建 SCE（只放 counts）→ 定 colnames（真细胞名）→ **再**赋
-  # reducedDim（SCE 的 reducedDim<- 校验 nrow==ncol(sce) 并对齐）。
-  sce <- SingleCellExperiment::SingleCellExperiment(
-    assays = list(counts = Matrix::Matrix(0, 1, ncol(pca_emb), sparse = TRUE)))
-  colnames(sce) <- rownames(pca_emb)
-  SingleCellExperiment::reducedDim(sce, "PCA") <- pca_emb
-  sce$cluster <- factor(clusters)
-  sling <- slingshot::slingshot(sce, clusterLabels = "cluster",
-                                reducedDim = "PCA", start.clus = root_cluster)
-  # 多谱系时取第一谱系（pbmc3k 单主干；多分支数据集的谱系选择记进 status）
-  pt <- as.numeric(SingleCellExperiment::colData(sling)$slingPseudotime_1)
-  # 谱系统计：slingshot 导出的是 slingLineages()（slingParams 返回的是
-  # 拟合参数 ifs/omega 等，没有 $lineages 槽 —— 之前误写会在 pbmc3k 上
-  # 永远走 fallback 报 1 条谱系，多谱系数据集会错报）。
+  # **直接传矩阵，不走 SCE**（run17-22 六跑教训汇总）：
+  # - SCE 占位 counts + reducedDim 的构造顺序怎么调都触发内部校验失败
+  #   （reducedDims<- invalid → rownames length invalid）；
+  # - slingshot 对 matrix 输入的一等支持最好：pca_emb 细胞xPC 行名=真细胞名；
+  # - clusterLabels 用 **named** character（names=细胞名）→ getLineages 里
+  #   as.matrix 后 rownames 与 X 完全对齐（SCE 分支的 factor(clusters) 会丢
+  #   names，正是 rownames length 校验失败的根源）。
+  sling <- slingshot::slingshot(pca_emb, clusterLabels = clusters,
+                                start.clus = root_cluster)
+  # 拟时序：slingPseudotime 返回 细胞x谱系 矩阵；单主干取第 1 列
+  ptm <- slingshot::slingPseudotime(sling)
+  pt <- as.numeric(ptm[, 1L])
+  # 谱系统计：slingLineages 列出各谱系的簇序列
   lineages <- tryCatch(slingshot::slingLineages(sling),
                        error = function(e) NULL)
   if (is.null(lineages) || length(lineages) == 0L) lineages <- "Lineage1"
