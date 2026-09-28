@@ -108,7 +108,7 @@
 | 00 fetch | `urllib`（UA 伪装）+ `sc.read_10x_mtx/h5`/`read_h5ad` | `download.file()`（**UA 问题在 R 侧要重新踩一遍**，用 `options(HTTPUserAgent=...)`）；`Seurat::Read10X()` / `Read10X_h5()`（hdf5r）；GEO 源走 `GEOquery::getGEO()`；`validate_counts` 等价实现 | B | 读进来的矩阵**坐标约定**（`rownames=基因符号`）必须与 Python 版一致，否则后面全部错位 |
 | 01 qc | `calculate_qc_metrics` + **scrublet** + filter | `Seurat::PercentageFeatureSet(pattern="^MT-")` + **`scDblFinder::scDblFinder`** + `scater::isOutlier`（MAD）+ 手工阈值 | **C** | 双细胞检测器不同：scrublet 是"模拟双体 + 分类器"，scDblFinder 是"人工双体 + 建模"；**检出数量与阈值口径会不同** → `qc_status.json` 里 `n_doublets` 等字段两版不可直接比 |
 | 02 integrate | `normalize_total/log1p/HVG/ComBat/PCA` + harmonypy | `NormalizeData / FindVariableFeatures / ScaleData / RunPCA` + `sva::ComBat` + `harmony::RunHarmony` | A | 归一化的 scale factor 缺省值（`target_sum=1e4`）两侧一致；HVG 选择准则（seurat_v3 vs dispersion）**必须对齐配置**，否则 HVG 集不同 → PCA/聚类全不同 |
-| 03 cluster_annotate | neighbors + umap + leiden + rank_genes_groups + score_genes | `FindNeighbors` + `RunUMAP` + `FindClusters(algorithm=4)`（Leiden）+ `FindAllMarkers`（Wilcoxon）+ `AddModuleScore` + `SingleR`+`celldex` + `clustree` | A/B | `AddModuleScore` 与 `sc.tl.score_genes` 同源（scanpy 是照 Seurat 移植的），但 bin 数缺省值不同（25 vs 100）→ 必须在配置里显式对齐 |
+| 03 cluster_annotate | neighbors + umap + leiden + rank_genes_groups + score_genes | `FindNeighbors` + `RunUMAP` + `FindClusters(algorithm=4)`（Leiden）+ `FindAllMarkers`（Wilcoxon）+ **`score_genes_scanpy_style`（scanpy 语义复刻，见下）** + `SingleR`+`celldex` + `clustree` | **C（打分）** | **打分实现换（run21/23R/25 三轮 CI 实锤）**：`AddModuleScore` 的 `cut(mean.expr, breaks=ctrl+1)` 分位数切桶在全基因集上必塌（重复分位 → `Insufficient data values to produce 24 bins`，ctrl 25→1 降级链无效）；R 侧改为逐条复刻 scanpy 包内源码 `_score_genes.py` 的 **rank(method="min") 整除 n_items 分桶 + 空桶 WARN 跳过 + ctrl_size=50 抽样 + 均值差**（03_cluster_annotate.R `score_genes_scanpy_style`）——结构与 scanpy 同源，数值不可逐位比。CellTypist 段两版一致（R 记 not_run） |
 | 04 pseudobulk_de | **pydeseq2** | **`DESeq2`**（母实现） | **A** | 拟合算法同（负二项 GLM + Wald/LRT），数值可能有末位差；`sizeFactors`/`design` 公式必须同构 |
 | 05 trajectory | 自实现 GCS + DPT + **Palantir** + **scFates（Python 移植）** | 同一套**自实现 GCS（逐行转写公式，保证两侧同值）** + `destiny::dpt` + **Palantir 无 R 实现 → 丢弃** + **`scFates`（CRAN 原版）** | **C** | ① Palantir 丢弃后方法数从 4 → 3，`trajectory_status.json` 的 `method_correlation` 仍成立（≥2 方法即可）；`stable_methods` 名单变为 `["dpt","scfates","cytotrace"]`。② scFates 从"Python 移植"换成"CRAN 原版"，**理论上更接近原始实现**，但数值会有差异。③ **`scFates` 是否在 CRAN 上可装，R-07 实测确认**；装不上则退回 `monocle3` 或 `slingshot` 并在文档标注 |
 | 06 communication | LIANA（`rank_aggregate`，100 perms）+ 自建共表达退回 | `liana`（**GitHub saezlab/liana**，非 CRAN/Bioc）+ 同一套自建退回 | A/B | `liana` 的 R 版是 GitHub 包，CI 里要 `remotes::install_github`（有版本漂移风险）；装不上就退回自建 —— 与 Python 的退回逻辑**同构** |
@@ -298,15 +298,14 @@ R 版入口脚本的验收层必须复刻 `scripts/main_analysis.py` 的 `run_ac
 
 1. **`scFates` 是否在 CRAN 上可装**（§3 05 行）—— **已核实（2026-09-26，R-07）：CRAN 上没有 `scFates`（HTTP 404，带 Chrome UA 复核非拦截），也没有任何同名 R 包 —— "CRAN 原版 scFates" 这个说法本身不成立**（Python `scFates` 从未发布 R 版）。按预案退回 Bioconductor：`slingshot`（HTTP 200）作主曲线树实现 + `TSCAN`（HTTP 200）备选；`destiny`（HTTP 200）承接 DPT。**裁决：05 行的 R 版方法集 = 自实现 GCS（与 Python 逐行同式）+ `destiny::DiffusionMap`+DPT + `slingshot`（主曲线拟时序，对应 scfates 槽位）；`stable_methods = ["dpt","slingshot","cytotrace"]`。** 方法学等级仍记 C（实现全换）；slingshot 的可复现性**没有六轮 CI 证据**，`reproducibility` 段的 stable/unstable 名单与证据文字必须改写、不能照抄 Python 版的 scfates 段。
 2. **`liana` R 版从 GitHub 装**的版本漂移（§3 06 行）—— 是否要钉 commit。
-3. **`AddModuleScore` 与 `score_genes` 的 bin 数**（§3 03 行）—— 配置里显式对齐，
-   还是文档里标注差异。
-   **2026-09-28 run21 实锤补充**：除 bin 数外还有**行为差异** —— 全基因集上大量
-   零表达基因使 `cut(mean.expr, breaks=ctrl+1)` 的分位数塌缩，Seurat 报
-   `Insufficient data values to produce 24 bins` 直接失败；scanpy `score_genes`
-   对空 bin 静默容忍。R 版已按降级链 25→10→5→3→1 处理（seed 每档重置、实际档位
-   诚实记录）。两版同数据时 R 可能用更少 bin —— 结果数值不可逐位比，验收层
-   `n_cells_expressing_tf` 类内容检查不受影响。**待拍板**：降级后是否在
-   `cluster_status.json` 加 `ctrl_used` 字段显式记录（当前只进日志）。
+3. **`AddModuleScore` 与 `score_genes` 的 bin 数**（§3 03 行）—— **已裁决（2026-09-28，
+   run25 后）**：不再纠结 bin 数 —— run21/23R/25 三轮实锤 `AddModuleScore` 的
+   `cut()` 分位数切桶在全基因集上**必塌**（降级链 25→10→5→3→1 全档
+   `Insufficient data values to produce 24 bins`），根修：R 03 打分改
+   `score_genes_scanpy_style`，逐条复刻 scanpy 包内源码 `_score_genes.py` 的
+   rank 整除分桶 + 空桶跳过 + ctrl_size=50 + 均值差（§3 03 行已同步，等级 C）。
+   原"降级后是否在 `cluster_status.json` 加 `ctrl_used` 字段"随 AddModuleScore
+   路线退役，`cluster_status.json` 的打分段字段 schema 不变。
 4. **HVG 准则**（§3 02 行）—— `seurat_v3` 与 Seurat 的 `vst` 是否等价，
    需要一个实测对照。
 5. `qc_status.json` 的双细胞字段两版数值不可直接比（§3 01 行）——

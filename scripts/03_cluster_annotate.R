@@ -18,12 +18,13 @@
 # "不确定"，是"这个指标在这里不适用"—— 要补签名基因，不是去比对两条路。
 #
 # **两条独立的注释路径**（文档 §2.4）：
-#   1. marker 签名打分（Seurat::AddModuleScore + 簇均值）→ celltype_annotation.csv
+#   1. marker 签名打分（score_genes scanpy 语义复刻 + 簇均值）→ celltype_annotation.csv
 #   2. CellTypist 预训练模型 → **R 侧无对应包，如实记 not_run**（r_version.md §3）
 #
 # 方法学等级（references/r_version.md §3）：聚类 A/B（bluster 图聚类等价
-# leiden igraph flavor）、marker A（wilcoxon 同法）、打分 A/B（AddModuleScore
-# 的 bin 数与 scanpy score_genes 的 n_bins=25 对齐 = 未决 3）。
+# leiden igraph flavor）、marker A（wilcoxon 同法）、打分 C（score_genes
+# scanpy 语义复刻：AddModuleScore 在全基因集上 bins 必塌，run21/23R/25 实锤，
+# 改 rank 整除分桶逐条复刻 scanpy/_score_genes.py —— 见 score_genes_scanpy_style）。
 #
 # **签名基因必须在全基因集里找**（03_cluster_annotate.py:96-103 的教训）：
 # 实测用 HVG 找会把 CD3D 判缺失、两簇分数逐位相同 margin 恰为 0 ——
@@ -91,6 +92,64 @@ load_signatures <- function(cfg) {
 }
 
 # ---------------------------------------------------------------------------
+# score_genes scanpy 语义复刻（根修 run21-25 实锤的 bins 塌缩问题）
+#
+# **为什么不再用 AddModuleScore**：Seurat 的 bin 是 cut(mean.expr, breaks=ctrl+1)
+# 分位数切桶，全基因集上重复分位值多 → `Insufficient data values to produce
+# 24 bins` 任何 ctrl 档位都塌（run21/23R/25 三轮实锤，降级链 25→1 无效）。
+# scanpy score_genes 的分桶是 **rank(method="min") 整除 n_items**（scanpy 源码
+# scanpy/tools/_score_genes.py:274-275）—— 重复表达值落同桶是正常路径、
+# 空桶只是 WARN 跳过，**结构上不会塌**。R 侧逐条复刻该语义：
+#   1. obs_avg = gene_pool 每基因平均表达（稀疏列均值）
+#   2. n_items = round(len(obs_avg) / (n_bins-1))；obs_cut = rank(min) 整除 n_items
+#   3. 对签名基因命中的每个桶：取同桶**非签名**基因，空桶 WARN 跳过，
+#      多于 ctrl_size 个时随机抽 ctrl_size 个（seed 固定可复现）
+#   4. score = mean(签名基因) - mean(对照基因)，按细胞
+# 与 scanpy 数值不可逐位比（稀疏 nanmean 与 Matrix colMeans 的边界差异），
+# 但语义同源：都是"签名基因平均表达 - 表达匹配对照平均表达"。
+# ---------------------------------------------------------------------------
+score_genes_scanpy_style <- function(log_counts_all, genes, n_bins = 25L,
+                                     ctrl_size = 50L, seed = 42L) {
+  stopifnot(length(genes) > 0L)
+  gene_pool <- rownames(log_counts_all)
+  genes <- intersect(genes, gene_pool)
+  if (!length(genes)) {
+    stop("score_genes: 签名基因一个都不在数据里", call. = FALSE)
+  }
+  obs_avg <- Matrix::rowMeans(log_counts_all)
+  obs_avg <- obs_avg[is.finite(obs_avg)]
+  gene_pool <- names(obs_avg)
+  genes <- intersect(genes, gene_pool)
+  if (!length(genes)) {
+    stop("score_genes: 签名基因平均表达全部非有限", call. = FALSE)
+  }
+  n_items <- max(1L, round(length(obs_avg) / (n_bins - 1L)))
+  obs_cut <- floor(rank(obs_avg, ties.method = "min") / n_items)
+  names(obs_cut) <- gene_pool
+  is_sig <- gene_pool %in% genes
+  set.seed(seed)
+  ctrl_sel <- character(0)
+  for (cut_v in unique(obs_cut[genes])) {
+    r_genes <- gene_pool[obs_cut == cut_v & !is_sig]
+    if (!length(r_genes)) {
+      log_warn(sprintf("score_genes: 桶 %d 无对照基因（跳过，scanpy 同为 WARN）", cut_v))
+      next
+    }
+    if (ctrl_size < length(r_genes)) {
+      r_genes <- sample(r_genes, ctrl_size)
+    }
+    ctrl_sel <- c(ctrl_sel, r_genes)
+  }
+  if (!length(ctrl_sel)) {
+    stop("score_genes: 所有桶都没有对照基因（gene_pool 过小）", call. = FALSE)
+  }
+  sig_idx <- match(genes, gene_pool)
+  ctrl_idx <- match(ctrl_sel, gene_pool)
+  as.numeric(Matrix::rowMeans(log_counts_all[sig_idx, , drop = FALSE])) -
+    as.numeric(Matrix::rowMeans(log_counts_all[ctrl_idx, , drop = FALSE]))
+}
+
+# ---------------------------------------------------------------------------
 # 细胞类型打分（03_cluster_annotate.py:84-189 同语义；margin 三态逐条复刻）
 # 返回 list(per_cell=矩阵, assign=data.frame, diag=list)；打分不可行时
 # assign=NULL 且 diag 带 reason。
@@ -112,67 +171,34 @@ score_celltypes <- function(log_counts_all, clusters, sig, seed = 42L) {
     return(list(per_cell = NULL, assign = NULL,
                 diag = list(reason = "签名里的基因一个都不在数据里")))
   }
-  # 诊断（run21 实锤：present 非空但 Seurat 报签名基因 not present ——
-  # 行名在进入 CreateSeuratObject 前后发生了改写。把两边各打几个出来定位）
+  # 诊断（run21 实锤沿用的输入自检：签名基因必须真的在矩阵行名里）
   log_info(sprintf("打分诊断: present %d 类型 / %d 基因; all_genes 头3=%s; CD3D 在 all_genes=%s",
                    length(present), length(unlist(present)),
                    paste(utils::head(all_genes, 3L), collapse = ","),
                    "CD3D" %in% all_genes))
-  obj_probe <- Seurat::CreateSeuratObject(counts = log_counts_all[intersect(unlist(present), rownames(log_counts_all)), , drop = FALSE])
-  log_info(sprintf("打分诊断: CreateSeuratObject 后 feature 头3=%s; n_features=%d",
-                   paste(utils::head(rownames(obj_probe[["RNA"]]$counts), 3L), collapse = ","),
-                   nrow(obj_probe[["RNA"]]$counts)))
-  rm(obj_probe)
 
-  # Seurat AddModuleScore：ctrl = 每个签名基因配 25 个对照基因（bin 数对齐
-  # scanpy score_genes n_bins=25，未决 3）；seed 固定保证对照抽取可复现。
-  need_pkg("Seurat")
-  # **过滤全零基因再建打分对象**（run23R 实锤：bins 降级链 25→1 全档失败
-  # `Insufficient data values to produce 24 bins`）—— 全基因集里大量在任何
-  # 细胞都不表达的基因，AddModuleScore 按 mean.expr 分位数切 bin 时这些基因
-  # 全挤在同一分位 → cut() 塌缩，ctrl 再小也没用。零表达基因对签名打分零贡献
-  # （score=均值差），过滤不影响结果、只让 bin 可分 —— scanpy score_genes 的
-  # partition 同样只在表达基因上算。诊断期 probe 已证 present ⊆ 表达基因。
-  keep_g <- Matrix::rowSums(log_counts_all > 0) > 0
-  log_info(sprintf("打分输入过滤: %d/%d 基因至少在 1 个细胞表达",
-                   sum(keep_g), length(keep_g)))
-  obj <- Seurat::CreateSeuratObject(counts = log_counts_all[keep_g, , drop = FALSE])
-  obj@meta.data$leiden <- factor(clusters)
-  set.seed(seed)
-  # **slot="counts" 必须显式**：AddModuleScore 默认 slot="data"，而
-  # CreateSeuratObject 只填 counts 层、不产 data 层（没跑 NormalizeData）——
-  # 默认值会找不到 data 层直接报错。喂进来的本来就是 log 后矩阵，语义即
-  # 打分输入。
-  # **bin 数降级链（run21 实锤）**：全基因集里大量零表达基因 → Seurat 内部
-  # cut(mean.expr, breaks=ctrl+1) 分位数重复 → `Insufficient data values to
-  # produce 24 bins`。scanpy 对空 bin 静默容忍，Seurat 严格报错 —— 同一数据
-  # Python 能过 R 不能。降级重试并如实记录实际用到的 ctrl 值。
-  # **features 直接传 present，不能再包 list()**：present 已是 list（每个细胞
-  # 类型一个基因向量）；包成 list(present) 变双层嵌套，Seurat 匹配不到任何
-  # 基因 → run21/22 的 "features are not present" warning 全表（诊断证实
-  # CD3D 在 all_genes、probe obj 里也可见 —— 问题出在 features 形状不在矩阵）。
-  # meta.data 列名 score_1..score_n 与 seq_along(present) 对齐 ✓。
-  sc_mat <- NULL; ctrl_used <- NA_integer_; ctrl_err <- NULL
-  for (ctrl_n in c(25L, 10L, 5L, 3L, 1L)) {
-    set.seed(seed)   # 每次 try 重置，保证降级结果可复现
-    r <- tryCatch({
-      o <- Seurat::AddModuleScore(obj, features = present,
-                                  ctrl = ctrl_n, name = "score_", slot = "counts")
-      o@meta.data[, paste0("score_", seq_along(present)), drop = FALSE]
-    }, error = function(e) { ctrl_err <<- conditionMessage(e); NULL })
-    if (!is.null(r)) { sc_mat <- r; ctrl_used <- ctrl_n; break }
-  }
-  if (is.null(sc_mat)) {
-    return(list(per_cell = NULL, assign = NULL,
-                diag = list(reason = sprintf(
-                  "AddModuleScore 全部 bin 档位失败（ctrl 25->1）：%s",
-                  ctrl_err %||% "unknown"))))
-  }
-  if (!identical(ctrl_used, 25L)) {
-    log_warn(sprintf("AddModuleScore ctrl 从 25 降到 %d（全基因集零表达基因多，Seurat 严格分箱报错；scanpy 空 bin 静默容忍，两版行为差异如实记录）：%s",
-                     ctrl_used, ctrl_err %||% ""))
-  }
+  # **打分实现 = score_genes_scanpy_style（本文件上方，scanpy 语义复刻）**
+  # run21/23R/25 三轮实锤 AddModuleScore 在全基因集上 bins 必塌
+  # （cut() 分位数切桶对重复值敏感），rank 整除分桶（scanpy 原语义）结构上
+  # 不会塌。放弃 Seurat 路线 = 03 的方法学等级从 A/B 降 C（r_version.md §3
+  # 03 行待同步）；每细胞打分逐签名独立算（与 sc.tl.score_genes 循环同构）。
+  # vapply 按列堆叠 → sc_mat = 签名x细胞（lg_all 列序 == clusters 序，调用点 539
+  # 已保证：lg_all colnames = rownames(raw_sub) = common_cells = names(clusters)）。
+  # 显式命名细胞后按 names(clusters) 重排，防静默错位（与 06 colLabels 同纪律）。
+  sc_mat <- vapply(seq_along(present), function(j) {
+    score_genes_scanpy_style(log_counts_all, present[[j]], n_bins = 25L,
+                             ctrl_size = 50L, seed = seed)
+  }, numeric(ncol(log_counts_all)))
+  rownames(sc_mat) <- colnames(log_counts_all)
   colnames(sc_mat) <- names(present)
+  if (!is.null(names(clusters))) {
+    miss_cells <- sum(!names(clusters) %in% rownames(sc_mat))
+    if (miss_cells > 0L) {
+      stop(sprintf("打分矩阵缺 %d 个细胞的行（细胞名对齐失败）", miss_cells),
+           call. = FALSE)
+    }
+    sc_mat <- sc_mat[names(clusters), , drop = FALSE]
+  }
 
   # 按簇均值
   ucl <- unique(clusters)
