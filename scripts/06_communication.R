@@ -464,7 +464,12 @@ run_06_communication <- function(cfg) {
                    nrow(mat), ncol(mat), nrow(res), length(pair_score), n_pairs))
 
   # ---- liana（文档 §2.7 指定的主工具）------------------------------------
-  liana_out <- try_liana(clu, clusters_vec, cfg)
+  # **必须传 named 版本**（名字=细胞名）：try_liana 里 SCE 列名要按名字显式
+  # 匹配重排。run28 实锤：L258 的 as.character() 已剥掉名字，裸值传进去 →
+  # 「liana SCE 有 2574 个细胞在簇标签向量里找不到」。03 落盘的 clu$clusters
+  # 本身是 named（名字=细胞名，03_cluster_annotate.R:424）—— 这里直接传原
+  # 对象；clusters_vec（裸值）留给上面的自建打分（masks 只用值）。
+  liana_out <- try_liana(clu, clu$clusters, cfg)
   liana_info <- liana_out$info
   liana_cmp <- list(compared = FALSE)
   if (!is.null(liana_out$res)) {

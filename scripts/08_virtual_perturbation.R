@@ -288,23 +288,30 @@ run_tenifold_engine <- function(cfg, X_counts, var_names, targets, tk) {
 
 # 距离矩阵 -> 每基因一行（compress_tenifold_distances 同语义）
 compress_tenifold_distances <- function(dist_df, res) {
-  # 距离表：第 1 列基因名，其余列同名基因（对称矩阵）
+  # 距离表：第 1 列行名（候选基因 20 个），其余列=网络基因（600 个）。
+  # **逐行遍历**（与 Python 08_virtual_perturbation.py:511 dist.index 同构）：
+  # 行=候选基因，v=该候选对全网络基因的距离。run28 实锤旧版遍历
+  # unique(c(行名,列名)) 共 620 个，对 600 个非候选网络基因执行 m[g,]
+  # 时 g 不在行名 → subscript out of bounds（tenifold 跑完 300s 后白崩）。
   m <- as.matrix(dist_df[, -1L, drop = FALSE])
   rownames(m) <- dist_df[[1L]]
+  empty_ko <- as.character(unlist(res$empty_knockout_genes %||% list()))
   rows <- list()
-  for (g in sort(unique(c(rownames(m), colnames(m))))) {
-    v <- c(m[g, ], m[, g])
-    # 两个向量拼起来有重复（对称位计两次）——先去重保名称，再排
-    v <- v[!duplicated(names(v))]
-    v <- v[names(v) != g]
+  for (g in rownames(m)) {
+    v <- m[g, ]
+    names(v) <- colnames(m)
     v <- v[is.finite(v)]
-    if (!length(v)) {
+    is_empty <- g %in% empty_ko
+    # 空敲除的行报 0 分辨（不是效应 0，是该网络表达不了该扰动）——
+    # 用 rmeta 的结构证据打标（tenifold_knk.R 已把空敲除行置 NA），
+    # 不从整行 NA 反推（推断会把别的原因造成的 NA 误标成空敲除）。
+    if (!length(v) || is_empty) {
       rows[[length(rows) + 1L]] <- list(
         gene = g, tenifold_n_genes_scored = 0L,
         mean_distance = NA_real_, max_distance = NA_real_,
         top_gene = NA_character_, top_distance = NA_real_,
         target_outdegree = 0L,
-        empty_knockout = TRUE,   # 结构证据（rmeta 的 empty_knockout_genes），不从整行 NA 反推
+        empty_knockout = TRUE,
         top_distance_real = NA_real_)
       next
     }
@@ -596,11 +603,12 @@ run_08_virtual_perturbation <- function(cfg) {
         "Tenifold 网络没有细胞类型分辨率 —— 结果是全群体网络的扰动，",
         "**不按细胞类型重新加权**（造出一个「分细胞类型的 Tenifold」",
         "再借它的名字发出去，是方法学造假）"),
-      if (td_ok) sprintf(paste0("网络基因是全基因集的子集（max_genes=%d，", DEFAULT_TENIFOLD$max_genes),
-                         "运行时间约束）；输入是原始计数（qc=FALSE，step 01 已滤过）"),
+      if (td_ok) sprintf(paste0("网络基因是全基因集的子集（max_genes=%d，运行时间约束）；",
+                                "输入是原始计数（qc=FALSE，step 01 已滤过）"),
+                         DEFAULT_TENIFOLD$max_genes),
       if (td_ok && n_empty > 0L) sprintf(paste0(
-        "%d 个候选在网络里出度为 0（空敲除）——", n_empty),
-        "不表示「无影响」，表示这个网络表达不了该扰动"),
+        "%d 个候选在网络里出度为 0（空敲除）——不表示「无影响」，",
+        "表示这个网络表达不了该扰动"), n_empty),
       "两引擎一致性高也可能只是共享同一偏差（都从 07 的调控子边出发）"))
   write_json(file.path(res_dir, "virtual_perturbation_status.json"), status)
   log_info(sprintf("虚拟扰动完成: engines=%s",
