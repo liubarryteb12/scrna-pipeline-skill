@@ -145,8 +145,12 @@ score_genes_scanpy_style <- function(log_counts_all, genes, n_bins = 25L,
   }
   sig_idx <- match(genes, gene_pool)
   ctrl_idx <- match(ctrl_sel, gene_pool)
-  as.numeric(Matrix::rowMeans(log_counts_all[sig_idx, , drop = FALSE])) -
-    as.numeric(Matrix::rowMeans(log_counts_all[ctrl_idx, , drop = FALSE]))
+  # 输入是 基因x细胞（行=基因）。打分 = 每细胞：对签名/对照基因行子集按
+  # **列**（细胞）平均。run27 实锤 rowMeans 返回每基因向量（首签名 50 基因
+  # → 长度 50），与 vapply 模板 numeric(ncol)=每细胞 2574 不符直接崩 ——
+  # scanpy 语义 X[:, sig].mean(axis=1) 是对基因轴求均值得每细胞分数。
+  as.numeric(Matrix::colMeans(log_counts_all[sig_idx, , drop = FALSE])) -
+    as.numeric(Matrix::colMeans(log_counts_all[ctrl_idx, , drop = FALSE]))
 }
 
 # ---------------------------------------------------------------------------
