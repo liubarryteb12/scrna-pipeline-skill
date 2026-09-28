@@ -127,7 +127,16 @@ score_celltypes <- function(log_counts_all, clusters, sig, seed = 42L) {
   # Seurat AddModuleScore：ctrl = 每个签名基因配 25 个对照基因（bin 数对齐
   # scanpy score_genes n_bins=25，未决 3）；seed 固定保证对照抽取可复现。
   need_pkg("Seurat")
-  obj <- Seurat::CreateSeuratObject(counts = log_counts_all)
+  # **过滤全零基因再建打分对象**（run23R 实锤：bins 降级链 25→1 全档失败
+  # `Insufficient data values to produce 24 bins`）—— 全基因集里大量在任何
+  # 细胞都不表达的基因，AddModuleScore 按 mean.expr 分位数切 bin 时这些基因
+  # 全挤在同一分位 → cut() 塌缩，ctrl 再小也没用。零表达基因对签名打分零贡献
+  # （score=均值差），过滤不影响结果、只让 bin 可分 —— scanpy score_genes 的
+  # partition 同样只在表达基因上算。诊断期 probe 已证 present ⊆ 表达基因。
+  keep_g <- Matrix::rowSums(log_counts_all > 0) > 0
+  log_info(sprintf("打分输入过滤: %d/%d 基因至少在 1 个细胞表达",
+                   sum(keep_g), length(keep_g)))
+  obj <- Seurat::CreateSeuratObject(counts = log_counts_all[keep_g, , drop = FALSE])
   obj@meta.data$leiden <- factor(clusters)
   set.seed(seed)
   # **slot="counts" 必须显式**：AddModuleScore 默认 slot="data"，而

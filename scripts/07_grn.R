@@ -482,7 +482,7 @@ run_07_grn <- function(cfg) {
   p <- ggplot2::ggplot(reg, ggplot2::aes(frac_cells_expressing_tf,
                                          cluster_specificity)) +
     ggplot2::geom_point(size = 0.9, colour = PAL$primary, alpha = 0.75) +
-    ggplot2::geom_text_repel(
+    ggrepel::geom_text_repel(
       data = utils::head(reg, 8L),
       ggplot2::aes(label = tf), size = 2.2, max.overlaps = 20,
       segment.colour = "grey60", seed = 42) +
