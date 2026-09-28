@@ -186,8 +186,24 @@ compare_with_liana <- function(liana_res, own) {
       return(out)
     }
     lr <- liana_res
-    lr$.pair <- paste(lr$ligand_complex, lr$receptor_complex, sep = "^")
-    lr$.combo <- paste(lr$.pair, lr$source, lr$target, sep = "|")
+    # liana 返回列名经 data.frame 自动 make.names 变成 ligand.complex /
+    # receptor.complex（run34 实锤：代码写 snake_case → paste(NULL,NULL)=
+    # character(0) → "replacement has 0 rows, data has 212"）。两种都认。
+    pick <- function(df, candidates) {
+      for (cn in candidates) if (cn %in% colnames(df)) return(cn)
+      NA_character_
+    }
+    lig_col <- pick(lr, c("ligand_complex", "ligand.complex"))
+    rec_col <- pick(lr, c("receptor_complex", "receptor.complex"))
+    src_col <- pick(lr, c("source", "target"))
+    tgt_col <- pick(lr, c("target", "receiver"))
+    if (is.na(lig_col) || is.na(rec_col) || is.na(src_col) || is.na(tgt_col)) {
+      out$reason <- sprintf("liana 结果缺少必要列（有 %s）",
+                            paste(utils::head(colnames(lr), 10), collapse = ", "))
+      return(out)
+    }
+    lr$.pair <- paste(lr[[lig_col]], lr[[rec_col]], sep = "^")
+    lr$.combo <- paste(lr$.pair, lr[[src_col]], lr[[tgt_col]], sep = "|")
     lr_score <- tapply(lr[[score_col]], lr$.combo, mean)
 
     ow <- own
@@ -355,13 +371,22 @@ run_06_communication <- function(cfg) {
         obs <- score_combo(pr$ligand, pr$receptor, masks[[src]], masks[[dst]])
         if (is.na(obs)) {
           # 非有限打分：第一次打诊断日志（定位 NaN 源头用），组合如实记 NA。
+          # run34 实锤 1134/1134 全 NA 但 small_NA=0 —— is.na(稀疏矩阵) 查的是
+          # **显式存储**的 NA；Matrix 的 mean(sparseMatrix) = mean(as(x,"sparseVector"))
+          # = sum(x@x)/n，@x 里**任何一个显式 NA 毒死整个 mean**。所以诊断必须
+          # 直接查 @x 槽（anyNA(x@x)），并给出 mean 的稀疏实现展开值。
           if (n_nonfinite == 0L) {
+            sub <- small[intersect(pr$ligand, rownames(small)), , drop = FALSE]
             log_warn(sprintf(
-              "首个非有限打分诊断: pair=%s %s->%s ligand=[%s] receptor=[%s] n_src=%d n_dst=%d small_NA=%d",
+              paste0("首个非有限打分诊断: pair=%s %s->%s ligand=[%s] receptor=[%s] ",
+                     "n_src=%d n_dst=%d small_NA=%d anyNA_at_x=%s n_at_x=%d ",
+                     "mean_direct=%s sum_at_x=%s len_at_x=%d"),
               pr$name, src, dst, paste(pr$ligand, collapse = ","),
               paste(pr$receptor, collapse = ","),
               length(masks[[src]]), length(masks[[dst]]),
-              sum(is.na(small[intersect(pr$ligand, rownames(small)), , drop = FALSE]))))
+              sum(is.na(sub)), anyNA(sub@x), length(sub@x),
+              sprintf("%.6g", sum(sub@x) / length(sub)),
+              sprintf("%.6g", sum(sub@x)), length(sub@x)))
           }
           n_nonfinite <- n_nonfinite + 1L
           ri_ <- ri_ + 1L
