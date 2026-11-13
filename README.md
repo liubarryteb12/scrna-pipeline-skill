@@ -20,7 +20,7 @@
 - **跨语言桥**：`src/bridge_guard.sh` 在 Python 与 R 之间传 `.h5ad` / `.rds` 前校验基因名、矩阵方向、细胞名、embedding 四项断言。
 - **环境声明**：`src/line2_scrna/envs/manifest.txt` 记录主语言、版本、环境名与关键依赖，分析中途不更换。
 - **检查点**：`src/line2_scrna/checkpoint/` 放跨语言检查点脚本。
-- **共享规范**：`src/line2_scrna/GLOSSARY.md`、`src/line2_scrna/docs/` 保存术语、隔离、目录与编码规范。
+- **共享规范**：`src/line2_scrna/GLOSSARY.md`、`src/line2_scrna/docs/` 保存术语、隔离、目录、编码与出图规范。
 
 ## 分析阶段
 
