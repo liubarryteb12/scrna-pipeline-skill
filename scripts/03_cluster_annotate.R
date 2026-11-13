@@ -507,8 +507,10 @@ run_03_cluster_annotate <- function(cfg) {
       group_label = "Leiden cluster", title = "Top markers per cluster",
       subtitle = paste0("rows = Leiden clusters (identities: celltype_annotation.csv)\n",
                         "dot size = fraction of cells expressing the gene"))
+    # 图高从图的 attr 里拿（build_marker_dotplot_figure 按簇数自适应算出，
+    # 点大小与行距联动）—— 不再写死 126mm（22 簇时行距跌破点径 → 点互压）。
     save_fig(cfg, "02-03-03-unit1-markers-dotplot", fig,
-             width = W_DOUBLE, height = mm(126))
+             width = W_DOUBLE, height = mm(attr(fig, "fig_height_mm") %||% 126))
 
     # **灰底 marker UMAP 网格**（差距清单 #19，文献范式）：
     # dotplot 给"哪个簇高表达"，灰底 UMAP 给"高表达在哪块区域"。

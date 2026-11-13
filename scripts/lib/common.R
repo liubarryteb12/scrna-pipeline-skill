@@ -636,12 +636,28 @@ df_to_records <- function(df) {
 # ============================================================================
 build_marker_dotplot_figure <- function(frac_df, z_df, group_label, title,
                                         subtitle, fig_width = NULL,
-                                        fig_height_mm = 126) {
+                                        fig_height_mm = NULL) {
   need_pkg("ggplot2")
   w <- fig_width %||% W_DOUBLE
   genes <- colnames(z_df)
   groups <- rownames(z_df)
   ng <- length(genes); ngrp <- length(groups)
+
+  # ---- 自适应几何（2026-10-06 根治"点重叠"，与 Python common.py 同式）-------
+  # 旧版图高 126mm 写死 + 点上限写死 —— 行距 = 面板高 ÷ 簇数，簇数一多
+  # 行距跌破点直径（22 簇实测：行距 3mm < 点径 5.2mm，必然互压）。
+  # 现在：图高按 理想行距 6.6mm/簇 + 图例带 55mm 反推（上限 200mm），
+  # 超上限回头缩点；点上限半径 = 实际行距 × 0.72 ÷ 2（留 28% 空隙）。
+  ROW_MM_IDEAL <- 6.6
+  BAND_MM <- 55.0
+  MAX_H_MM <- 200.0
+  row_mm <- min(ROW_MM_IDEAL, (MAX_H_MM - BAND_MM) / max(1, ngrp))
+  h_mm <- row_mm * max(1, ngrp) + BAND_MM
+  if (!is.null(fig_height_mm)) h_mm <- as.numeric(fig_height_mm)
+  band_frac <- min(0.60, BAND_MM / h_mm)
+  # ggplot 面板高 ≈ 图高 × (1 - band_frac - 标题区 0.10)（粗于 mpl 版，含轴文本）
+  panel_h_mm <- h_mm * (1 - band_frac - 0.10)
+  size_max_radius_mm <- max(0.9, 0.72 * panel_h_mm / max(1, ngrp) / 2)
 
   # 长表：geom_point 的 size/colour 双标度映射
   long <- data.frame(
@@ -652,7 +668,6 @@ build_marker_dotplot_figure <- function(frac_df, z_df, group_label, title,
   # 对称归一上限（Python common.py:1243 同式）
   vmax <- max(1.5, stats::quantile(abs(long$z), 0.95, na.rm = TRUE))
   vmax <- round(as.numeric(vmax), 1)
-  long$size_pt <- 3 + long$frac * 5.5   # 面积观感对应 size_min=10..size_max=170
 
   p <- ggplot2::ggplot(long, ggplot2::aes(x = gene, y = group,
                                           size = frac, colour = z)) +
@@ -663,7 +678,11 @@ build_marker_dotplot_figure <- function(frac_df, z_df, group_label, title,
       midpoint = 0, limits = c(-vmax, vmax),
       name = "Mean Expression",
       breaks = c(-vmax, 0, vmax), labels = c("Low", "Mid", "High")) +
-    ggplot2::scale_size(range = c(0.5, 6), limits = c(0, 1),
+    # scale_size 的 range 是**半径 mm** 制：上限 = 行距×0.72/2（自适应），
+    # 下限 = 上限的 22%（视觉上仍是"一个点"）—— 任何簇数下点不碰行。
+    ggplot2::scale_size(range = c(max(0.15, size_max_radius_mm * 0.22),
+                                  size_max_radius_mm),
+                        limits = c(0, 1),
                         breaks = c(0.25, 0.5, 0.75, 1),
                         labels = c("25", "50", "75", "100"),
                         name = "Percent Expressed (%)") +
@@ -677,6 +696,7 @@ build_marker_dotplot_figure <- function(frac_df, z_df, group_label, title,
       angle = 90, hjust = 1, vjust = 0.4, size = 7),
       legend.box = "horizontal",
       legend.position = "bottom") # LEGEND_DIFF: 底部横带 = do_DotPlot 范式（R-06 定版，双图例横排）
+  attr(p, "fig_height_mm") <- h_mm   # 调用方 save_fig 用它当 height（联动）
   p
 }
 # 基因列原顺序展示（ggplot scale_x_discrete 的 labels 需与 levels 对齐，

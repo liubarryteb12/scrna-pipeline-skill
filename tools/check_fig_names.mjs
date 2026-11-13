@@ -39,8 +39,13 @@ import { dirname } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = join(here, "..");
 
-/** 三大部分 -> 阶段号。仓库目录名 -> 阶段号。 */
+/** 三大部分 -> 阶段号。仓库目录名 -> 阶段号。
+ *  （同时收录原名与 p2- 前缀名：工作区 2026-10-03 按层归位，本地目录名加前缀，
+ *    云端仓库名不变 —— 两名同阶段号。三仓此表逐字节一致。） */
 const PART_BY_REPO = {
+  "p2-geo-normal-pipeline-skill": "01",
+  "p2-scrna-pipeline-skill": "02",
+  "p2-spatial-pipeline-skill": "03",
   "geo-normal-pipeline-skill": "01",
   "scrna-pipeline-skill": "02",
   "spatial-pipeline-skill": "03",

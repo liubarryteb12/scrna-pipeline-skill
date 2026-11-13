@@ -1195,7 +1195,8 @@ def _content_overflow(fig) -> dict:
 
 
 def plot_marker_dotplot(ax, frac, zmat, *, cmap="RdBu_r",
-                        size_max=170, size_min=10, dot_edge=0.3):
+                        size_max=None, size_min=None, dot_edge=0.3,
+                        row_pitch_pt=None):
     """
     手工画 marker dotplot：颜色 = 按基因做 z-score（跨簇可比偏离方向），
     点大小 = 表达该基因的细胞比例。
@@ -1220,18 +1221,42 @@ def plot_marker_dotplot(ax, frac, zmat, *, cmap="RdBu_r",
       * 色标对称 —— RdBu_r 以 0 为中点，正负偏离等权可见；
       * 图例间距 —— 点大小图例单独画、间距显式给定，不再粘连。
 
+    **点大小为什么必须自适应（2026-10-06 根治"点重叠"）。** 旧版
+    `size_max=170`（pt^2，直径 ≈14.7pt≈5.2mm）是写死的，而行距 =
+    主轴高 ÷ 簇数 —— 簇数一多（22 个 Leiden 簇实测），行距只剩 ~3mm，
+    100% 的点比行距大 73%，相邻行的点**必然**互压（用户截图实拍）。
+    调图幅/缩字号都治不了本，因为"点"和"行距"没有联动。
+    现在调用方把实际行距（pt）经 `row_pitch_pt` 传进来，点的两个极端
+    直径按 `d = pitch × 0.72 / 1.30` 反推（0.72 = 留 28% 空隙；÷1.30 =
+    面积 pt² → 直径 pt 的换算 √(s/π)×2 ≈ √s×1.30 简化系数对齐），
+    **任何簇数下 100% 的点都不会碰到上一行**。
+
     :param ax: 目标 axes
     :param frac: DataFrame，index=分组（行），columns=基因（列），值 0..1
     :param zmat: DataFrame，同形状，值 = 按基因 z-score 后的值
     :param cmap: 色标（默认 RdBu_r：红=高表达，蓝=低表达，白=0）
-    :param size_max: 100% 表达时点的面积（pt^2）
-    :param size_min: 0% 表达时点的面积（仍画一个极小点，表示"测到但几乎不表达"）
+    :param size_max: 100% 表达时点的面积（pt^2）；None = 按行距反推
+    :param size_min: 0% 表达时点的面积（仍画一个极小点，表示"测到但几乎不表达"）；
+                     None = size_max 的约 4.8%（直径取上限的 22%）
     :param dot_edge: 点描边宽度
+    :param row_pitch_pt: y 轴相邻两行的间距（pt）。None = 退回旧常数
+                         （size_max=170 / size_min=10，兼容外部直调）
     :returns: (ScalarMappable, size_handles) —— 供调用方画共享色标与大小图例
     """
     import numpy as np
     import matplotlib.pyplot as plt
     from matplotlib.colors import Normalize
+
+    if row_pitch_pt is not None and row_pitch_pt > 0:
+        # 行距反推（自适应；见 docstring "点大小为什么必须自适应"）
+        d_max_pt = 0.72 * row_pitch_pt / 1.30     # 100% 点直径（pt）
+        d_min_pt = max(1.1, d_max_pt * 0.22)      # 0% 点直径，视觉上仍是"一个点"
+        size_max = (d_max_pt / 2.0) ** 2 * math.pi
+        size_min = (d_min_pt / 2.0) ** 2 * math.pi
+    if size_max is None:
+        size_max = 170.0
+    if size_min is None:
+        size_min = 10.0
 
     genes = list(zmat.columns)
     groups = list(zmat.index)
@@ -1271,7 +1296,7 @@ def plot_marker_dotplot(ax, frac, zmat, *, cmap="RdBu_r",
 
 
 def build_marker_dotplot_figure(frac_df, z_df, *, group_label, title,
-                                subtitle, fig_width=None, fig_height_mm=126):
+                                subtitle, fig_width=None, fig_height_mm=None):
     """
     构建**整张** marker dotplot（主图 + 底部横带图例），返回 `(fig, size_handles)`。
 
@@ -1298,32 +1323,72 @@ def build_marker_dotplot_figure(frac_df, z_df, *, group_label, title,
     的原因：`fig.add_axes([...])` 设的位置被 constrained layout 覆盖了。
     这张图的几何由本函数全权控制，所以显式关掉它。
 
+    **图高/点大小为什么必须随簇数联动（2026-10-06 根治"点重叠"）。**
+    旧版 `fig_height_mm=126` 写死、`size_max=170` 写死 —— 行距 = 面板高 ÷ 簇数，
+    簇数一多行距就跌破点直径（22 簇实测：行距 3mm < 点径 5.2mm，必然互压）。
+    现在：
+      1. 图高按 `理想行距 6.6mm/簇 + 图例带 55mm` 反推，上限 200mm（A4 可用高，
+         与 grid_figsize 同一上限）；超出上限时**回头缩点**（第 2 步的行距变
+         小，点跟着变小）—— 两端联动，任何簇数下点与行距都匹配；
+      2. 点尺寸 = 实际行距 × 0.72（留 28% 空隙），经 `row_pitch_pt` 传给
+         `plot_marker_dotplot`，不再有写死的点径。
+
     :param frac_df: DataFrame，index=分组，columns=基因，值 = 表达细胞比例
     :param z_df: DataFrame，同形状，值 = 按基因 z-score 后的表达
     :param group_label: y 轴标签（"Leiden cluster" / "Spatial domain"）
     :param title: suptitle（如 "Top markers per cluster"）
     :param subtitle: 主图标题第二行（轴语义说明）
     :param fig_width: 图宽（默认 W_DOUBLE）
-    :param fig_height_mm: 图高（毫米）
+    :param fig_height_mm: 图高（毫米）；None = 按簇数自适应（推荐）
     :returns: `(fig, size_handles)`
     """
     import matplotlib.pyplot as plt
 
     w = W_DOUBLE if fig_width is None else fig_width
-    fig = plt.figure(figsize=(w, mm(fig_height_mm)))
+    ngrp = len(z_df.index)
+    # ---- 自适应几何：行距 → 图高 → 点尺寸（见 docstring 联动小节）-----------
+    ROW_MM_IDEAL = 6.6          # 单行理想占高（点径 4.75 + 空隙），Seurat 观感
+    BAND_MM = 55.0              # 底部横带（图例 + x 轴基因名）固定占高
+    MAX_H_MM = 200.0            # A4 可用高度上限（grid_figsize 同值）
+    row_mm = min(ROW_MM_IDEAL, (MAX_H_MM - BAND_MM) / max(1, ngrp))
+    h_mm = row_mm * max(1, ngrp) + BAND_MM
+    if fig_height_mm is not None:
+        h_mm = float(fig_height_mm)     # 调用方显式给定时尊重（但行距仍实算）
+    # 主轴面板几何：底部横带占 (BAND_MM / h_mm)
+    band_frac = min(0.60, BAND_MM / h_mm)
+    ax_bottom = band_frac + 0.03 * (1.0 - band_frac)
+    # ---- 顶部标题带显式预留（2026-10-06 修 suptitle 与副标题相撞）----------
+    # 旧版 suptitle y=0.965 + ax.set_title(pad=6) 都用比例/锚点向上长，图一高
+    # 两者落进同一带（sc3 实拍：居中大标题压住副标题第二行）。现在：
+    # 顶部留 head_mm（≥17mm：副标题两行 20pt + 与面板间距 4pt + suptitle 11pt
+    # + 余量；短图按比例放大，上限 26%），suptitle 锚画布顶、副标题锚带内顶部，
+    # 三者（suptitle / 副标题 / 面板）各占一段，物理分离。
+    HEAD_MM = 17.0
+    head_frac = max(0.10, min(0.26, HEAD_MM / h_mm))
+    ax_top = 1.0 - head_frac
+    panel_h = ax_top - ax_bottom - 0.008
+    row_pitch_pt = (panel_h * (h_mm / 25.4) * 72.0) / max(1, ngrp)
+
+    fig = plt.figure(figsize=(w, mm(h_mm)))
     # **关掉 constrained layout** —— 见 docstring：它会覆盖下面所有手动坐标
     fig.set_layout_engine("none")
 
     # 主图占满上方（左右各留一点给 y 轴标签与右缘）
-    ax = fig.add_axes([0.075, 0.315, 0.905, 0.535])
-    sm, size_handles = plot_marker_dotplot(ax, frac_df, z_df)
+    ax = fig.add_axes([0.075, ax_bottom, 0.905, panel_h])
+    sm, size_handles = plot_marker_dotplot(ax, frac_df, z_df,
+                                           row_pitch_pt=row_pitch_pt)
     ax.set_xlabel("gene", fontsize=8)
     ax.set_ylabel(group_label, fontsize=8)
-    fig.suptitle(title, fontsize=11, y=0.965)
-    ax.set_title(subtitle, fontsize=8, pad=6, loc="left")
+    fig.suptitle(title, fontsize=11, y=0.995, va="top")
+    # 副标题：锚在标题带内顶部、va="top" 向下排两行，底缘落在面板顶之上
+    # （旧 ax.set_title(pad=6) 从面板顶向上长，高度不受控 —— 撞 suptitle）
+    sub_top_frac = ax_top + (24.0 / 72.0) * 25.4 / h_mm   # 面板顶 + 24pt 处为副标题顶
+    fig.text(0.075, sub_top_frac, subtitle, ha="left", va="top", fontsize=8)
 
     # ---- 底部横带 · 左半：Percent Expressed (%)（四点横排）---------------
-    lax = fig.add_axes([0.075, 0.045, 0.42, 0.13])
+    # 图例点大小与主图实际用的 size_handles 一致（随行距缩放，联动）
+    lax_h = max(0.085, band_frac * 0.30)
+    lax = fig.add_axes([0.075, 0.030, 0.42, lax_h])
     lax.set_xlim(0, 1)
     lax.set_ylim(0, 1)
     lax.axis("off")
@@ -1337,7 +1402,7 @@ def build_marker_dotplot_figure(frac_df, z_df, *, group_label, title,
                  fontsize=7.5)
 
     # ---- 底部横带 · 右半：Mean Expression（横向色标）--------------------
-    cax = fig.add_axes([0.60, 0.085, 0.28, 0.035])
+    cax = fig.add_axes([0.60, 0.030 + lax_h * 0.28, 0.28, max(0.028, lax_h * 0.30)])
     cb = fig.colorbar(sm, cax=cax, orientation="horizontal")
     cax.text(0.0, 1.9, "Mean Expression", transform=cax.transAxes,
              ha="left", va="bottom", fontsize=7.5)
