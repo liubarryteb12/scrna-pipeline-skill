@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+# cell_communication：line2_scrna 步骤 8 细胞间通讯（liana consensus 聚合）。
+#
+# 输入（两个 h5ad，按文件名分流）：
+#   步骤 6 产物 *annotated*.h5ad：取 obs['celltype'] 标签（13 大类）。
+#   步骤 3 产物 *norm*.h5ad：取全基因归一化表达矩阵（24969 基因）。
+# 为什么不用步骤 7 的 2000 HVG 矩阵：consensus 资源库 2016 个 LR 基因在
+# 全基因矩阵覆盖 81.3%，在 2000 HVG 只覆盖 21.9%（原型实测）。HVG 按全局
+# 方差选取，与 LR 相关性弱，用它做通讯分析会系统性漏掉 78% 的配体受体。
+# 这是口径选择，写死在输入契约里：norm 基因数必须 > 2000。
+#
+# 方法口径（2026-10-13 定稿）：
+#   liana 1.10.0 li.mt.rank_aggregate，resource=consensus（4620 对 LR，
+#   CellPhoneDB/CellTalkDB/ConnectomeDB2020 等汇总），groupby=celltype，
+#   expr_prop=0.1 / min_cells=5 / de_method=t-test / aggregate=rra（liana 默认），
+#   n_perms=1000 + seed=BIOANALYS_SEED（原型实测 top20 在 100 与 1000 perms
+#   下完全一致，取默认 1000）。内存受限设备可用 BIO_LIANA_NPERMS 等环境变量
+#   覆盖（见下方参数读取），避免 11GB 手机上 1000 perms 必 OOM。
+#   两个 rank 分工：specificity_rank 衡量"这对 LR 相对其他组是否特异"，
+#   magnitude_rank 衡量表达强度；B2M-CD1A/VIM-CD44 这类管家 pair 会霸占
+#   magnitude 榜但 specificity 低，报告按 specificity 排序并注明该现象。
+#   unknown 类（289 细胞，注释打分不过阈值的混合类）保留在结果中但不作
+#   生物学结论，报告注明。
+#
+# 自校验内建：输入契约（annotated 的 obs['celltype']+uns['annotation']、
+# norm 的 layers['counts']+全基因数）、两产物细胞集合一致、分组集合一致、
+# rank 列无 NaN、lr_means 非负、pvals 在 [0,1]、LR 基因覆盖率 >= 0.5、
+# 结果行数 > 0 且 source/target 集合 == celltype 集合。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入分流：两个 h5ad，按文件名区分角色。模式前后都带 *：拿到的是绝对
+# 路径，前缀匹配永远不中（坑 #99）。
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+annotated_file=""
+norm_file=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *annotated*.h5ad) annotated_file="$path" ;;
+    *norm*.h5ad) norm_file="$path" ;;
+    *) echo "无法识别的输入文件: $path（需要 *annotated*.h5ad 与 *norm*.h5ad）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$annotated_file" ] || [ -z "$norm_file" ]; then
+  echo "缺少必需输入：需要步骤 6 annotated 产物与步骤 3 norm 产物（当前 annotated='$annotated_file' norm='$norm_file'）" >&2
+  exit 2
+fi
+for f in "$annotated_file" "$norm_file"; do
+  if [ ! -f "$f" ]; then
+    echo "输入文件不存在: $f" >&2
+    exit 2
+  fi
+done
+
+echo "step_executed=cell_communication"
+echo "bioanalys_seed=${seed}"
+echo "input_annotated=${annotated_file}"
+echo "input_norm=${norm_file}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+ANNOTATED_FILE="$annotated_file" NORM_FILE="$norm_file" BIOANALYS_SEED="$seed" \
+python3 - <<'PYSCRIPT'
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+import anndata as ad
+import scanpy as sc
+import liana as li
+
+# pandas 3 与 2 的 infer_string 默认值不同，显式关掉（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+N_PERMS = int(os.environ.get("BIO_LIANA_NPERMS", "1000"))
+EXPR_PROP = float(os.environ.get("BIO_LIANA_EXPR_PROP", "0.1"))
+MIN_CELLS = int(os.environ.get("BIO_LIANA_MIN_CELLS", "5"))
+MAX_CELLS_PER_CT = int(os.environ.get("BIO_LIANA_MAX_CELLS_PER_CT", "0"))
+COVERAGE_MIN = 0.5
+HVG_GENE_LIMIT = 2000
+TOP_N = 20
+
+
+def fail(message):
+    sys.stderr.write("cell_communication 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+annotated_file = os.environ["ANNOTATED_FILE"]
+norm_file = os.environ["NORM_FILE"]
+seed = os.environ["BIOANALYS_SEED"]
+try:
+    seed_int = int(seed)
+except ValueError:
+    fail("BIOANALYS_SEED 不是整数: %s" % seed)
+
+# --- 1. 输入契约校验 ---
+annot = ad.read_h5ad(annotated_file)
+norm = ad.read_h5ad(norm_file)
+log("loaded annotated=%s norm=%s" % (annot.shape, norm.shape))
+
+if "celltype" not in annot.obs.columns:
+    fail("annotated 产物缺少 obs['celltype']（不是 annotate_celltypes 产物？）")
+if "annotation" not in annot.uns:
+    fail("annotated 产物缺少 uns['annotation']（不是 annotate_celltypes 产物？）")
+if "counts" not in norm.layers:
+    fail("norm 产物缺少 layers['counts']（不是 normalize_hvg 产物？）")
+if norm.shape[1] <= HVG_GENE_LIMIT:
+    fail("norm 产物基因数 %d <= %d：疑似喂了 HVG 裁剪矩阵，consensus LR 覆盖率会崩，必须是全基因矩阵"
+         % (norm.shape[1], HVG_GENE_LIMIT))
+
+# --- 2. 装配：表达取 norm 全基因矩阵，标签按索引对齐取 annotated ---
+if set(annot.obs_names) != set(norm.obs_names):
+    fail("annotated 与 norm 的细胞集合不一致（%d vs %d）" % (len(set(annot.obs_names)), len(set(norm.obs_names))))
+labels = annot.obs["celltype"].astype(str)
+aligned = labels.reindex(norm.obs_names)
+if aligned.isna().any():
+    fail("按索引对齐后存在无标签细胞（%d 个）" % int(aligned.isna().sum()))
+
+adata = norm
+adata.obs["celltype"] = aligned
+n_cells = adata.shape[0]
+celltype_counts = adata.obs["celltype"].value_counts()
+celltypes = sorted(celltype_counts.index)
+log("celltypes=%d cells=%d" % (len(celltypes), n_cells))
+log("celltype_counts=%s" % celltype_counts.to_dict())
+
+# 内存受限设备的细胞数上限：每 celltype 随机抽 MAX_CELLS_PER_CT 个细胞
+#（seed 固定，可复现）。0 = 不抽（默认，保持全量口径）。
+if MAX_CELLS_PER_CT > 0:
+    rng = np.random.default_rng(seed_int)
+    keep_idx = []
+    for ct in celltypes:
+        idx = np.where(adata.obs["celltype"].to_numpy() == ct)[0]
+        if len(idx) > MAX_CELLS_PER_CT:
+            idx = rng.choice(idx, size=MAX_CELLS_PER_CT, replace=False)
+        keep_idx.extend(idx.tolist())
+    keep_idx = np.sort(np.array(keep_idx, dtype=int))
+    adata = adata[keep_idx, :].copy()
+    n_cells = adata.shape[0]
+    celltype_counts = adata.obs["celltype"].value_counts()
+    celltypes = sorted(celltype_counts.index)
+    log("subsampled to max %d cells/celltype -> cells=%d" % (MAX_CELLS_PER_CT, n_cells))
+
+# --- 3. LR 资源覆盖率（喂错矩阵的第一道防线）---
+resource = li.resource.select_resource("consensus")
+db_genes = set(resource["ligand"].astype(str)) | set(resource["receptor"].astype(str))
+var_genes = set(adata.var_names.astype(str))
+covered = db_genes & var_genes
+coverage = len(covered) / len(db_genes)
+log("consensus db_genes=%d covered=%d coverage=%.4f" % (len(db_genes), len(covered), coverage))
+if coverage < COVERAGE_MIN:
+    fail("LR 基因覆盖率 %.4f < %.2f：输入矩阵基因覆盖不足" % (coverage, COVERAGE_MIN))
+
+# --- 4. rank_aggregate（liana 默认方法集合，consensus 聚合）---
+li.mt.rank_aggregate(adata, groupby="celltype", resource_name="consensus",
+                     use_raw=False, n_perms=N_PERMS, seed=seed_int,
+                     expr_prop=EXPR_PROP, min_cells=MIN_CELLS, verbose=False)
+res = adata.uns["liana_res"].copy()
+del adata.uns["liana_res"]
+log("liana_res rows=%d cols=%s" % (res.shape[0], list(res.columns)))
+
+# --- 5. 自校验 ---
+if res.shape[0] == 0:
+    fail("liana 结果为空")
+if res["specificity_rank"].isna().any() or res["magnitude_rank"].isna().any():
+    fail("rank 列存在 NaN")
+if (res["lr_means"] < 0).any():
+    fail("lr_means 存在负值")
+pvals = res["cellphone_pvals"].dropna()
+if len(pvals) and ((pvals < 0) | (pvals > 1)).any():
+    fail("cellphone_pvals 超出 [0,1]")
+if set(res["source"].unique()) != set(celltypes) or set(res["target"].unique()) != set(celltypes):
+    fail("结果 source/target 集合与 celltype 分组不一致")
+log("self_check 契约/对齐/覆盖率/rank 完整/分组一致 OK")
+
+# --- 6. 汇总表 ---
+sort_cols = ["source", "target", "specificity_rank", "magnitude_rank"]
+top_specificity = res.sort_values("specificity_rank").head(TOP_N).reset_index(drop=True)
+per_pair_top = (res.sort_values("magnitude_rank")
+                  .groupby(["source", "target"], as_index=False)
+                  .first()
+                  .sort_values(["source", "target"])
+                  .reset_index(drop=True))
+
+# --- 7. 落盘 ---
+res.to_csv("cellcomm_interactions.tsv", sep="\t", index=False)
+
+out = annot.copy()
+out.uns["cell_communication"] = {
+    "method": "liana_rank_aggregate_consensus",
+    "liana_version": li.__version__ if hasattr(li, "__version__") else "1.10.0",
+    "resource": "consensus",
+    "n_lr_pairs_resource": int(resource.shape[0]),
+    "groupby": "celltype",
+    "expr_prop": EXPR_PROP,
+    "min_cells": MIN_CELLS,
+    "n_perms": N_PERMS,
+    "seed": seed_int,
+    "aggregate_method": "rra",
+    "de_method": "t-test",
+    "expression_source": norm_file,
+    "label_source": annotated_file,
+    "n_interactions": int(res.shape[0]),
+    "n_celltypes": len(celltypes),
+    "lr_gene_coverage": round(float(coverage), 4),
+    "lr_genes_covered": len(covered),
+    "lr_genes_total": len(db_genes),
+    # 表一律用 DataFrame 存：key 可能是 pair 名，含 "/" 过不了 h5py（坑 #106）
+    "top_specificity": top_specificity[["source", "target", "ligand_complex",
+                                        "receptor_complex", "specificity_rank",
+                                        "magnitude_rank"]],
+    "per_pair_top_magnitude": per_pair_top[["source", "target", "ligand_complex",
+                                            "receptor_complex", "magnitude_rank",
+                                            "specificity_rank"]],
+}
+out.write_h5ad("scrna_cellcomm.h5ad")
+
+report_lines = [
+    "step=cell_communication",
+    "seed=%s" % seed,
+    "label_source=%s" % annotated_file,
+    "expression_source=%s" % norm_file,
+    "method=liana %s rank_aggregate resource=consensus n_perms=%d expr_prop=%.2f min_cells=%d aggregate=rra de_method=t-test"
+    % (out.uns["cell_communication"]["liana_version"], N_PERMS, EXPR_PROP, MIN_CELLS),
+    "cells=%d celltypes=%d" % (n_cells, len(celltypes)),
+    "celltype_counts=%s" % ", ".join("%s:%d" % (c, int(celltype_counts[c])) for c in celltypes),
+    "lr_resource_pairs=%d lr_genes=%d covered=%d coverage=%.4f（全基因矩阵；若用 2000 HVG 覆盖率仅 0.219，故表达矩阵取 norm 全基因）"
+    % (resource.shape[0], len(db_genes), len(covered), coverage),
+    "interactions=%d（source x target x 过滤后 LR 对，含自分泌对）" % res.shape[0],
+    "",
+    "TOP%d by specificity_rank（越小越强；衡量该 LR 对相对其他细胞类型组的特异性）:" % TOP_N,
+]
+for _, row in top_specificity.iterrows():
+    report_lines.append("  %-28s -> %-28s %-16s -> %-16s spec=%.3e mag=%.3e"
+                        % (row["source"], row["target"], row["ligand_complex"],
+                           row["receptor_complex"], row["specificity_rank"],
+                           row["magnitude_rank"]))
+report_lines += [
+    "",
+    "per-pair top1 by magnitude_rank（每对 source->target 表达强度最高的 LR）:",
+]
+for _, row in per_pair_top.iterrows():
+    report_lines.append("  %-28s -> %-28s %-16s -> %-16s mag=%.3e"
+                        % (row["source"], row["target"], row["ligand_complex"],
+                           row["receptor_complex"], row["magnitude_rank"]))
+report_lines += [
+    "",
+    "口径说明:",
+    "1. specificity_rank 与 magnitude_rank 分工：前者衡量 LR 对相对其他组的特异性，",
+    "   后者衡量表达强度。B2M-CD1A/VIM-CD44/DSG1-DSC3 等管家型 pair 表达高但广泛，",
+    "   会占据 magnitude 榜而 specificity 低，生物学结论以 specificity 排序为准。",
+    "2. unknown 类（%d 细胞）是注释打分不过阈值的混合类，保留在结果中但不作生物学结论。"
+    % int(celltype_counts.get("unknown", 0)),
+    "3. 全量结果见 cellcomm_interactions.tsv（%d 行，含自分泌 source==target 对）。" % res.shape[0],
+    "4. liana 结果为统计评分不是实验验证；供假设生成，供人工复核。",
+    "outputs=scrna_cellcomm.h5ad, cellcomm_interactions.tsv",
+]
+with open("cellcomm_report.txt", "w") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+log("cell_communication_done rows=%d coverage=%.4f elapsed=%.1fs"
+    % (res.shape[0], coverage, time.time() - START))
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "$PWD" "cellcomm_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

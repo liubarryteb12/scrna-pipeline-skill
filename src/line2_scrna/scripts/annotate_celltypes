@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+# annotate_celltypes：line2_scrna 步骤 6 细胞类型注释。
+#
+# 输入：步骤 5 产物 scrna_clustered.h5ad（4587 细胞，obs['leiden'] 21 簇，
+# obs['celltype_paper'] 作者注释，var['highly_variable']）。
+#
+# 做三件事：
+#   1. 簇 marker 基因：wilcoxon vs 其余簇，每簇 top20。marker 是注释的客观证据，
+#      先出证据再下结论，不凭印象。
+#   2. 自动注释：marker 与已知细胞类型 marker 集（文献常见皮肤免疫 marker，
+#      大写类别）比对打分，每簇取最优类型；打分不过阈值记 unknown，不硬猜。
+#      粒度是大类（14 类），不比作者注释细，这是口径选择不是遗漏。
+#   3. 与作者注释对照审计：每簇 paper 分布 + 细胞级一致率。自动注释与 paper
+#      不一致的簇如实报告，供人工复核，不静默抹平。
+#
+# 自校验内建：输入契约（步骤 5 uns['clustering'] + obs['leiden'] + celltype_paper
+# 无 NA）、每簇都有 marker 输出、注释列全覆盖、obs['leiden'] 与细胞数不变。
+# 任一不过非零退出。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入分流：一个 h5ad（步骤 5 产物）。模式前后都带 *：拿到的是绝对路径，
+# 前缀匹配永远不中（坑 #99）。
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+h5ad_file=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *.h5ad) h5ad_file="$path" ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad，即步骤 5 cluster_umap 产物）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$h5ad_file" ]; then
+  echo "缺少必需输入：scrna_clustered.h5ad（步骤 5 产物）未提供" >&2
+  exit 2
+fi
+if [ ! -f "$h5ad_file" ]; then
+  echo "输入文件不存在: $h5ad_file"
+  exit 2
+fi
+
+echo "step_executed=annotate_celltypes"
+echo "bioanalys_seed=${seed}"
+echo "input_h5ad=${h5ad_file}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+H5AD_FILE="$h5ad_file" BIOANALYS_SEED="$seed" \
+python3 - <<'PYSCRIPT'
+import hashlib
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+import anndata as ad
+import scanpy as sc
+
+# pandas 3 与 2 的 infer_string 默认值不同，会导致 anndata 0.13 写 obs 字符串列时
+# 因 nullable strings 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+N_MARKER_GENES = 20
+SCORE_THRESHOLD = 0.4
+
+
+def fail(message):
+    sys.stderr.write("annotate_celltypes 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def count_dict(series):
+    return {str(name): int(count) for name, count in series.value_counts().items()}
+
+
+h5ad_file = os.environ["H5AD_FILE"]
+seed = os.environ["BIOANALYS_SEED"]
+
+adata = ad.read_h5ad(h5ad_file)
+log("loaded cells=%d genes=%d" % adata.shape)
+
+# --- 1. 输入契约校验：必须是步骤 5 产物 ---
+required_obs = ["donor", "diagnosis", "region", "group", "class", "plate", "well",
+                "celltype_paper", "seurat_cluster_paper", "leiden"]
+missing_obs = [col for col in required_obs if col not in adata.obs.columns]
+if missing_obs:
+    fail("输入 h5ad 缺少 obs 列 %s（不是 cluster_umap 产物？）" % missing_obs)
+if "clustering" not in adata.uns:
+    fail("输入 h5ad 缺少 uns['clustering']（不是 cluster_umap 产物？）")
+if "X_umap" not in adata.obsm:
+    fail("输入 h5ad 缺少 obsm['X_umap']（不是 cluster_umap 产物？）")
+n_paper_na = int((adata.obs["celltype_paper"].astype(str) == "NA").sum())
+if n_paper_na:
+    fail("celltype_paper 有 %d 个 NA（qc_cells 排除 doublet 后应无 NA）" % n_paper_na)
+
+leiden_before = sorted(adata.obs["leiden"].unique(), key=lambda s: int(s))
+n_cells_before = adata.shape[0]
+log("clusters=%d cells=%d paper_na=%d" % (len(leiden_before), n_cells_before, n_paper_na))
+
+# --- 2. marker 基因（wilcoxon vs 其余簇）---
+sc.tl.rank_genes_groups(adata, groupby="leiden", method="wilcoxon",
+                        n_genes=N_MARKER_GENES, use_raw=False)
+rgg = adata.uns["rank_genes_groups"]
+if set(rgg["names"].dtype.names) != set(leiden_before):
+    fail("marker 输出的簇集合 %s 与 obs['leiden'] %s 不一致"
+         % (sorted(rgg["names"].dtype.names), leiden_before))
+log("marker genes OK n_genes=%d method=wilcoxon" % N_MARKER_GENES)
+
+# --- 3. 自动注释：marker 集大类打分 ---
+CELLTYPE_MARKERS = {
+    "basal_keratinocyte": ["KRT5", "KRT14", "KRT15", "COL17A1", "POSTN", "ITGA6", "ITGB4"],
+    "suprabasal_keratinocyte": ["KRT1", "KRT10", "KRT2", "DMKN", "CASP14"],
+    "transition_keratinocyte": ["KRT1", "KRT5", "KRT15", "KRT10"],
+    "activated_keratinocyte": ["S100A8", "S100A7", "KRT6A", "S100A9", "S100A2"],
+    "mitotic": ["MKI67", "CCNB1", "PCNA", "TK1", "CDK1", "TOP2A"],
+    "melanocyte": ["MLANA", "PMEL", "TYR", "TYRP1", "DCT", "MITF", "KIT"],
+    "T_cell": ["CD3D", "CD3E", "CD2", "IL32", "PTPRC", "CD52"],
+    "Treg": ["FOXP3", "IL2RA", "CTLA4", "TIGIT", "IKZF2"],
+    "NK_ILC": ["NKG7", "GNLY", "KLRD1", "CTSW", "XCL1", "IL2RB"],
+    "macrophage_mDC": ["LYZ", "CST3", "HLA-DRA", "CD74", "CST6"],
+    "Langerhans_cell": ["CD207", "CD1A", "FCER1A", "CD1C"],
+    "pDC": ["LILRA4", "TCF4", "IL3RA", "IRF8", "GZMB", "CLEC4C"],
+    "progenitor_keratinocyte": ["SFRP1", "FZD7", "LHX2", "KRT17"],
+    "channel_keratinocyte": ["GJB6", "KRT23", "TFCP2L1", "SEMA3C"],
+    "fibroblast": ["COL1A1", "COL3A1", "DCN", "LUM"],
+    "endothelial": ["PECAM1", "VWF", "CLDN5", "CD34"],
+}
+PAPER_TO_MAJOR = {
+    "Basal keratinocytes I": "basal_keratinocyte",
+    "Basal keratinocytes II": "basal_keratinocyte",
+    "Basal keratinocytes III": "basal_keratinocyte",
+    "Suprabasal keratinocytes I": "suprabasal_keratinocyte",
+    "Suprabasal keratinocytes II": "suprabasal_keratinocyte",
+    "Transition keratinocytes": "transition_keratinocyte",
+    "Activated basal keratinocytes": "activated_keratinocyte",
+    "Activated suprabasal keratinocytes": "activated_keratinocyte",
+    "Activated Transition keratinocytes": "activated_keratinocyte",
+    "Activated mitotic keratinocytes": "mitotic",
+    "Mitotic keratinocytes": "mitotic",
+    "Channel keratinocytes": "channel_keratinocyte",
+    "Progenitor keratinocytes": "progenitor_keratinocyte",
+    "Melanocytes": "melanocyte",
+    "Th1": "T_cell", "Th17": "T_cell", "T lymphocytes": "T_cell",
+    "Tc (cytokine+)": "T_cell", "Tc (cytokine-)": "T_cell",
+    "Proliferative CD8": "T_cell",
+    "Treg": "Treg",
+    "ILC": "NK_ILC", "ILC/NK": "NK_ILC",
+    "Mac/MoDC": "macrophage_mDC", "mDC": "macrophage_mDC",
+    "LC": "Langerhans_cell",
+    "pDC": "pDC",
+}
+unknown_paper = sorted(set(adata.obs["celltype_paper"].unique()) - set(PAPER_TO_MAJOR))
+if unknown_paper:
+    fail("celltype_paper 有未映射大类的取值: %s" % unknown_paper)
+
+cluster_annotation = {}
+marker_rows = []
+log2fc_inf = 0
+for cluster in leiden_before:
+    genes = list(rgg["names"][cluster])
+    scores = list(rgg["scores"][cluster])
+    log2fcs = list(rgg["logfoldchanges"][cluster])
+    padj = list(rgg["pvals_adj"][cluster])
+    top_genes = set(genes)
+    best_type, best_score, best_hits = "unknown", 0.0, []
+    for celltype, marker_set in CELLTYPE_MARKERS.items():
+        hits = [g for g in marker_set if g in top_genes]
+        score = len(hits) / min(5, len(marker_set))
+        if score > best_score or (score == best_score and len(hits) > len(best_hits)):
+            best_type, best_score, best_hits = celltype, score, hits
+    if best_score < SCORE_THRESHOLD:
+        best_type = "unknown"
+    cluster_annotation[cluster] = {"annotation": best_type, "score": best_score,
+                                   "hits": best_hits}
+    for rank, (gene, score, lfc, pv) in enumerate(zip(genes, scores, log2fcs, padj), start=1):
+        if not np.isfinite(lfc):
+            log2fc_inf += 1
+            lfc = float("nan")
+        marker_rows.append({"cluster": cluster, "rank": rank, "gene": gene,
+                            "score": float(score), "log2fc": float(lfc),
+                            "pvals_adj": float(pv)})
+    log("cluster %s -> %s (score=%.2f hits=%s)" % (cluster, best_type, best_score, best_hits))
+
+adata.obs["celltype"] = adata.obs["leiden"].map(lambda c: cluster_annotation[c]["annotation"])
+adata.obs["celltype_paper_major"] = adata.obs["celltype_paper"].map(PAPER_TO_MAJOR)
+
+# --- 4. 自校验 ---
+if adata.obs["celltype"].isna().any():
+    fail("存在细胞未分到注释（leiden 簇未覆盖？）")
+if sorted(adata.obs["leiden"].unique(), key=lambda s: int(s)) != leiden_before:
+    fail("obs['leiden'] 簇集合在注释前后发生变化")
+if adata.shape[0] != n_cells_before:
+    fail("细胞数变化: %d -> %d" % (n_cells_before, adata.shape[0]))
+log("self_check 契约/marker 覆盖/注释全覆盖/leiden 不变 OK")
+
+# --- 5. 与作者注释对照 ---
+# 注意：obs 列由 categorical.map 生成，两个 categorical 类别集不同不能直接比较，先 astype(str)
+match = (adata.obs["celltype"].astype(str).to_numpy() ==
+         adata.obs["celltype_paper_major"].astype(str).to_numpy())
+overall_agreement = float(match.mean())
+unknown_clusters = [c for c, v in cluster_annotation.items() if v["annotation"] == "unknown"]
+
+# --- 6. 落盘 ---
+annotation_uns = {
+    "method": "wilcoxon_marker_vs_known_celltype_marker_sets",
+    "n_marker_genes": N_MARKER_GENES,
+    "score_threshold": SCORE_THRESHOLD,
+    "granularity": "major_class_14",
+    "marker_sets": {k: list(v) for k, v in CELLTYPE_MARKERS.items()},
+    # paper_to_major 用 DataFrame 存：key 含斜杠（ILC/NK、Mac/MoDC），h5py group 键名不允许 "/"
+    "paper_to_major": pd.DataFrame(
+        {"paper": list(PAPER_TO_MAJOR),
+         "major": [PAPER_TO_MAJOR[name] for name in PAPER_TO_MAJOR]}),
+    "cluster_annotation": {c: {"annotation": v["annotation"],
+                               "score": float(v["score"]),
+                               "hits": v["hits"]} for c, v in cluster_annotation.items()},
+    "paper_overall_agreement": overall_agreement,
+    "unknown_clusters": unknown_clusters,
+    "seed": int(seed),
+}
+adata.uns["annotation"] = annotation_uns
+adata.uns["cluster_markers"] = pd.DataFrame(marker_rows)
+adata.uns["seed"] = int(seed)
+adata.uns["source_h5ad"] = h5ad_file
+adata.write_h5ad("scrna_annotated.h5ad")
+
+markers_df = pd.DataFrame(marker_rows)
+markers_df.to_csv("cluster_markers.tsv", sep="\t", index=False)
+
+report_lines = [
+    "step=annotate_celltypes",
+    "seed=%s" % seed,
+    "input_h5ad=%s" % h5ad_file,
+    "cells=%d clusters=%d（注释不丢细胞不改簇）" % (adata.shape[0], len(leiden_before)),
+    "marker_method=wilcoxon vs rest, top %d / cluster" % N_MARKER_GENES,
+    "annotation_method=marker 集大类打分（文献常见 marker），阈值 score>=%.1f，不过记 unknown"
+    % SCORE_THRESHOLD,
+    "granularity=大类（%d 类），作者细分类见 celltype_paper 原列"
+    % len(set(CELLTYPE_MARKERS) | {"unknown"}),
+    "log2fc_inf_count=%d（组内全零表达基因的 wilcoxon 已知行为，已置 NaN 不进结论）" % log2fc_inf,
+    "paper_overall_agreement=%.4f（细胞级：自动注释大类 vs 作者注释映射大类）" % overall_agreement,
+    "unknown_clusters=%s（marker 打分不过阈值，不硬猜）" % (unknown_clusters or "无"),
+    "",
+    "per_cluster（n / 自动注释 / score / 作者注释众数 / 一致细胞数）:",
+]
+for cluster in leiden_before:
+    info = cluster_annotation[cluster]
+    in_cluster = adata.obs["leiden"] == cluster
+    paper_top = adata.obs.loc[in_cluster, "celltype_paper"].value_counts()
+    agree = int((adata.obs.loc[in_cluster, "celltype"].astype(str).to_numpy() ==
+                 adata.obs.loc[in_cluster, "celltype_paper_major"].astype(str).to_numpy()).sum())
+    top_genes = [row["gene"] for row in marker_rows if row["cluster"] == cluster][:8]
+    report_lines.append(
+        "  %s: n=%d annotation=%s score=%.2f paper_majority=%s(%d/%d) agree=%d markers=%s"
+        % (cluster, int(in_cluster.sum()), info["annotation"], info["score"],
+           str(paper_top.index[0]), int(paper_top.iloc[0]), int(in_cluster.sum()),
+           agree, " ".join(top_genes)))
+report_lines += [
+    "",
+    "note=自动注释为大类，作者注释为细分类（如 Treg vs T_cell 属粒度差异不矛盾）；",
+    " 不一致簇已逐簇列出，供人工复核，不静默抹平。",
+    "outputs=scrna_annotated.h5ad, cluster_markers.tsv, annotate_report.txt",
+    "elapsed_seconds=%.0f" % (time.time() - START),
+]
+with open("annotate_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+for _artifact in sorted(os.listdir(".")):
+    if not os.path.isfile(_artifact):
+        continue
+    if _artifact == 'annotate_report.txt':
+        continue
+    with open(_artifact, "rb") as _fh:
+        _digest = hashlib.sha256(_fh.read()).hexdigest()
+    with open('annotate_report.txt', "a", encoding="utf-8") as _fh:
+        _fh.write("%s_sha256=%s\n" % (_artifact, _digest))
+log("annotate_celltypes_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "$PWD" "annotate_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

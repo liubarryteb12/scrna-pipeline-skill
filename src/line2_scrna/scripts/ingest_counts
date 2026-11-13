@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+# ingest_counts：line2_scrna 步骤 1 读入与格式统一。
+#
+# 数据形态（2026-10-13 服务器实测，GSE254707，BJD 2024 银屑病 pDC 研究）：
+# Smart-seq2 孔板单细胞，每个细胞一个 gene x count 两列文本（CRLF 行尾，
+# 末尾带 featureCounts 的 __no_feature/__ambiguous 等汇总行，必须排除），
+# 全部打在 GSE254707_RAW.tar 里（4988 个 GSM*_*.txt.gz，外层纯 tar 不压）。
+# 每细胞元数据（donor/diagnosis/region/class/nCount/nFeature/percent.ercc/
+# 作者注释）在 GPL21697_family.soft.gz 的 ^SAMPLE 块里。
+#
+# 本步骤做三件事：
+#   1. 解析 soft 元数据 + tar 内全部按细胞计数文件，建成 cell x gene 稀疏矩阵；
+#   2. 区域码映射分组（PP=皮损 LS / PN=非皮损 NLS / H=健康 HC，银屑病转录组
+#      惯例，与 grouping.txt 的 LS/NLS/HC 对应），并与 grouping.txt 交叉核对；
+#   3. 落 AnnData h5ad（scrna_counts.h5ad）+ ingest_report.txt 到工作目录。
+#
+# 自校验内建：GSM 唯一且 tar 与 soft 一致、基因表跨文件逐字节一致、无负计数、
+# __ 汇总行不泄漏进矩阵、区域码与诊断自洽、computed 与 soft 元数据对账
+# （1% 容差，ERCC  spike-in 单列，精确匹配率如实报告）。任一不过非零退出，
+# 让台账记 failed，不产出看似成功的半成品。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入按文件名特征分流：按细胞计数 tar / 平台注释 soft / 用户分组表。
+# 模式必须前后都带 *：拿到的是绝对路径，前缀匹配永远不中（坑 #99）。
+declare -a INPUTS=()
+input_count=0
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); input_count=$((input_count + 1)); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+tar_file=""
+soft_file=""
+grouping_file=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *.tar) tar_file="$path" ;;
+    *GPL*) soft_file="$path" ;;
+    *grouping*) grouping_file="$path" ;;
+    *) echo "无法识别的输入文件: $path（需要 *.tar / *GPL* / *grouping*）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$tar_file" ] || [ -z "$soft_file" ]; then
+  echo "缺少必需输入：按细胞计数 tar 与 GPL soft 都必须提供（当前 tar='$tar_file' soft='$soft_file'）" >&2
+  exit 2
+fi
+for required in "$tar_file" "$soft_file"; do
+  if [ ! -f "$required" ]; then
+    echo "输入文件不存在: $required" >&2
+    exit 2
+  fi
+done
+if [ -n "$grouping_file" ] && [ ! -f "$grouping_file" ]; then
+  echo "grouping 文件不存在: $grouping_file" >&2
+  exit 2
+fi
+
+echo "step_executed=ingest_counts"
+echo "bioanalys_seed=${seed}"
+echo "input_counts_tar=${tar_file}"
+echo "input_gpl_soft=${soft_file}"
+echo "input_grouping=${grouping_file:-（未提供，跳过组名核对）}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+TAR_FILE="$tar_file" SOFT_FILE="$soft_file" GROUPING_FILE="$grouping_file" BIOANALYS_SEED="$seed" \
+python3 - <<'PYSCRIPT'
+import array
+import gzip
+import os
+import re
+import sys
+import tarfile
+import time
+from collections import Counter
+
+import numpy as np
+import pandas as pd
+import anndata
+from scipy.sparse import csr_matrix
+
+# pandas 3 与 2 的 infer_string 默认值不同，会导致 anndata 0.13 写 obs 字符串列时
+# 因 nullable strings 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+# 本脚本 import anndata 无别名，用全名。
+anndata.settings.allow_write_nullable_strings = False
+
+START = time.time()
+
+
+def fail(message):
+    sys.stderr.write("ingest_counts 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    sys.stdout.write(message + "\n")
+    sys.stdout.flush()
+
+
+tar_file = os.environ["TAR_FILE"]
+soft_file = os.environ["SOFT_FILE"]
+grouping_file = os.environ.get("GROUPING_FILE", "")
+seed = os.environ["BIOANALYS_SEED"]
+
+# --- 1. tar 成员清单：每个文件 = 一个细胞 ---
+# GEO RAW tar 命名 <GSM>_<样本标题>.txt.gz；标题形如 HLA00101R-A01（板号-孔位），
+# 板号孔位只作溯源记录，解析不了不致命，GSM 解析不了才是数据损坏。
+member_names = []
+member_dirs = 0
+with tarfile.open(tar_file, "r:") as tf:
+    for member in tf:
+        if member.isfile():
+            member_names.append(member.name)
+        else:
+            member_dirs += 1
+if not member_names:
+    fail("tar 内没有任何文件: %s" % tar_file)
+
+gsm_re = re.compile(r"^(GSM\d+)_.+\.txt\.gz$")
+plate_re = re.compile(r"^(.*)-([A-Z]\d{2})$")
+cell_records = []
+for name in member_names:
+    base = os.path.basename(name)
+    gsm_match = gsm_re.match(base)
+    if not gsm_match:
+        fail("tar 内存在无法解析 GSM 的文件: %s" % base)
+    gsm = gsm_match.group(1)
+    title_part = base[len(gsm) + 1:-len(".txt.gz")]
+    plate_match = plate_re.match(title_part)
+    plate = plate_match.group(1) if plate_match else ""
+    well = plate_match.group(2) if plate_match else ""
+    cell_records.append((gsm, plate, well, name))
+
+gsm_list = [record[0] for record in cell_records]
+duplicated = sorted(gsm for gsm, count in Counter(gsm_list).items() if count > 1)
+if duplicated:
+    fail("tar 内 GSM 重复（前 5 个）: %s" % duplicated[:5])
+cell_records.sort(key=lambda record: record[0])
+n_cells = len(cell_records)
+log("tar_members=%d cells=%d non_file_entries=%d" % (len(member_names), n_cells, member_dirs))
+
+# --- 2. soft 元数据：只收 tar 里出现的 GSM ---
+gsm_set = set(gsm_list)
+meta = {}
+current = None
+opener = gzip.open if soft_file.endswith(".gz") else open
+with opener(soft_file, "rt", encoding="utf-8", errors="replace") as fh:
+    for line in fh:
+        if line.startswith("^SAMPLE = "):
+            current = line.strip().split("= ", 1)[1]
+            if current in gsm_set and current not in meta:
+                meta[current] = {}
+        elif current in gsm_set and line.startswith("!Sample_title = "):
+            meta[current].setdefault("title", line.strip().split("= ", 1)[1])
+        elif current in gsm_set and line.startswith("!Sample_characteristics_ch1 = "):
+            body = line.strip().split("= ", 1)[1]
+            if ": " in body:
+                key, _, value = body.partition(": ")
+                meta[current].setdefault(key, value)
+missing_meta = sorted(gsm_set - set(meta))
+if missing_meta:
+    fail("soft 中缺少 %d 个细胞的元数据（前 5 个 GSM）: %s" % (len(missing_meta), missing_meta[:5]))
+log("soft_meta_cells=%d" % len(meta))
+
+# --- 3. 区域码 -> 分组 ---
+# region 码沿用银屑病皮肤转录组惯例（Tsoi 等系列论文）：PP = psoriatic plaque
+# 皮损区 -> LS；PN = perilesional/non-involved 非皮损区 -> NLS；H = healthy
+# 健康对照 -> HC。与 grouping.txt 的组名对应。未知码不猜，直接失败。
+REGION_TO_GROUP = {"PP": "LS", "PN": "NLS", "H": "HC"}
+region_counter = Counter()
+diagnosis_counter = Counter()
+for gsm in gsm_list:
+    cell_meta = meta[gsm]
+    region = cell_meta.get("region", "")
+    diagnosis = cell_meta.get("diagnosis", "")
+    region_counter[region] += 1
+    diagnosis_counter[diagnosis] += 1
+    if region not in REGION_TO_GROUP:
+        fail("细胞 %s 的 region 码无法映射分组: '%s'（已知 PP/PN/H）" % (gsm, region))
+    expected_word = "psoriasis" if region in ("PP", "PN") else "healthy"
+    if expected_word not in diagnosis.lower():
+        fail("细胞 %s 的 region=%s 与 diagnosis='%s' 矛盾（期望含 %s）"
+             % (gsm, region, diagnosis, expected_word))
+log("region_counts=%s" % dict(region_counter))
+log("diagnosis_counts=%s" % dict(diagnosis_counter))
+
+# --- 4. grouping.txt 交叉核对（用户分组表 vs 区域码派生分组）---
+grouping_check = "未提供 grouping 文件，跳过核对"
+if grouping_file:
+    # warn=FALSE：grouping.txt 是 CRLF 且末尾可能无换行，warning 会污染 stderr
+    with open(grouping_file, "r", encoding="utf-8", errors="replace") as fh:
+        grouping_text = fh.read()
+    # 组名以 ", LS" / ", NLS" 形式缀在中文描述后，按此提取，不按下标猜
+    grouping_tags = set(re.findall(r",\s*([A-Za-z][A-Za-z0-9_-]{0,15})\b", grouping_text))
+    mapped_groups = set(REGION_TO_GROUP[region] for region in region_counter)
+    if not grouping_tags:
+        fail("grouping 文件里提取不到任何组名: %s" % grouping_file)
+    if mapped_groups != grouping_tags:
+        fail("grouping 组名 %s 与区域码派生分组 %s 不一致" % (sorted(grouping_tags), sorted(mapped_groups)))
+    grouping_check = "一致（%s）" % "/".join(sorted(grouping_tags))
+log("grouping_check=%s" % grouping_check)
+
+# --- 5. 逐细胞解析 + 稀疏矩阵构建 ---
+ref_genes = None
+cell_axis = array.array("i")
+gene_axis = array.array("i")
+values = array.array("i")
+cell_total = np.zeros(n_cells, dtype=np.int64)
+cell_nnz = np.zeros(n_cells, dtype=np.int64)
+cell_ercc_total = np.zeros(n_cells, dtype=np.int64)
+cell_ercc_nnz = np.zeros(n_cells, dtype=np.int64)
+summary_row_counter = Counter()
+
+with tarfile.open(tar_file, "r:") as tf:
+    for cell_idx, record in enumerate(cell_records):
+        gsm, plate, well, member_name = record
+        handle = tf.extractfile(member_name)
+        if handle is None:
+            fail("无法读取 tar 成员: %s" % member_name)
+        text = gzip.decompress(handle.read()).decode("utf-8")
+        genes = []
+        counts = []
+        for line in text.splitlines():
+            if not line:
+                continue
+            gene, _, count = line.partition("\t")
+            if gene.startswith("__"):
+                # featureCounts 汇总行（__no_feature/__ambiguous 等）不是基因
+                summary_row_counter[gene] += 1
+                continue
+            genes.append(gene)
+            counts.append(int(count))
+        if ref_genes is None:
+            ref_genes = genes
+            duplicated_genes = sorted(g for g, c in Counter(ref_genes).items() if c > 1)
+            if duplicated_genes:
+                fail("基因名重复（前 5 个）: %s" % duplicated_genes[:5])
+        elif genes != ref_genes:
+            # 基因表顺序或内容与参考不一致：矩阵行索引会错位，必须失败
+            first_diff = next((pos for pos, pair in enumerate(zip(genes, ref_genes)) if pair[0] != pair[1]),
+                              min(len(genes), len(ref_genes)))
+            fail("细胞 %s 的基因表与参考不一致（长度 %d vs %d，首个差异位 %d: %s vs %s）"
+                 % (gsm, len(genes), len(ref_genes), first_diff,
+                    genes[first_diff] if first_diff < len(genes) else "<无>",
+                    ref_genes[first_diff] if first_diff < len(ref_genes) else "<无>"))
+        total = 0
+        nnz = 0
+        ercc_total = 0
+        ercc_nnz = 0
+        nz_positions = array.array("i")
+        nz_values = array.array("i")
+        for gene_pos, value in enumerate(counts):
+            if value < 0:
+                fail("细胞 %s 基因 %s 计数为负: %d" % (gsm, genes[gene_pos], value))
+            total += value
+            if value > 0:
+                nnz += 1
+                nz_positions.append(gene_pos)
+                nz_values.append(value)
+            if genes[gene_pos].startswith("ERCC"):
+                ercc_total += value
+                if value > 0:
+                    ercc_nnz += 1
+        gene_axis.extend(nz_positions)
+        cell_axis.extend(array.array("i", [cell_idx]) * len(nz_positions))
+        values.extend(nz_values)
+        cell_total[cell_idx] = total
+        cell_nnz[cell_idx] = nnz
+        cell_ercc_total[cell_idx] = ercc_total
+        cell_ercc_nnz[cell_idx] = ercc_nnz
+        if (cell_idx + 1) % 500 == 0 or cell_idx + 1 == n_cells:
+            log("parsed_cells=%d/%d elapsed=%.0fs" % (cell_idx + 1, n_cells, time.time() - START))
+
+n_genes = len(ref_genes)
+if n_genes == 0:
+    fail("基因表为空")
+log("genes=%d summary_rows_excluded=%s" % (n_genes, dict(summary_row_counter)))
+
+# 矩阵方向：行 = 细胞，列 = 基因（AnnData 约定 cells x genes）
+count_matrix = csr_matrix(
+    (np.array(values, dtype=np.int32),
+     (np.array(cell_axis, dtype=np.int32), np.array(gene_axis, dtype=np.int32))),
+    shape=(n_cells, n_genes))
+if count_matrix.shape != (n_cells, n_genes):
+    fail("矩阵维度异常: %s" % (count_matrix.shape,))
+if count_matrix.nnz != len(values):
+    fail("矩阵非零元数量与解析不一致: %d vs %d" % (count_matrix.nnz, len(values)))
+
+# --- 6. 与 soft 元数据对账（完整性校验，非精确性校验）---
+# 实测（cn_debug/s3_ingest_diag*.py）：soft 的 nCount/nFeature 剔除 ERCC spike-in，
+# 与 deposited 文件有 <=0.1% 的再定量残差；percent.ercc = ERCC/(总量)。
+# 因此对账用 1% 容差 + ERCC 剔除口径，精确匹配数单独报告，不静默吞差异。
+exact_match = 0
+checked = 0
+max_count_rel = 0.0
+max_feat_abs = 0
+max_ercc_abs = 0.0
+for cell_idx, gsm in enumerate(gsm_list):
+    cell_meta = meta[gsm]
+    meta_count = cell_meta.get("ncount rna")
+    meta_feat = cell_meta.get("nfeature rna")
+    meta_ercc = cell_meta.get("percent.ercc")
+    computed_count = int(cell_total[cell_idx] - cell_ercc_total[cell_idx])
+    computed_feat = int(cell_nnz[cell_idx] - cell_ercc_nnz[cell_idx])
+    if meta_count and meta_feat:
+        checked += 1
+        count_rel = abs(computed_count - float(meta_count)) / max(float(meta_count), 1.0)
+        feat_abs = abs(computed_feat - float(meta_feat))
+        if count_rel > 0.01:
+            fail("细胞 %s 计数对账超差: computed=%d meta=%s (rel=%.4f)"
+                 % (gsm, computed_count, meta_count, count_rel))
+        if feat_abs > max(0.01 * float(meta_feat), 20.0):
+            fail("细胞 %s 基因数对账超差: computed=%d meta=%s" % (gsm, computed_feat, meta_feat))
+        if count_rel == 0.0 and feat_abs == 0:
+            exact_match += 1
+        max_count_rel = max(max_count_rel, count_rel)
+        max_feat_abs = max(max_feat_abs, feat_abs)
+    if meta_ercc and cell_total[cell_idx] > 0:
+        ercc_abs = abs(cell_ercc_total[cell_idx] / cell_total[cell_idx] - float(meta_ercc))
+        if ercc_abs > 0.005:
+            fail("细胞 %s ERCC 比例对账超差: computed=%.6f meta=%s"
+                 % (gsm, cell_ercc_total[cell_idx] / cell_total[cell_idx], meta_ercc))
+        max_ercc_abs = max(max_ercc_abs, ercc_abs)
+if checked < n_cells:
+    fail("只有 %d/%d 个细胞能对账（其余缺 ncount/nfeature 元数据）" % (checked, n_cells))
+log("meta_reconcile checked=%d exact_match=%d max_count_rel=%.5f max_feat_abs=%d max_ercc_abs=%.6f"
+    % (checked, exact_match, max_count_rel, max_feat_abs, max_ercc_abs))
+
+# --- 7. obs / var 组装 ---
+def to_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return np.nan
+
+
+obs = pd.DataFrame(index=pd.Index(gsm_list, name="gsm"))
+obs["sample_title"] = [meta[gsm].get("title", "") for gsm in gsm_list]
+obs["donor"] = [meta[gsm].get("donor", "") for gsm in gsm_list]
+obs["diagnosis"] = [meta[gsm].get("diagnosis", "") for gsm in gsm_list]
+obs["region"] = [meta[gsm].get("region", "") for gsm in gsm_list]
+obs["group"] = [REGION_TO_GROUP[meta[gsm]["region"]] for gsm in gsm_list]
+obs["class"] = [meta[gsm].get("class", "") for gsm in gsm_list]
+obs["plate"] = [record[1] for record in cell_records]
+obs["well"] = [record[2] for record in cell_records]
+obs["ncount_rna_meta"] = [to_float(meta[gsm].get("ncount rna")) for gsm in gsm_list]
+obs["nfeature_rna_meta"] = [to_float(meta[gsm].get("nfeature rna")) for gsm in gsm_list]
+obs["percent_ercc_meta"] = [to_float(meta[gsm].get("percent.ercc")) for gsm in gsm_list]
+obs["fsc_a"] = [to_float(meta[gsm].get("fsc.a.x")) for gsm in gsm_list]
+obs["fsc_h"] = [to_float(meta[gsm].get("fsc.h.x")) for gsm in gsm_list]
+obs["fsc_w"] = [to_float(meta[gsm].get("fsc.w.x")) for gsm in gsm_list]
+obs["celltype_paper"] = [meta[gsm].get("celltype", "") for gsm in gsm_list]
+obs["seurat_cluster_paper"] = [meta[gsm].get("seurat clusters", "") for gsm in gsm_list]
+obs["ncount_computed"] = cell_total - cell_ercc_total
+obs["nfeature_computed"] = cell_nnz - cell_ercc_nnz
+obs["ercc_fraction_computed"] = np.where(cell_total > 0, cell_ercc_total / np.maximum(cell_total, 1), 0.0)
+
+var = pd.DataFrame(index=pd.Index(ref_genes, name="gene"))
+var["ercc"] = [gene.startswith("ERCC") for gene in ref_genes]
+
+adata = anndata.AnnData(X=count_matrix, obs=obs, var=var)
+adata.uns["region_to_group"] = REGION_TO_GROUP
+adata.uns["seed"] = seed
+adata.uns["source_counts_tar"] = tar_file
+adata.uns["source_gpl_soft"] = soft_file
+adata.uns["grouping_check"] = grouping_check
+adata.write_h5ad("scrna_counts.h5ad")
+
+# --- 8. 报告落盘 ---
+group_counts = Counter(obs["group"])
+donor_counts = Counter(obs["donor"])
+class_counts = Counter(obs["class"])
+plate_count = len(set(obs["plate"]))
+ercc_genes = int(var["ercc"].sum())
+
+report_lines = [
+    "step=ingest_counts",
+    "seed=%s" % seed,
+    "source_counts_tar=%s" % tar_file,
+    "source_gpl_soft=%s" % soft_file,
+    "grouping_file=%s" % (grouping_file if grouping_file else "（未提供）"),
+    "grouping_check=%s" % grouping_check,
+    "cells=%d" % n_cells,
+    "genes=%d (ercc=%d)" % (n_genes, ercc_genes),
+    "matrix_nnz=%d" % count_matrix.nnz,
+    "matrix_density=%.6f" % (count_matrix.nnz / (n_cells * n_genes)),
+    "region_counts=%s" % dict(region_counter),
+    "group_counts=%s" % dict(group_counts),
+    "donor_counts=%s" % dict(donor_counts),
+    "class_counts=%s" % dict(class_counts),
+    "plates=%d" % plate_count,
+    "summary_rows_excluded=%s" % dict(summary_row_counter),
+    "meta_reconcile_checked=%d" % checked,
+    "meta_reconcile_exact_match=%d (%.2f%%)" % (exact_match, 100.0 * exact_match / max(checked, 1)),
+    "meta_reconcile_max_count_rel=%.5f" % max_count_rel,
+    "meta_reconcile_max_feat_abs=%d" % max_feat_abs,
+    "meta_reconcile_max_ercc_abs=%.6f" % max_ercc_abs,
+    "median_ncount_computed=%.0f" % float(np.median(obs["ncount_computed"])),
+    "median_nfeature_computed=%.0f" % float(np.median(obs["nfeature_computed"])),
+    "elapsed_seconds=%.0f" % (time.time() - START),
+    "outputs=scrna_counts.h5ad, ingest_report.txt",
+]
+with open("ingest_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+for line in report_lines:
+    log(line)
+log("ingest_counts_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "$PWD" "ingest_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

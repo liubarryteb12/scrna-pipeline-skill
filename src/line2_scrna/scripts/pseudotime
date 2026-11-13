@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# pseudotime：line2_scrna 步骤 7 拟时序（diffusion map + DPT）。
+#
+# 输入：步骤 6 产物 scrna_annotated.h5ad（4587 细胞，obs['celltype']、
+# obsm['X_pca_harmony'] 与邻居图、uns['annotation']）。
+#
+# 口径（Monocle3/slingshot 容器均缺位，pip 源可达但 cellrank 依赖链过重，
+# 选 scanpy 内置 DPT，零新依赖；README 工具分工表相应更新为 Python 侧）：
+#   1. diffusion map：在步骤 5 的 harmony 邻居图上算（n_comps=15）。
+#   2. 根选择：progenitor_keratinocyte（簇 15，皮肤分化谱系起点）内
+#      DC 空间离该簇质心最远的细胞为根（iroot），不拍脑袋选单个细胞。
+#   3. DPT：sc.tl.dpt(n_dcs=10, n_branchings=0, min_group_size=0.01)。
+#   4. 不可达细胞：DPT 只在「根所在的连通分量」上有限，分量外的细胞必然是
+#      inf（scanpy 正常输出，不是 bug）。本数据 4587 细胞在 harmony kNN 图
+#      （n_neighbors=15, X_pca_harmony）上分成 3 个连通分量：上皮/角质形成
+#      细胞主图（含根）、免疫细胞图、黑素细胞图。如实报告不置 NaN。
+#      免疫细胞（T_cell/NK_ILC）即使可达也不具表皮分化拟时序意义，报告注明
+#      只解读表皮谱系。
+#
+# 自校验内建（P13 由「细胞类型豁免白名单」改为「连通分量等价」，理由：白名单
+# 只对某一份数据成立，换数据集（本 E2E 项目）就误报；连通分量是数学性质）：
+# 输入契约（步骤 6 uns['annotation'] + celltype + 邻居图）、根细胞 dpt == 0、
+# 主链最大值 <= 1+容差、inf 集合必须与「非根连通分量」严格等价（根分量内出现
+# inf 判 fail，分量外出现有限值也判 fail）、表皮谱系类型不许整类不可达
+# （部分细胞落到别的分量允许，如 16 个 mitotic 细胞落在免疫分量）、
+# 细胞数与注释列不变。任一不过非零退出。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入分流：一个 h5ad（步骤 6 产物）。模式前后都带 *：拿到的是绝对路径，
+# 前缀匹配永远不中（坑 #99）。
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+h5ad_file=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *.h5ad) h5ad_file="$path" ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad，即步骤 6 annotate_celltypes 产物）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$h5ad_file" ]; then
+  echo "缺少必需输入：scrna_annotated.h5ad（步骤 6 产物）未提供" >&2
+  exit 2
+fi
+if [ ! -f "$h5ad_file" ]; then
+  echo "输入文件不存在: $h5ad_file"
+  exit 2
+fi
+
+echo "step_executed=pseudotime"
+echo "bioanalys_seed=${seed}"
+echo "input_h5ad=${h5ad_file}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+H5AD_FILE="$h5ad_file" BIOANALYS_SEED="$seed" \
+python3 - <<'PYSCRIPT'
+import hashlib
+import os
+import os
+import sys
+import time
+
+import numpy as np
+import anndata as ad
+import scanpy as sc
+from scipy.sparse.csgraph import connected_components
+
+# pandas 3 与 2 的 infer_string 默认值不同，会导致 anndata 0.13 写 obs 字符串列时
+# （本脚本不再直接 import pandas，只通过 anndata 间接用；这里只是显式定下开关）
+# 因 nullable strings 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+N_DCS = 15
+N_DPT_DCS = 10
+ROOT_CELLTYPE = os.environ.get("BIO_PSEUDO_ROOT", "progenitor_keratinocyte")
+# 不可达判定按连通分量做，不再维护细胞类型白名单：白名单只对某一份数据成立，
+# 换数据集就会把「合法的 inf」误报成异常。判据见第 5 节自校验。
+# 拟时序只解读这些表皮谱系类型；免疫细胞虽连通但不具分化谱系意义。
+LINEAGE_CELLTYPES = None
+_env_lineage = os.environ.get("BIO_PSEUDO_LINEAGE", "")
+if _env_lineage:
+    LINEAGE_CELLTYPES = {s.strip() for s in _env_lineage.split(",") if s.strip()}
+ROOT_DPT_TOL = 1e-6
+MAX_DPT_TOL = 1e-4
+
+
+def fail(message):
+    sys.stderr.write("pseudotime 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+h5ad_file = os.environ["H5AD_FILE"]
+seed = os.environ["BIOANALYS_SEED"]
+seed_int = int(seed)
+
+adata = ad.read_h5ad(h5ad_file)
+log("loaded cells=%d genes=%d" % adata.shape)
+
+# --- 1. 输入契约校验：必须是步骤 6 产物 ---
+if "annotation" not in adata.uns:
+    fail("输入 h5ad 缺少 uns['annotation']（不是 annotate_celltypes 产物？）")
+if "celltype" not in adata.obs.columns:
+    fail("输入 h5ad 缺少 obs['celltype']（不是 annotate_celltypes 产物？）")
+if "X_pca_harmony" not in adata.obsm:
+    fail("输入 h5ad 缺少 obsm['X_pca_harmony']（不是 cluster_umap 产物？）")
+if "neighbors" not in adata.uns or "connectivities" not in adata.obsp:
+    fail("输入 h5ad 缺少邻居图 connectivities（不是 cluster_umap 产物？）")
+
+root_mask = (adata.obs["celltype"] == ROOT_CELLTYPE).to_numpy()
+n_root = int(root_mask.sum())
+if n_root == 0:
+    fail("obs['celltype'] 中没有 %s 细胞，无法选根" % ROOT_CELLTYPE)
+
+n_cells_before = adata.shape[0]
+celltype_before = set(adata.obs["celltype"].unique())
+leiden_before = sorted(adata.obs["leiden"].unique(), key=lambda s: int(s))
+log("clusters=%d cells=%d root_cells=%d" % (len(leiden_before), n_cells_before, n_root))
+
+# --- 2. diffusion map（在 harmony 邻居图上）---
+sc.tl.diffmap(adata, n_comps=N_DCS, random_state=seed_int)
+diff = np.asarray(adata.obsm["X_diffmap"])
+if not np.isfinite(diff).all():
+    fail("X_diffmap 含非有限值")
+log("diffmap OK shape=%s" % (diff.shape,))
+
+# --- 3. 根选择：根簇内 DC 空间离质心最远的细胞（谱系极端点）---
+root_idx = np.where(root_mask)[0]
+root_center = diff[root_idx].mean(axis=0)
+dists = np.linalg.norm(diff - root_center, axis=1)
+root_cell = int(root_idx[int(np.argmax(dists[root_idx]))])
+log("iroot=%d leiden=%s（根簇 %s 内 DC 离质心最远细胞，dist=%.4f）"
+    % (root_cell, adata.obs["leiden"].iloc[root_cell], ROOT_CELLTYPE,
+       float(dists[root_cell])))
+adata.uns["iroot"] = root_cell
+
+# --- 4. DPT ---
+sc.tl.dpt(adata, n_dcs=N_DPT_DCS, n_branchings=0, min_group_size=0.01)
+dpt = adata.obs["dpt_pseudotime"].to_numpy().astype(float)
+if np.isnan(dpt).any():
+    fail("dpt_pseudotime 含 NaN（scanpy DPT 只产出有限值或 inf，不应有 NaN）")
+n_inf = int(np.isinf(dpt).sum())
+finite = dpt[np.isfinite(dpt)]
+dpt_max = float(finite.max()) if finite.size else 0.0
+log("dpt finite=%d inf=%d max=%.4f root_dpt=%.6f"
+    % (int(np.isfinite(dpt).sum()), n_inf, dpt_max, float(dpt[root_cell])))
+
+# --- 5. 自校验 ---
+if abs(float(dpt[root_cell])) > ROOT_DPT_TOL:
+    fail("根细胞 dpt=%r 不为 0（容差 %g）" % (float(dpt[root_cell]), ROOT_DPT_TOL))
+if dpt_max > 1.0 + MAX_DPT_TOL:
+    fail("dpt 最大值 %.6f 超过 1（容差 %g）" % (dpt_max, MAX_DPT_TOL))
+inf_mask = np.isinf(dpt)
+# 连通分量用与 diffmap 完全相同的图（obsp['connectivities']）算，保证判据自洽。
+n_components, comp_labels = connected_components(adata.obsp["connectivities"], directed=False)
+root_comp = int(comp_labels[root_cell])
+off_comp = comp_labels != root_comp
+wrong_inf = int((inf_mask & ~off_comp).sum())
+wrong_finite = int((~inf_mask & off_comp).sum())
+if wrong_inf:
+    fail("根连通分量内出现 dpt=inf: %d 个细胞（扩散图连通性异常）" % wrong_inf)
+if wrong_finite:
+    fail("根分量外出现有限 dpt: %d 个细胞（与连通性矛盾）" % wrong_finite)
+lineage_arr = adata.obs["celltype"].to_numpy()
+for celltype in sorted(LINEAGE_CELLTYPES):
+    type_mask = lineage_arr == celltype
+    if int(type_mask.sum()) == 0:
+        continue
+    if int((~np.isfinite(dpt[type_mask])).sum()) == int(type_mask.sum()):
+        fail("表皮谱系类型 %s 的全部细胞 dpt=inf（该类型没有连进主图）" % celltype)
+log("components=%d root_comp=%d off_comp_cells=%d"
+    % (n_components, root_comp, int(off_comp.sum())))
+if sorted(adata.obs["leiden"].unique(), key=lambda s: int(s)) != leiden_before:
+    fail("obs['leiden'] 簇集合在拟时序前后发生变化")
+if set(adata.obs["celltype"].unique()) != celltype_before:
+    fail("obs['celltype'] 取值集合发生变化")
+if adata.shape[0] != n_cells_before:
+    fail("细胞数变化: %d -> %d" % (n_cells_before, adata.shape[0]))
+log("self_check 契约/根为0/值域<=1/inf=非根分量/谱系可达/簇与细胞数不变 OK")
+
+# --- 6. 与注释对照 + 报告 ---
+per_type = {}
+for celltype, sub in adata.obs.groupby("celltype", observed=True):
+    values = sub["dpt_pseudotime"].to_numpy().astype(float)
+    finite_values = values[np.isfinite(values)]
+    per_type[str(celltype)] = {
+        "n": int(values.shape[0]),
+        "n_inf": int(np.isinf(values).sum()),
+        "median": float(np.median(finite_values)) if finite_values.size else None,
+        "q25": float(np.percentile(finite_values, 25)) if finite_values.size else None,
+        "q75": float(np.percentile(finite_values, 75)) if finite_values.size else None,
+    }
+
+per_cluster = {}
+for cluster, sub in adata.obs.groupby("leiden", observed=True):
+    values = sub["dpt_pseudotime"].to_numpy().astype(float)
+    finite_values = values[np.isfinite(values)]
+    per_cluster[str(cluster)] = {
+        "n": int(values.shape[0]),
+        "n_inf": int(np.isinf(values).sum()),
+        "median": float(np.median(finite_values)) if finite_values.size else None,
+    }
+
+# --- 7. 落盘 ---
+adata.uns["pseudotime"] = {
+    "method": "scanpy_diffmap_dpt_on_harmony_neighbors",
+    "root_celltype": ROOT_CELLTYPE,
+    "iroot": root_cell,
+    "iroot_leiden": str(adata.obs["leiden"].iloc[root_cell]),
+    "root_selection": "根簇内 DC 空间离质心最远细胞（谱系极端点）",
+    "n_dcs_diffmap": N_DCS,
+    "n_dcs_dpt": N_DPT_DCS,
+    "n_branchings": 0,
+    "min_group_size": 0.01,
+    "random_state": seed_int,
+    "dpt_max": dpt_max,
+    "n_inf": n_inf,
+    "n_components": int(n_components),
+    "root_component": int(root_comp),
+    "off_component_cells": int(off_comp.sum()),
+    "unreachable_rule": "inf 集合 == 非根连通分量（scanpy DPT 的数学性质，非异常）",
+    "lineage_celltypes": sorted(LINEAGE_CELLTYPES),
+    "per_celltype": per_type,
+    "per_cluster": per_cluster,
+}
+adata.uns["seed"] = seed_int
+adata.uns["source_h5ad"] = h5ad_file
+adata.write_h5ad("scrna_pseudotime.h5ad")
+
+report_lines = [
+    "step=pseudotime",
+    "seed=%s" % seed,
+    "input_h5ad=%s" % h5ad_file,
+    "method=diffmap(n_comps=%d) + DPT(n_dcs=%d, n_branchings=0) on harmony 邻居图"
+    % (N_DCS, N_DPT_DCS),
+    "route_note=Monocle3/slingshot/cellrank 容器缺位，选 scanpy 内置 DPT（零新依赖）",
+    "root=%s 簇（皮肤分化谱系起点），iroot=%d（簇内 DC 离质心最远细胞）"
+    % (ROOT_CELLTYPE, root_cell),
+    "cells=%d clusters=%d（拟时序不丢细胞不改簇）" % (adata.shape[0], len(leiden_before)),
+    "dpt_range=[0, %.4f] root_dpt=%.6f" % (dpt_max, float(dpt[root_cell])),
+    "dpt_inf=%d（= 非根连通分量细胞数 %d；DPT 只在根分量上有限，scanpy 正常输出）"
+    % (n_inf, int(off_comp.sum())),
+    "graph_components=%d（root_comp=%d）：inf 与连通分量严格等价，已自校验"
+    % (n_components, root_comp),
+    "interpretation_note=免疫细胞（T_cell/NK_ILC）虽连通但 dpt 无生物学拟时序意义，",
+    "  只解读表皮谱系：%s" % "/".join(sorted(LINEAGE_CELLTYPES)),
+    "",
+    "per_celltype（n / n_inf / median / q25 / q75）:",
+]
+for celltype in sorted(per_type, key=lambda k: (per_type[k]["median"] is None,
+                                                per_type[k]["median"] or 0.0)):
+    info = per_type[celltype]
+    if info["median"] is None:
+        report_lines.append("  %-28s n=%4d n_inf=%4d median=inf（不可达）"
+                            % (celltype, info["n"], info["n_inf"]))
+    else:
+        report_lines.append("  %-28s n=%4d n_inf=%4d median=%.4f q25=%.4f q75=%.4f"
+                            % (celltype, info["n"], info["n_inf"],
+                               info["median"], info["q25"], info["q75"]))
+report_lines += ["", "per_cluster（n / n_inf / median dpt，按 median 升序）:"]
+for cluster in sorted(per_cluster, key=lambda k: (per_cluster[k]["median"] is None,
+                                                  per_cluster[k]["median"] or 0.0)):
+    info = per_cluster[cluster]
+    median_str = "inf（不可达）" if info["median"] is None else "%.4f" % info["median"]
+    report_lines.append("  %s: n=%d n_inf=%d median=%s"
+                        % (cluster, info["n"], info["n_inf"], median_str))
+report_lines += [
+    "",
+    "outputs=scrna_pseudotime.h5ad, pseudotime_report.txt",
+    "elapsed_seconds=%.0f" % (time.time() - START),
+]
+with open("pseudotime_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+for _artifact in sorted(os.listdir(".")):
+    if not os.path.isfile(_artifact):
+        continue
+    if _artifact == 'pseudotime_report.txt':
+        continue
+    with open(_artifact, "rb") as _fh:
+        _digest = hashlib.sha256(_fh.read()).hexdigest()
+    with open('pseudotime_report.txt', "a", encoding="utf-8") as _fh:
+        _fh.write("%s_sha256=%s\n" % (_artifact, _digest))
+log("pseudotime_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "$PWD" "pseudotime_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# summarize_dr：line2_scrna 步骤 10 DR genes 汇总输出（线内末端汇总模块）。
+#
+# 输入（两个文件，按文件名分流）：
+#   步骤 9 产物 *knockout*.h5ad：uns['virtual_knockout'] 敲除口径元数据 +
+#     uns['annotation']['marker_sets'] 步骤 6 marker 集（16 类）+
+#     obs['celltype'] 标签 + layers['counts'] 原始整数计数（算表达占比）。
+#   步骤 9 产物 *ko_dr*.tsv：DR 全表（1225 行 = 网络基因数）。
+#
+# 汇总口径（2026-10-13 定稿）：
+#   显著 DR 基因 = adjusted p-value < 0.05 且 is_knockout_gene == False，
+#   按 p-value 升序排名（敲除基因自身不参与排名，其排名单独从 uns 读）。
+#   每个显著基因输出：direction（FC>1 up / FC<1 down）、marker_celltypes
+#   （命中步骤 6 marker 集的细胞类型，分号分隔，无命中留空）、
+#   top_expr_celltype / top_expr_prop（layers['counts'] 上 counts>0 的
+#   细胞占比最高的细胞类型；unknown 混合类排除，不作结论）。
+#   本步骤只做汇总输出，不重新计算敲除，不改任何上游口径。
+#
+# 自校验内建：输入契约（tsv 列名、敲除基因唯一、adj p 全表单调非降、
+# h5ad uns 口径键完整、marker_sets 非空）、显著数与 uns 计数一致、
+# rank 连续 1..N、汇总基因集合 == 显著集、direction 合法值。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入分流：两个文件，按文件名区分角色。模式前后都带 *：拿到的是绝对
+# 路径，前缀匹配永远不中（坑 #99）。
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+knockout_file=""
+dr_file=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *knockout*.h5ad) knockout_file="$path" ;;
+    *ko_dr*.tsv) dr_file="$path" ;;
+    *) echo "无法识别的输入文件: $path（需要 *knockout*.h5ad 与 *ko_dr*.tsv）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$knockout_file" ] || [ -z "$dr_file" ]; then
+  echo "缺少必需输入：需要步骤 9 knockout 产物与 ko_dr 全表（当前 knockout='$knockout_file' dr='$dr_file'）" >&2
+  exit 2
+fi
+for f in "$knockout_file" "$dr_file"; do
+  if [ ! -f "$f" ]; then
+    echo "输入文件不存在: $f" >&2
+    exit 2
+  fi
+done
+
+echo "step_executed=summarize_dr"
+echo "bioanalys_seed=${seed}"
+echo "input_knockout=${knockout_file}"
+echo "input_dr_table=${dr_file}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+KNOCKOUT_FILE="$knockout_file" DR_FILE="$dr_file" BIOANALYS_SEED="$seed" \
+python3 - <<'PYSCRIPT'
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+
+start = time.time()
+
+def fail(message):
+    print("self_check_fail: %s" % message, file=sys.stderr)
+    sys.exit(1)
+
+def log(message):
+    print(message, flush=True)
+
+knockout_file = os.environ["KNOCKOUT_FILE"]
+dr_file = os.environ["DR_FILE"]
+seed_int = int(os.environ["BIOANALYS_SEED"])
+
+import anndata as ad
+import scanpy as sc
+
+ad.settings.allow_write_nullable_strings = False  # 坑 #107
+
+DR_COLUMNS = ["Gene", "Distance", "boxcox-transformed distance", "Z", "FC",
+              "p-value", "adjusted p-value", "is_knockout_gene"]
+SIG_LEVEL = 0.05
+UNKNOWN_CLASS = "unknown"
+
+# --- 1. 读输入 ---
+dr = pd.read_csv(dr_file, sep="\t")
+if list(dr.columns) != DR_COLUMNS:
+    fail("DR 表列名与预期不符: %s" % list(dr.columns))
+if dr.shape[0] == 0:
+    fail("DR 表为空")
+if int(dr["is_knockout_gene"].sum()) != 1:
+    fail("敲除基因标记数 != 1: %d" % int(dr["is_knockout_gene"].sum()))
+adj = dr["adjusted p-value"].to_numpy()
+if np.any(np.diff(adj) < 0):
+    fail("DR 表 adjusted p-value 非单调非降（表必须按 p-value 升序）")
+ko_gene = str(dr.loc[dr["is_knockout_gene"], "Gene"].iloc[0])
+
+ko = ad.read_h5ad(knockout_file)
+uns = ko.uns["virtual_knockout"]
+required_uns = ["ko_gene", "population", "seed", "n_genes_network",
+                "n_cells_after_qc", "n_dr_genes", "n_significant",
+                "n_significant_excluding_ko", "ko_rank_by_pvalue",
+                "sctenifoldpy_version"]
+for key in required_uns:
+    if key not in uns:
+        fail("knockout h5ad uns['virtual_knockout'] 缺键: %s" % key)
+if uns["ko_gene"] != ko_gene:
+    fail("tsv 敲除基因 %s 与 h5ad uns 记录 %s 不一致" % (ko_gene, uns["ko_gene"]))
+if uns["n_dr_genes"] != dr.shape[0]:
+    fail("tsv 行数 %d 与 uns n_dr_genes %d 不一致" % (dr.shape[0], uns["n_dr_genes"]))
+if int(uns["seed"]) != seed_int:
+    fail("uns seed %s 与引擎注入 seed %d 不一致" % (uns["seed"], seed_int))
+
+marker_sets = ko.uns["annotation"]["marker_sets"]
+if not isinstance(marker_sets, dict) or len(marker_sets) == 0:
+    fail("uns['annotation']['marker_sets'] 缺失或为空")
+gene_to_celltypes = {}
+for celltype, genes in marker_sets.items():
+    for gene in [str(g) for g in genes]:
+        gene_to_celltypes.setdefault(gene, []).append(celltype)
+
+if "celltype" not in ko.obs.columns:
+    fail("knockout h5ad obs 缺 celltype 列")
+if "counts" not in ko.layers:
+    fail("knockout h5ad 缺 layers['counts']（算表达细胞占比需要原始整数计数）")
+
+log("input_dr_rows=%d ko_gene=%s population=%s n_genes_network=%d"
+    % (dr.shape[0], ko_gene, uns["population"], uns["n_genes_network"]))
+
+# --- 2. 显著 DR 基因筛选与汇总表装配 ---
+non_ko = dr[~dr["is_knockout_gene"]].copy()
+sig = non_ko[non_ko["adjusted p-value"] < SIG_LEVEL].copy()
+sig = sig.sort_values("p-value", kind="mergesort").reset_index(drop=True)
+
+n_sig_expected = int(uns["n_significant_excluding_ko"])
+if sig.shape[0] != n_sig_expected:
+    fail("显著非敲除 DR 基因数 %d 与 uns n_significant_excluding_ko %d 不一致"
+         % (sig.shape[0], n_sig_expected))
+
+sig.insert(0, "rank", np.arange(1, sig.shape[0] + 1))
+if sig["rank"].tolist() != list(range(1, sig.shape[0] + 1)):
+    fail("rank 不连续")
+
+directions = np.where(sig["FC"].to_numpy() > 1, "up",
+                      np.where(sig["FC"].to_numpy() < 1, "down", "none"))
+if not set(directions).issubset({"up", "down", "none"}):
+    fail("direction 出现非法值: %s" % set(directions))
+sig["direction"] = directions
+
+sig["marker_celltypes"] = [
+    ";".join(sorted(gene_to_celltypes.get(str(g), []))) for g in sig["Gene"]
+]
+
+# top_expr_celltype：layers['counts'] 上 counts>0 的细胞占比最高的类
+# （unknown 混合类排除，与步骤 6/8 口径一致：保留但不作结论）
+counts = ko.layers["counts"]
+celltype = ko.obs["celltype"].astype(str).to_numpy()
+known_types = sorted({t for t in celltype if t != UNKNOWN_CLASS})
+var_index = pd.Index(ko.var_names.astype(str))
+sym_to_loc = {}
+if "gene_symbol" in ko.var.columns:
+    sym_series = ko.var["gene_symbol"].astype(str).to_numpy()
+    for idx_pos, s in enumerate(sym_series):
+        if s not in sym_to_loc:
+            sym_to_loc[s] = idx_pos
+
+top_types = []
+top_props = []
+for gene in sig["Gene"]:
+    loc = None
+    if gene in var_index:
+        loc = var_index.get_loc(gene)
+    elif gene in sym_to_loc:
+        loc = sym_to_loc[gene]
+    else:
+        fail("显著 DR 基因 %s 既不在 h5ad var_names 也不在 var['gene_symbol'] 内" % gene)
+    col = counts[:, loc]
+    expressed = np.asarray(col.todense()).ravel() > 0
+    best_type, best_prop = "", 0.0
+    for celltype_name in known_types:
+        mask = celltype == celltype_name
+        prop = float(expressed[mask].mean()) if mask.any() else 0.0
+        if prop > best_prop:
+            best_type, best_prop = celltype_name, prop
+    top_types.append(best_type)
+    top_props.append(round(best_prop, 4))
+sig["top_expr_celltype"] = top_types
+sig["top_expr_prop"] = top_props
+
+summary = sig[["rank", "Gene", "Distance", "boxcox-transformed distance", "Z", "FC",
+               "p-value", "adjusted p-value", "direction",
+               "marker_celltypes", "top_expr_celltype", "top_expr_prop"]]
+summary.to_csv("dr_genes_summary.tsv", sep="\t", index=False)
+
+n_up = int((summary["direction"] == "up").sum())
+n_down = int((summary["direction"] == "down").sum())
+log("significant_dr_genes=%d up=%d down=%d ko_rank_by_pvalue=%d"
+    % (summary.shape[0], n_up, n_down, uns["ko_rank_by_pvalue"]))
+for _, row in summary.iterrows():
+    log("  dr_rank%-3d %-10s %-4s marker=[%s] top_expr=%s(%.3f)"
+        % (row["rank"], row["Gene"], row["direction"],
+           row["marker_celltypes"], row["top_expr_celltype"], row["top_expr_prop"]))
+
+# --- 3. 汇总报告 ---
+report_lines = [
+    "=== line2_scrna 步骤 10 DR genes 汇总报告 ===",
+    "",
+    "生成时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S"),
+    "随机种子：%d" % seed_int,
+    "",
+    "--- 敲除口径（复述自步骤 9 uns['virtual_knockout']，本步骤未改任何上游口径）---",
+    "方法：%s（scTenifoldpy %s）" % (uns["method"], uns["sctenifoldpy_version"]),
+    "敲除基因：%s（来源：%s）" % (uns["ko_gene"], uns["ko_gene_provenance"]),
+    "群体：%s（标签列 %s）" % (uns["population"], uns["population_column"]),
+    "表达矩阵：%s 的 layers['%s']，基因空间 %s"
+    % (os.path.basename(str(uns["expression_source"])), uns["expression_layer"],
+       os.path.basename(str(uns["gene_set_source"]))),
+    "网络：%d 个自助网络 x %d 细胞，n_comp=%d，q=%s，TD rank=%d，MA dims=%d"
+    % (uns["n_nets"], uns["n_samp_cells"], uns["n_comp"], uns["q_value"],
+       uns["td_rank"], uns["ma_dims"]),
+    "细胞：群体 %d -> QC 后 %d；基因：输入 %d -> 网络 %d"
+    % (uns["n_cells_population"], uns["n_cells_after_qc"],
+       uns["n_genes_input"], uns["n_genes_network"]),
+    "敲除基因表达占比（QC 前群体）：%s" % uns["ko_expression_fraction"],
+    "",
+    "--- DR genes 汇总统计 ---",
+    "DR 基因总数（网络基因数）：%d" % uns["n_dr_genes"],
+    "adj p < %.2f 显著（含敲除基因）：%d" % (SIG_LEVEL, uns["n_significant"]),
+    "adj p < %.2f 显著（不含敲除基因）：%d" % (SIG_LEVEL, n_sig_expected),
+    "方向：up(FC>1) %d / down(FC<1) %d" % (n_up, n_down),
+    "敲除基因 %s 按 p-value 排名：第 %d（敲除基因不参与非敲除排名）"
+    % (uns["ko_gene"], uns["ko_rank_by_pvalue"]),
+    "",
+    "--- 显著 DR 基因明细 ---",
+    "%-4s %-12s %-6s %-12s %-12s %-30s %-24s %s"
+    % ("rank", "Gene", "dir", "FC", "adj_p", "marker_celltypes",
+       "top_expr_celltype", "expr_prop"),
+]
+for _, row in summary.iterrows():
+    report_lines.append("%-4d %-12s %-6s %-12.3f %-12.3e %-30s %-24s %.3f"
+                        % (row["rank"], row["Gene"], row["direction"], row["FC"],
+                           row["adjusted p-value"],
+                           row["marker_celltypes"] or "-",
+                           row["top_expr_celltype"] or "-",
+                           row["top_expr_prop"]))
+
+report_lines += [
+    "",
+    "--- 列说明 ---",
+    "rank：非敲除显著 DR 基因按 p-value 升序排名（从 1 开始）。",
+    "direction：FC>1 记 up（敲除后距离增大，调控减弱方向），FC<1 记 down。",
+    "marker_celltypes：该基因命中步骤 6 文献 marker 集的细胞类型（分号分隔），",
+    "  空表示不在任何 marker 集内（不代表无生物学意义，只表示无文献先验）。",
+    "top_expr_celltype / expr_prop：layers['counts'] 上 counts>0 的细胞占比",
+    "  最高的细胞类型及其占比（unknown 混合类排除）。",
+    "",
+    "--- 口径与局限（结论解释前必读）---",
+    "1. 本表是 DR genes（Differentially Regulated，虚拟敲除后调控距离变化），",
+    "   不是 DEG（差异表达基因），两者概念不可混用（见 GLOSSARY.md）。",
+    "2. 基因空间限于步骤 3 的 HVG %d 个内的 %d 个网络基因：HVG 之外的基因"
+    % (uns["n_genes_input"], uns["n_genes_network"]),
+    "   即使受调控也不会出现在本表，本表不是全基因组的调控结论。",
+    "3. 敲除是计算模拟（tenifoldknk 网络重建），非实验验证；结论需实验确认。",
+    "4. 敲除对象与全部输入来自本线产物，未引用线1 交集基因，无跨线数据。",
+    "5. 汇总统计口径：显著性阈值 adj p < %.2f 固定，不随结果调整。" % SIG_LEVEL,
+    "outputs=dr_genes_summary.tsv, dr_summary_report.txt",
+]
+with open("dr_summary_report.txt", "w") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+log("summarize_dr_done significant=%d up=%d down=%d elapsed=%.1fs"
+    % (summary.shape[0], n_up, n_down, time.time() - start))
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "$PWD" "dr_summary_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

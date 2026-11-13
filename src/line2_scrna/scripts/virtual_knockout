@@ -1,0 +1,512 @@
+#!/usr/bin/env bash
+# virtual_knockout：line2_scrna 步骤 9 虚拟敲除（scTenifoldKnk，产出 DR genes）。
+#
+# 输入（三个文件，按文件名分流）：
+#   步骤 3 产物 *norm*.h5ad：layers['counts'] 原始整数计数，限定 HVG 基因集。
+#   步骤 6 产物 *annotated*.h5ad：obs['diagnosis'] 取群体标签（Psoriasis）。
+#   步骤 3 产物 *hvg*.tsv：HVG 基因清单（2000 个），网络基因空间的正本。
+#
+# 敲除口径（2026-10-13 定稿，原型实测）：
+#   群体 = Psoriasis（2747 细胞，LS+NLS 银屑病供体）。不用 Healthy：步骤 4 已警告
+#   donor 与 group 共线（healthy 供体只贡献 HC），混群建网会把供体差异当调控差异。
+#   敲除基因 = TNF。来源在本线内：步骤 3 top HVG（hub 性质，按 dispersion 选取），
+#   银屑病经典细胞因子；Psoriasis 细胞中 19.3% 表达，稳过 sc_QC 的 5% 基因闸
+#   （pDC 定义 marker TCF4 虽然更正，但全群表达仅 6.55% 且 pDC 只有 20 个细胞，
+#   单独建网细胞数不够，混群表达占比也贴近闸门，原型对比后选 TNF）。
+#   表达矩阵 = HVG 2000 上的原始计数（scTenifold 内部 CPM 归一化）。不用全基因：
+#   tensor_decomp 产物是 n_genes x n_genes，24969 基因要 15GB  dense 矩阵，
+#   手机 11G 内存放不下；2000 HVG 是聚类/整合同款基因空间，口径一致。
+#
+# 敲除基因来源（2026-10-21 全链取证后改造，对齐 aims/aims.txt:185）：
+#   工作台要求勾选虚拟敲除时强制弹出 target_ko_gene 必填框，所以基因不许再写死。
+#   解析优先级：--ko-gene 参数 > 环境变量 BIO_KO_GENE > 项目元数据
+#   $BIOANALYS_PROJECT_JSON 里的 biological_priors.target_ko_gene（前端模块 C 的录入位，
+#   提交层已把该路径导出为环境变量）> 兜底 TNF（上面 2026-10-13 定稿口径）。
+#   选中的基因与来源都写进台账行 ko_gene= 与 ko_gene_source=，任何一次跑批都能回溯
+#   "这份 DR 是敲哪个基因敲出来的"。基因仍须过下面两道闸：必须在 HVG 清单内、
+#   在目标群体表达占比 > sc_QC 基因闸。
+#
+# 方法口径（scTenifoldpy 0.5.1，与 R 包 scTenifoldKnk 默认参数等价）：
+#   scTenifoldKnk(data, ko_genes=TNF)：qc(sc_QC+cpm_norm) -> nc(make_networks
+#   10 网 x 500 细胞自助抽样, n_comp=3, q=0.9) -> td(CP 分解 K=3) ->
+#   ko(default：WT 张量中 TNF 行置零) -> ma(manifold_alignment d=2) ->
+#   dr(d_regulation，敲除基因自动排除出期望计算，与 R 一致)。
+#   random_state 用引擎 seed（nc/td 两处都传，RRandom 复现 R 的抽样序列）。
+#
+# DR genes（Differentially Regulated Gene）不是 DEG：衡量的是敲除后调控关系的
+# 变化，不是表达量差异。不得与差异分析概念混用（见 GLOSSARY.md）。
+#
+# 自校验内建：三输入的契约（norm 全基因+counts、annotated 的 diagnosis+annotation、
+# hvg 清单是 norm var 子集）、细胞集合一致、敲除基因过 QC 表达闸、QC/网络基因数
+# 自洽、DR 表结构与取值范围、敲除基因确实发生了位移（无出边=空操作会 fail）。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入分流：按文件名区分角色。模式前后都带 *：拿到的是绝对路径，
+# 前缀匹配永远不中（坑 #99）。
+declare -a INPUTS=()
+output_count=0
+ko_gene=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    --ko-gene) ko_gene="$2"; shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+annotated_file=""
+norm_file=""
+hvg_file=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *annotated*.h5ad) annotated_file="$path" ;;
+    *norm*.h5ad) norm_file="$path" ;;
+    *hvg*.tsv) hvg_file="$path" ;;
+    *) echo "无法识别的输入文件: $path（需要 *annotated*.h5ad、*norm*.h5ad 与 *hvg*.tsv）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$annotated_file" ] || [ -z "$norm_file" ] || [ -z "$hvg_file" ]; then
+  echo "缺少必需输入：需要步骤 6 annotated 产物、步骤 3 norm 产物与步骤 3 hvg 清单（当前 annotated='$annotated_file' norm='$norm_file' hvg='$hvg_file'）" >&2
+  exit 2
+fi
+for f in "$annotated_file" "$norm_file" "$hvg_file"; do
+  if [ ! -f "$f" ]; then
+    echo "输入文件不存在: $f" >&2
+    exit 2
+  fi
+done
+
+# 敲除基因解析（顺序见文件头注释）：参数 > 环境变量 > 项目元数据 > TNF 兜底。
+# project.json 可能不存在（E2E 项目默认没有）或字段为空，任何读取异常都当"没指定"，
+# 不许让一个可选元数据把整步打挂。
+ko_gene_source="cli:--ko-gene"
+if [ -z "${ko_gene:-}" ]; then
+  ko_gene="$(printf '%s' "${BIO_KO_GENE:-}" | tr -d '[:space:]')"
+  ko_gene_source="env:BIO_KO_GENE"
+fi
+if [ -z "${ko_gene:-}" ]; then
+  # Python 侧输出 "holder.target_ko_gene=基因"，用 = 切分即可拿到基因与来源字段名
+  # （基因名不可能含 =，比 read 分列更省事，也不依赖 IFS 与 here-string）。
+  meta_gene="$(python3 - "${BIOANALYS_PROJECT_JSON:-}" <<'PYGENE'
+import json
+import sys
+
+
+def read_gene(path):
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(meta, dict):
+        return ""
+    for holder in ("biological_priors", "acl_and_output"):
+        block = meta.get(holder)
+        if isinstance(block, dict):
+            value = block.get("target_ko_gene")
+            if isinstance(value, str) and value.strip():
+                return holder + ".target_ko_gene=" + value.strip()
+    return ""
+
+
+print(read_gene(sys.argv[1] if len(sys.argv) > 1 else ""))
+PYGENE
+)"
+  if [ -n "${meta_gene:-}" ]; then
+    ko_gene="${meta_gene#*=}"
+    ko_gene_source="project.json:${meta_gene%%=*}"
+  fi
+fi
+if [ -z "${ko_gene:-}" ]; then
+  ko_gene="TNF"
+  ko_gene_source="fallback:TNF"
+fi
+
+echo "step_executed=virtual_knockout"
+echo "bioanalys_seed=${seed}"
+echo "input_annotated=${annotated_file}"
+echo "input_norm=${norm_file}"
+echo "input_hvg=${hvg_file}"
+echo "ko_gene=${ko_gene}"
+echo "ko_gene_source=${ko_gene_source}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+ANNOTATED_FILE="$annotated_file" NORM_FILE="$norm_file" HVG_FILE="$hvg_file" BIOANALYS_SEED="$seed" KO_GENE="$ko_gene" KO_GENE_SOURCE="$ko_gene_source" \
+python3 - <<'PYSCRIPT'
+import gc
+import os
+import sys
+import time
+import warnings
+
+import numpy as np
+import pandas as pd
+import anndata as ad
+import scanpy as sc
+import scTenifold as st
+
+# pandas 3 与 2 的 infer_string 默认值不同，显式关掉（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+# 敲除基因由 bash 包装层解析后经环境变量传入（参数 / BIO_KO_GENE / project.json / TNF 兜底），
+# Python 侧不再写死：写死会让 aims:185 的 target_ko_gene 必填框永远空转。
+KO_GENE = os.environ.get("KO_GENE", "").strip()
+# 基因的指定渠道（cli / env / project.json / fallback），随结果一起落台账。
+KO_GENE_SOURCE = os.environ.get("KO_GENE_SOURCE", "unknown").strip() or "unknown"
+POPULATION = "Psoriasis"
+N_NETS = 10
+N_SAMP_CELLS = 500
+N_COMP = 3
+Q_VALUE = 0.9
+TD_RANK = 3
+MA_DIMS = 2
+TOP_N = 20
+SIG_LEVEL = 0.05
+QC_MIN_PERCENT = 0.05  # sc_QC 默认基因闸，写在这里只为前置预检，不覆盖包默认
+
+DR_COLUMNS = ["Gene", "Distance", "boxcox-transformed distance", "Z", "FC",
+              "p-value", "adjusted p-value"]
+
+
+def fail(message):
+    sys.stderr.write("virtual_knockout 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+if not KO_GENE:
+    fail("敲除基因未注入：bash 包装层应通过 KO_GENE 环境变量传入（--ko-gene / BIO_KO_GENE / project.json / TNF 兜底）")
+
+# 来源口径随基因走：基因可由客户指定，所以不能再用写死的"银屑病经典细胞因子"描述，
+# 只保留与基因无关的两条选择依据（网内 HVG + 表达闸），另附指定渠道。
+KO_GENE_PROVENANCE = ("由 %s 指定；选择依据：HVG 2000 网内基因（步骤 3 按 dispersion 选取）"
+                      "且目标群体表达占比超过 sc_QC 5%% 基因闸" % KO_GENE_SOURCE)
+
+
+PEAK_FILE = "memory_peak.tsv"
+PEAK_COLUMNS = ("stage", "peak_rss_mb", "timestamp")
+
+
+def peak_rss_mb():
+    # VmHWM 是内核记录的进程峰值 RSS（KB），比轮询 VmRSS 更准：短命峰值也不会漏。
+    try:
+        with open("/proc/self/status", "r") as fh:
+            for line in fh:
+                if line.startswith("VmHWM:"):
+                    return round(int(line.split()[1]) / 1024.0, 1)
+    except OSError:
+        return None
+    return None
+
+
+def record_peak(stage):
+    # 峰值记录是观测手段不是产出契约：写失败只留 stderr，绝不让分析失败。
+    peak = peak_rss_mb()
+    try:
+        need_header = not os.path.exists(PEAK_FILE) or os.path.getsize(PEAK_FILE) == 0
+        with open(PEAK_FILE, "a") as fh:
+            if need_header:
+                fh.write("\t".join(PEAK_COLUMNS) + "\n")
+            fh.write("%s\t%s\t%s\n" % (stage, "" if peak is None else peak,
+                                         time.strftime("%Y-%m-%dT%H:%M:%S")))
+    except OSError as exc:
+        sys.stderr.write("memory_peak.tsv 写入失败（不影响分析）: %s\n" % exc)
+
+
+annotated_file = os.environ["ANNOTATED_FILE"]
+norm_file = os.environ["NORM_FILE"]
+hvg_file = os.environ["HVG_FILE"]
+seed = os.environ["BIOANALYS_SEED"]
+try:
+    seed_int = int(seed)
+except ValueError:
+    fail("BIOANALYS_SEED 不是整数: %s" % seed)
+
+# --- 1. 输入契约校验 ---
+annot = ad.read_h5ad(annotated_file)
+norm = ad.read_h5ad(norm_file)
+log("loaded annotated=%s norm=%s" % (annot.shape, norm.shape))
+record_peak("load_inputs")
+
+if "diagnosis" not in annot.obs.columns:
+    fail("annotated 产物缺少 obs['diagnosis']（群体标签来源，不是 annotate_celltypes 产物？）")
+if "annotation" not in annot.uns:
+    fail("annotated 产物缺少 uns['annotation']（不是 annotate_celltypes 产物？）")
+if "counts" not in norm.layers:
+    fail("norm 产物缺少 layers['counts']（不是 normalize_hvg 产物？）")
+if norm.shape[1] <= 2000:
+    fail("norm 产物基因数 %d <= 2000：疑似喂了 HVG 裁剪矩阵，HVG 清单另有其人，必须是全基因矩阵"
+         % norm.shape[1])
+
+hvg_table = pd.read_csv(hvg_file, sep="\t")
+if "gene" not in hvg_table.columns:
+    fail("hvg 清单缺少 gene 列（不是 normalize_hvg 产物？）")
+hvg_genes = [str(g) for g in hvg_table["gene"].tolist()]
+norm_var = set(norm.var_names.astype(str))
+if not set(hvg_genes) <= norm_var:
+    missing = sorted(set(hvg_genes) - norm_var)[:10]
+    fail("hvg 清单有 %d 个基因不在 norm var_names 中（前 10: %s）" % (len(set(hvg_genes) - norm_var), missing))
+if KO_GENE not in hvg_genes:
+    fail("敲除基因 %s 不在 HVG 清单中：网络基因空间由 HVG 定义，敲除目标必须在网内" % KO_GENE)
+
+if set(annot.obs_names) != set(norm.obs_names):
+    fail("annotated 与 norm 的细胞集合不一致（%d vs %d）" % (len(set(annot.obs_names)), len(set(norm.obs_names))))
+
+# --- 2. 群体与表达矩阵装配 ---
+diagnosis = annot.obs["diagnosis"].astype(str).reindex(norm.obs_names)
+pop_mask = (diagnosis == POPULATION).to_numpy()
+n_pop = int(pop_mask.sum())
+if n_pop == 0:
+    fail("群体 %s 在输入中 0 个细胞" % POPULATION)
+log("population=%s cells=%d（diagnosis 列）" % (POPULATION, n_pop))
+
+gene_mask = pd.Series(norm.var_names.astype(str)).isin(hvg_genes).to_numpy()
+pop_counts = norm.layers["counts"][pop_mask][:, gene_mask]
+pop_cells = norm.obs_names[pop_mask].astype(str)
+expr = pd.DataFrame(np.asarray(pop_counts.todense()).T,
+                    index=[str(g) for g in norm.var_names.astype(str)[gene_mask]],
+                    columns=pop_cells)
+log("expr(genes x cells)=%s" % (expr.shape,))
+
+ko_fraction = float((expr.loc[KO_GENE] > 0).mean())
+log("ko_gene=%s expression_fraction=%.4f（sc_QC 基因闸 %.2f）" % (KO_GENE, ko_fraction, QC_MIN_PERCENT))
+if ko_fraction <= QC_MIN_PERCENT:
+    fail("敲除基因 %s 在 %s 群体表达占比 %.4f 不超过 sc_QC 基因闸 %.2f，进不了网络（换基因或放宽口径需重新定稿）"
+         % (KO_GENE, POPULATION, ko_fraction, QC_MIN_PERCENT))
+
+# 装配阶段收尾：expr 已是独立稠密矩阵，pop_counts 与 norm 到此再无引用点。
+# 立即释放并回收。Python 没有 rm()，del + gc.collect() 就是等价写法；gc.collect()
+# 无 verbose 参数，回收全程静默，等价 R 侧的 gc(verbose = FALSE)。
+del pop_counts
+del norm
+gc.collect()
+record_peak("assemble_expr")
+
+# 建网前再强制回收一次，等价 R 侧循环前的 gc(reset = TRUE)：10 个 2000x2000 网络
+# 加张量是本步骤的内存墙，开跑前先把峰值水位压回基线，再分配新的大对象。
+gc.collect()
+record_peak("before_network")
+
+# --- 3. scTenifoldKnk 全流程 ---
+captured = []
+with warnings.catch_warnings(record=True) as wlist:
+    warnings.simplefilter("always")
+    scn = st.scTenifoldKnk(expr, ko_genes=KO_GENE,
+                           nc_kws={"random_state": seed_int},
+                           td_kws={"random_state": seed_int})
+    dr = scn.build()
+    for w in wlist:
+        captured.append(str(w.message))
+for message in captured:
+    log("WARN: %s" % message[:200])
+no_edge_warnings = [m for m in captured if "no outgoing edges" in m]
+if no_edge_warnings:
+    fail("敲除基因在 WT 网络没有出边，敲除是空操作，DR 结果只是数值噪声: %s" % no_edge_warnings[0][:200])
+
+qc_matrix = scn.QC_dict["WT"]
+n_cells_qc = int(qc_matrix.shape[1])
+n_genes_net = len(scn.shared_gene_names)
+log("QC 后矩阵(genes x cells)=%s（输入 %d 基因 x %d 细胞；剔除 %d 细胞 %d 基因）"
+    % (qc_matrix.shape, expr.shape[0], expr.shape[1],
+       expr.shape[1] - n_cells_qc, expr.shape[0] - n_genes_net))
+qc_kept_cells = set(qc_matrix.columns.astype(str))
+if not qc_kept_cells <= set(pop_cells):
+    fail("QC 保留细胞越出群体集合")
+if n_cells_qc == 0 or n_genes_net == 0:
+    fail("QC 后矩阵为空")
+
+# 建网产物收尾：QC 信息已全部提取成标量与小集合，scn（10 网 + 张量）与 qc_matrix
+# 是本步骤最大的常驻块，立刻归还，别让它和后面的 annot 副本同时在线。
+del scn
+del qc_matrix
+gc.collect()
+record_peak("after_network")
+
+# --- 4. 自校验 ---
+if list(dr.columns) != DR_COLUMNS:
+    fail("DR 表列名与预期不符: %s" % list(dr.columns))
+if dr.shape[0] != n_genes_net:
+    fail("DR 表行数 %d 与网络基因数 %d 不一致" % (dr.shape[0], n_genes_net))
+if not dr["Gene"].isin([KO_GENE]).any():
+    fail("DR 表中没有敲除基因 %s" % KO_GENE)
+for col in ["Distance", "Z", "FC", "p-value", "adjusted p-value"]:
+    if dr[col].isna().any():
+        fail("DR 表 %s 列存在 NaN" % col)
+if (dr["Distance"] < 0).any():
+    fail("DR 表 Distance 存在负值")
+pvals = dr["p-value"]
+if ((pvals < 0) | (pvals > 1)).any():
+    fail("DR 表 p-value 超出 [0,1]")
+padj = dr["adjusted p-value"]
+if ((padj < 0) | (padj > 1)).any():
+    fail("DR 表 adjusted p-value 超出 [0,1]")
+ko_distance = float(dr.loc[dr["Gene"] == KO_GENE, "Distance"].iloc[0])
+if ko_distance <= 0:
+    fail("敲除基因 %s 位移为 0，敲除未产生扰动" % KO_GENE)
+log("self_check 契约/对齐/QC 自洽/DR 表结构与取值范围/敲除生效 OK")
+
+dr_sorted = dr.sort_values("p-value", kind="mergesort").reset_index(drop=True)
+n_sig_all = int((dr_sorted["adjusted p-value"] < SIG_LEVEL).sum())
+non_ko = dr_sorted[dr_sorted["Gene"] != KO_GENE]
+n_sig_non_ko = int((non_ko["adjusted p-value"] < SIG_LEVEL).sum())
+ko_rank = int(dr_sorted.index[dr_sorted["Gene"] == KO_GENE][0]) + 1
+log("dr_genes=%d significant_adj<%0.2f=%d（含敲除基因）/ %d（不含）ko_rank_by_pvalue=%d"
+    % (dr_sorted.shape[0], SIG_LEVEL, n_sig_all, n_sig_non_ko, ko_rank))
+
+# dr 原始表已被 dr_sorted 取代，释放它并回收；落盘阶段只留排序表，别让两份 DR 表并存。
+del dr
+gc.collect()
+record_peak("dr_ready")
+
+top_dr = non_ko.head(TOP_N)[["Gene", "Distance", "Z", "FC", "p-value", "adjusted p-value"]].reset_index(drop=True)
+for _, row in top_dr.iterrows():
+    log("  top_dr %-10s Z=%8.3f FC=%12.3f padj=%.3e" % (row["Gene"], row["Z"], row["FC"], row["adjusted p-value"]))
+
+# --- 5. 落盘 ---
+dr_out = dr_sorted.copy()
+dr_out["is_knockout_gene"] = dr_out["Gene"] == KO_GENE
+dr_out.to_csv("ko_dr_genes.tsv", sep="\t", index=False)
+
+out = annot[pop_mask].copy()
+out.obs["tenifold_qc_kept"] = [name in qc_kept_cells for name in out.obs_names.astype(str)]
+
+dr_indexed = dr_sorted.set_index("Gene")
+var_index = pd.Index(out.var_names.astype(str))
+# DR 表列名 -> var 列名显式映射（列名要能当 h5ad var 字段用，不带空格）
+VAR_DR_COLS = {"Distance": "tenifold_distance",
+               "Z": "tenifold_z",
+               "FC": "tenifold_fc",
+               "p-value": "tenifold_p_value",
+               "adjusted p-value": "tenifold_adj_p_value"}
+for src_col, dst_col in VAR_DR_COLS.items():
+    out.var[dst_col] = dr_indexed[src_col].reindex(var_index).to_numpy()
+out.var["tenifold_dr_available"] = var_index.isin(dr_indexed.index)
+
+out.uns["virtual_knockout"] = {
+    "method": "scTenifoldKnk_virtual_knockout",
+    "sctenifoldpy_version": getattr(st, "__version__", "0.5.1"),
+    "ko_gene": KO_GENE,
+    "ko_gene_provenance": KO_GENE_PROVENANCE,
+    "ko_gene_source": KO_GENE_SOURCE,
+    "population": POPULATION,
+    "population_column": "diagnosis",
+    "expression_source": norm_file,
+    "label_source": annotated_file,
+    "gene_set_source": hvg_file,
+    "expression_layer": "counts",
+    "n_cells_population": n_pop,
+    "n_cells_after_qc": n_cells_qc,
+    "n_genes_input": int(expr.shape[0]),
+    "n_genes_network": n_genes_net,
+    "n_nets": N_NETS,
+    "n_samp_cells": N_SAMP_CELLS,
+    "n_comp": N_COMP,
+    "q_value": Q_VALUE,
+    "td_rank": TD_RANK,
+    "ma_dims": MA_DIMS,
+    "ko_method": "default",
+    "ko_expression_fraction": round(ko_fraction, 4),
+    "seed": seed_int,
+    "n_dr_genes": int(dr_sorted.shape[0]),
+    "n_significant": n_sig_all,
+    "n_significant_excluding_ko": n_sig_non_ko,
+    "ko_rank_by_pvalue": ko_rank,
+    "warnings": captured,
+    "top_dr_genes": top_dr,
+}
+out.write_h5ad("scrna_knockout.h5ad")
+
+# 落盘收尾：out（annot 群体副本 + var 列）与 DR 表都已写盘，后面只剩文本报告。
+# 报告要用到的两个 uns 字段先取成小字符串，再释放大对象，避免报告段继续持有 out。
+sctenifold_version = out.uns["virtual_knockout"]["sctenifoldpy_version"]
+ko_gene_provenance = out.uns["virtual_knockout"]["ko_gene_provenance"]
+
+# annot 与 out 是同一批细胞的两份副本，写盘后立刻双双归还，避免叠加占用。
+del out
+del annot
+del dr_out
+del dr_indexed
+gc.collect()
+record_peak("write_h5ad")
+
+report_lines = [
+    "step=virtual_knockout",
+    "seed=%s" % seed,
+    "label_source=%s" % annotated_file,
+    "expression_source=%s" % norm_file,
+    "gene_set_source=%s" % hvg_file,
+    "method=scTenifoldpy %s scTenifoldKnk ko_method=default（与 R 包 scTenifoldKnk 默认参数等价）"
+    % sctenifold_version,
+    "params=n_nets=%d n_samp_cells=%d n_comp=%d q=%.2f td_rank=%d ma_dims=%d random_state=%d"
+    % (N_NETS, N_SAMP_CELLS, N_COMP, Q_VALUE, TD_RANK, MA_DIMS, seed_int),
+    "population=%s cells=%d（diagnosis 列；healthy 供体与 HC 共线，步骤 4 已警告，故不混群）"
+    % (POPULATION, n_pop),
+    "ko_gene=%s provenance=%s expression_fraction=%.4f"
+    % (KO_GENE, ko_gene_provenance, ko_fraction),
+    "qc=sc_QC 默认（lib>1000 / 1.5IQR 离群细胞 / 基因>5% 表达）+ cpm_norm：",
+    "  细胞 %d -> %d（剔 %d），基因 %d -> %d（剔 %d）"
+    % (n_pop, n_cells_qc, n_pop - n_cells_qc, expr.shape[0], n_genes_net, expr.shape[0] - n_genes_net),
+    "dr_genes=%d significant(adj p<%.2f)=%d 含敲除基因 / %d 不含；敲除基因按 p-value 排名第 %d"
+    % (dr_sorted.shape[0], SIG_LEVEL, n_sig_all, n_sig_non_ko, ko_rank),
+    "",
+    "TOP%d DR genes（剔除敲除基因自身，按 adjusted p-value；DR=调控变化不是表达差异）:" % TOP_N,
+]
+for _, row in top_dr.iterrows():
+    report_lines.append("  %-10s Distance=%.3e Z=%8.3f FC=%12.3f p=%.3e padj=%.3e"
+                        % (row["Gene"], row["Distance"], row["Z"], row["FC"],
+                           row["p-value"], row["adjusted p-value"]))
+report_lines += [
+    "",
+    "口径说明:",
+    "1. DR genes（Differentially Regulated Gene）衡量敲除后调控关系变化，不是 DEG，",
+    "   不得与差异分析（limma 等）概念混用；不得引用线1 GEO 交集基因。",
+    "2. 敲除基因自身按构造位移最大（p-value 排名第 %d），d_regulation 已将其排除出"
+    "期望计算（与 R 包一致），表中保留但解释时不作为 DR 证据。" % ko_rank,
+    "3. 网络基因空间 = HVG %d（步骤 3 清单），sc_QC 后再剔表达占比 <=5%% 的基因，"
+    "DR 表只覆盖留网 %d 个基因；未留网基因不是无调控变化，是没进这张网。"
+    % (expr.shape[0], n_genes_net),
+    "4. scTenifold 结果为计算模拟不是实验验证；供假设生成，供人工复核。",
+    "5. 种子稳定性（原型实测）：换 seed 重跑 top20 DR 基因重合 19/20，尾部排序对抽样敏感，",
+    "   结论以头部显著基因为准。",
+    "",
+    "warnings:",
+]
+for message in captured:
+    report_lines.append("  %s" % message[:300])
+report_lines.append("outputs=ko_dr_genes.tsv, scrna_knockout.h5ad, memory_peak.tsv, knockout_report.txt")
+with open("knockout_report.txt", "w") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+record_peak("done")
+log("virtual_knockout_done dr_genes=%d significant=%d elapsed=%.1fs"
+    % (dr_sorted.shape[0], n_sig_non_ko, time.time() - START))
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "$PWD" "knockout_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

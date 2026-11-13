@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# integrate_harmony：line2_scrna 步骤 4 去批次 / 整合（batch = donor）。
+#
+# 输入：步骤 3 产物 scrna_norm.h5ad（4587 细胞 × 24969 基因，X=normalized log，
+# var['highly_variable'] 标志，layers['counts'] 原始整数计数）。
+#
+# 为什么步骤 4 内含 PCA：Harmony 校正对象是 PCA 嵌入空间，依赖顺序是先 PCA 再
+# Harmony，无法拆成两步各自独立验收，故步骤边界按"校正前计算完成"切分：
+# 本步产出 X_pca（未校正）与 X_pca_harmony（校正后）两个嵌入，步骤 5 的
+# neighbors/UMAP/leiden 只用 X_pca_harmony。
+#
+# 做三件事：
+#   1. HVG 子集：步骤 3 已按 seurat flavor 选出 2000 个 HVG，降维与整合只在这
+#      2000 个基因上进行（全基因组做 PCA 会被低表达噪声基因主导）。
+#   2. scale(max_value=10) + PCA(50)：Seurat 标准口径；scale 会把稀疏矩阵稠密化
+#      （2000 基因 × 4587 细胞可接受），max_value=10 截断极值防离群基因主导 PC。
+#   3. Harmony 校正：batch = donor（8 供体）。走 harmonypy 原生调用，
+#      不用 sce.pp.harmony_integrate：scanpy 1.12.4 的包装器对 Z_corr 做了 .T，
+#      与容器内 harmonypy 返回形状 (cells, n_comps) 不兼容，obsm 赋值校验直接
+#      ValueError。原生调用 random_state 用引擎注入的 seed，保证可复现。
+#
+# 已知混淆（写进报告，不静默）：GSE254707 是配对设计，每个银屑病供体贡献
+# LS+NLS，healthy 供体只贡献 HC。batch=donor 与 group 部分共线，harmony 在校正
+# 供体差异时会顺带削去一部分组间信号。本步如实报告 donor-group crosstab 与
+# silhouette 前后对比，是否可接受由后续注释步骤判断。
+#
+# 自校验内建：输入契约（步骤 3 uns 三件套）、HVG 数精确 2000、PCA/Harmony 嵌入
+# 形状 (n_cells, 50)、嵌入全有限、donor 集合与 obs 不丢细胞不丢列、
+# silhouette 前后与 crosstab 进报告。任一不过非零退出。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入分流：一个 h5ad（步骤 3 产物）。模式前后都带 *：拿到的是绝对路径，
+# 前缀匹配永远不中（坑 #99）。
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+h5ad_file=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *.h5ad) h5ad_file="$path" ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad，即步骤 3 normalize_hvg 产物）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$h5ad_file" ]; then
+  echo "缺少必需输入：scrna_norm.h5ad（步骤 3 产物）未提供" >&2
+  exit 2
+fi
+if [ ! -f "$h5ad_file" ]; then
+  echo "输入文件不存在: $h5ad_file"
+  exit 2
+fi
+
+echo "step_executed=integrate_harmony"
+echo "bioanalys_seed=${seed}"
+echo "input_h5ad=${h5ad_file}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+H5AD_FILE="$h5ad_file" BIOANALYS_SEED="$seed" \
+python3 - <<'PYSCRIPT'
+import hashlib
+import os
+import sys
+import time
+
+import numpy as np
+import anndata as ad
+import scanpy as sc
+from sklearn.metrics import silhouette_score
+
+# pandas 3 与 2 的 infer_string 默认值不同，会导致 anndata 0.13 写 obs 字符串列时
+# 因 nullable strings 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+N_TOP_GENES = 2000
+N_COMPS = 50
+MAX_VALUE = 10
+
+
+def fail(message):
+    sys.stderr.write("integrate_harmony 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def count_dict(series):
+    return {str(name): int(count) for name, count in series.value_counts().items()}
+
+
+h5ad_file = os.environ["H5AD_FILE"]
+seed = os.environ["BIOANALYS_SEED"]
+try:
+    seed_int = int(seed)
+except ValueError:
+    fail("BIOANALYS_SEED 不是整数: %s" % seed)
+
+adata = ad.read_h5ad(h5ad_file)
+log("loaded cells=%d genes=%d" % adata.shape)
+
+# --- 1. 输入契约校验：必须是步骤 3 产物 ---
+required_obs = ["donor", "diagnosis", "region", "group", "class", "plate", "well",
+                "celltype_paper", "seurat_cluster_paper"]
+missing_obs = [col for col in required_obs if col not in adata.obs.columns]
+if missing_obs:
+    fail("输入 h5ad 缺少 obs 列 %s（不是 normalize_hvg 产物？）" % missing_obs)
+for key in ["normalization", "hvg", "ercc_removed_count"]:
+    if key not in adata.uns:
+        fail("输入 h5ad 缺少 uns['%s']（不是 normalize_hvg 产物？）" % key)
+if "highly_variable" not in adata.var.columns:
+    fail("输入 h5ad 缺少 var['highly_variable']（不是 normalize_hvg 产物？）")
+if (adata.obs["class"] == "doublet").any():
+    fail("输入 h5ad 仍含 doublet 细胞（qc_cells 应已排除）")
+
+donors_before = sorted(adata.obs["donor"].unique())
+n_cells_before = adata.shape[0]
+log("donors=%d cells=%d" % (len(donors_before), n_cells_before))
+
+# --- 2. HVG 子集（2000 基因）---
+hvg_mask = adata.var["highly_variable"].to_numpy(dtype=bool)
+hvg_count = int(hvg_mask.sum())
+if hvg_count != N_TOP_GENES:
+    fail("HVG 数量 %d != 步骤 3 选出的 %d" % (hvg_count, N_TOP_GENES))
+adata = adata[:, hvg_mask].copy()
+log("hvg subset genes=%d" % adata.shape[1])
+
+# --- 3. scale + PCA ---
+sc.pp.scale(adata, max_value=MAX_VALUE)
+sc.tl.pca(adata, n_comps=N_COMPS, random_state=seed_int)
+if adata.obsm["X_pca"].shape != (n_cells_before, N_COMPS):
+    fail("PCA 嵌入形状 %s != (%d, %d)" % (adata.obsm["X_pca"].shape, n_cells_before, N_COMPS))
+if not np.isfinite(adata.obsm["X_pca"]).all():
+    fail("PCA 嵌入含非有限值")
+variance_ratio = adata.uns["pca"]["variance_ratio"]
+log("pca var ratio PC1=%.4f cum10=%.4f cum30=%.4f cum50=%.4f"
+    % (variance_ratio[0], variance_ratio[:10].sum(),
+       variance_ratio[:30].sum(), variance_ratio[:50].sum()))
+
+# --- 4. donor 混合度基线（harmony 前，前 10 PC）---
+labels = adata.obs["donor"].to_numpy()
+sil_before = float(silhouette_score(adata.obsm["X_pca"][:, :10], labels))
+log("donor silhouette before harmony: %.4f" % sil_before)
+
+# --- 5. Harmony 校正（harmonypy 原生调用）---
+# 绕开 sce.pp.harmony_integrate：scanpy 1.12.4 包装器写 obsm 时对 Z_corr 做 .T，
+# 与容器内 harmonypy 返回的 (cells, n_comps) 不兼容，赋值校验 ValueError。
+import harmonypy
+ho = harmonypy.run_harmony(adata.obsm["X_pca"], adata.obs, "donor", random_state=seed_int)
+z_corr = np.asarray(ho.Z_corr)
+if z_corr.shape != (n_cells_before, N_COMPS):
+    fail("Harmony 嵌入形状 %s != (%d, %d)" % (z_corr.shape, n_cells_before, N_COMPS))
+if not np.isfinite(z_corr).all():
+    fail("Harmony 嵌入含非有限值")
+adata.obsm["X_pca_harmony"] = z_corr
+sil_after = float(silhouette_score(adata.obsm["X_pca_harmony"][:, :10], labels))
+log("donor silhouette after harmony: %.4f" % sil_after)
+
+# --- 6. 自校验 ---
+if sorted(adata.obs["donor"].unique()) != donors_before:
+    fail("donor 集合在校正前后发生变化")
+if adata.shape[0] != n_cells_before:
+    fail("细胞数变化: %d -> %d" % (n_cells_before, adata.shape[0]))
+current_obs = list(adata.obs.columns)
+for col in required_obs:
+    if col not in current_obs:
+        fail("obs 列丢失: %s" % col)
+if "counts" not in adata.layers:
+    fail("layers['counts'] 丢失（步骤 3 应保留原始整数计数）")
+log("self_check 契约/HVG/嵌入形状/finite/donor/obs/counts 层 OK")
+
+# --- 7. 混淆诊断：每个 donor 出现在哪些 group ---
+donor_group = adata.obs.groupby("donor", observed=True)["group"].apply(lambda s: sorted(set(s)))
+single_group_donors = {d: g for d, g in donor_group.items() if len(g) < 2}
+log("single_group_donors=%s" % single_group_donors)
+
+# --- 8. 落盘 ---
+adata.uns["integration"] = {
+    "method": "harmonypy_native_run_harmony",
+    "batch_key": "donor",
+    "n_comps": N_COMPS,
+    "max_iter_harmony": 10,
+    "random_state": seed_int,
+    "silhouette_before": sil_before,
+    "silhouette_after": sil_after,
+    "embeddings": ["X_pca", "X_pca_harmony"],
+    "note": "scanpy 1.12.4 sce.pp.harmony_integrate 包装器 Z_corr.T bug，改原生调用",
+}
+adata.uns["seed"] = seed_int
+adata.uns["source_h5ad"] = h5ad_file
+adata.write_h5ad("scrna_integrated.h5ad")
+
+crosstab = adata.obs.groupby(["donor", "group"], observed=True).size()
+report_lines = [
+    "step=integrate_harmony",
+    "seed=%s" % seed,
+    "input_h5ad=%s" % h5ad_file,
+    "cells=%d（HVG 子集不丢细胞）" % adata.shape[0],
+    "hvg_genes=%d（沿用步骤 3 seurat flavor 选择，未重选）" % N_TOP_GENES,
+    "scale=max_value=%d（稀疏矩阵稠密化后可接受）" % MAX_VALUE,
+    "pca=n_comps=%d var_ratio PC1=%.4f cum10=%.4f cum30=%.4f cum50=%.4f"
+    % (N_COMPS, variance_ratio[0], variance_ratio[:10].sum(),
+       variance_ratio[:30].sum(), variance_ratio[:50].sum()),
+    "harmony=harmonypy native run_harmony, batch=donor(%d), random_state=%d, max_iter=10"
+    % (len(donors_before), seed_int),
+    "harmony_wrapper_note=scanpy 1.12.4 sce.pp.harmony_integrate 对 Z_corr 做 .T 与容器 harmonypy 形状不兼容，本步绕开包装器原生调用",
+    "silhouette_donor_before=%.4f（前 10 PC，负值=donor 不是主导方差来源）" % sil_before,
+    "silhouette_donor_after=%.4f（变化 %.4f，如实报告不调参凑数）" % (sil_after, sil_after - sil_before),
+    "embeddings=X_pca（未校正）+ X_pca_harmony（校正后），步骤 5 聚类只用后者",
+    "counts_layer=layers['counts'] 原始整数计数（HVG 子集）已保留",
+    "donor_group_crosstab:",
+]
+for donor in donors_before:
+    groups = adata.obs[adata.obs["donor"] == donor]["group"].value_counts()
+    report_lines.append("  %s: %s" % (donor, count_dict(groups)))
+report_lines += [
+    "confounding_warning=配对设计：healthy 供体只贡献 HC，银屑病供体贡献 LS+NLS；batch=donor 与 group 部分共线，harmony 校正会顺带削去部分组间信号，解释时注意",
+    "single_group_donor_count=%d / %d" % (len(single_group_donors), len(donors_before)),
+    "elapsed_seconds=%.0f" % (time.time() - START),
+    "outputs=scrna_integrated.h5ad, integrate_report.txt",
+]
+with open("integrate_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+for _artifact in sorted(os.listdir(".")):
+    if not os.path.isfile(_artifact):
+        continue
+    if _artifact == 'integrate_report.txt':
+        continue
+    with open(_artifact, "rb") as _fh:
+        _digest = hashlib.sha256(_fh.read()).hexdigest()
+    with open('integrate_report.txt', "a", encoding="utf-8") as _fh:
+        _fh.write("%s_sha256=%s\n" % (_artifact, _digest))
+log("integrate_harmony_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "$PWD" "integrate_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

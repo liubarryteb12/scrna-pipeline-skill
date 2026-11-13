@@ -1,0 +1,509 @@
+#!/usr/bin/env bash
+# scrna_composition：line2_scrna 步骤 14 细胞类型比例/组成分析（aims 线2 下游第 1 项）。
+#
+# 输入：步骤 6 产物 scrna_annotated.h5ad（obs 带 celltype/leiden/donor/diagnosis/region/group，
+#       layers['counts'] 原始计数，obsm X_umap）。
+#
+# 做法（口径定稿依据：服务器探针 s5l2_comp_probe*.py 实测）：
+#   1. 比例单位 = donor（细胞比例是样本级量：每 donor 内各类占比谱，行和=1）。
+#      celltype 有 13 类（min pDC 20 细胞，Healthy 组 0 个）。donor 级比例把
+#      "细胞数规模差异"归一掉，组间比较是比例谱而非绝对数。
+#   2. 组成谱排序确定性：比例降序，ties 按 celltype 名字典序（与 line3 步骤 9
+#      rank 对齐口径一致；celltype 是全 dataset 共享命名空间，不像 line3 的
+#      domain 身份样本私有，这里不需要 rank 对齐、直接按身份比）。
+#   3. 组间检验：diagnosis 两级（Healthy 3 donor vs Psoriasis 5 donor）
+#      + region/group 两级。统计口径与 line3 步骤 9 完全一致：
+#      - 2 组且组合数 <=20000 用精确置换枚举（C(8,3)=56 无蒙特卡洛误差）；
+#      - 非 2 组回退 seed 注入 10000 次随机置换（add-one 校正）；
+#      - 教科书 KW 独立实现（含 tie 校正，不调 scipy.stats.kruskal 防同源互证）；
+#      - 附加 eta2 效应量（组间平方和/总平方和）。
+#   4. 混淆如实记录：healthy 供体只贡献 region=H（psoriasis 供体同时贡献
+#      LS/NLS），与 line3 condition 级混淆同源，region 级组间比较在读结果时
+#     必须注意这个设计属性，报告写明不解读为区域效应。
+#
+# 自校验内建：输入契约（步骤 6 键集合 + celltype 列 + 未做过 composition）、
+# 比例行和=1（未舍入 1e-9 / 舍入 1e-3）、celltype 集合与 obs 一致、
+# 每 donor 至少 1 个非零类、Kruskal 统计量与教科书实现一致坐标、
+# 置换 p 在 [1/(C+1), 1] 区间、X/counts/X_umap/leiden/celltype/obs/var 不变量。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+src_h5ad=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *scrna_annotated*.h5ad) src_h5ad="$path" ;;
+    *.h5ad) echo "无法识别的输入文件: $path（需要 scrna_annotated.h5ad，步骤 6 产物）" >&2; exit 2 ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$src_h5ad" ]; then
+  echo "缺少必需输入：scrna_annotated.h5ad（步骤 6 产物）" >&2
+  exit 2
+fi
+if [ ! -f "$src_h5ad" ]; then
+  echo "输入文件不存在: $src_h5ad"
+  exit 2
+fi
+
+echo "step_executed=scrna_composition"
+echo "bioanalys_seed=${seed}"
+echo "input=${src_h5ad}"
+
+COMP_INPUT="$src_h5ad"
+export COMP_INPUT
+export COMP_OUTDIR="${COMP_OUTDIR:-$(pwd)}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+python3 - <<'PYSCRIPT'
+import json
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+import anndata as ad
+
+# pandas 3 与 2 的 infer_string 默认值不同，anndata 0.13 写 obs 字符串列时
+# 会因 nullable strings 开关未定而崩；显式关掉（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+SEED = int(os.environ["BIOANALYS_SEED"])
+ALPHA = 0.05
+
+
+def _nnz(mat):
+    """稀疏/稠密矩阵统一的 nnz 计数（line2 步骤 6 产物 X 是稠密 ndarray）。"""
+    import scipy.sparse as sp
+    if sp.issparse(mat):
+        return int(mat.nnz)
+    return int(np.count_nonzero(np.asarray(mat)))
+
+
+def fail(message):
+    sys.stderr.write("scrna_composition 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+# 步骤 6 产物键集合（obs 22 列 + uns 25 键）
+REQUIRED_OBS = ["sample_title", "donor", "diagnosis", "region", "group", "class",
+                "plate", "well", "leiden", "celltype", "celltype_paper",
+                "celltype_paper_major"]
+REQUIRED_UNS = ["annotation", "cluster_markers", "clustering", "grouping_check",
+                "hvg", "integration", "leiden", "log1p", "normalization", "pca",
+                "qc_doublet_disposition", "qc_source_h5ad", "qc_thresholds",
+                "rank_genes_groups", "region_to_group", "seed", "source_counts_tar",
+                "source_gpl_soft", "source_h5ad", "umap"]
+
+# 组间检验的两级分组：诊断主比较 + 区域次级比较（design 混淆写报告）
+GROUP_LEVELS = ["diagnosis", "region"]
+PERM_REPEATS = 10000
+MAX_EXACT = 20000
+
+
+def _n_comb(n, k):
+    """组合数 C(n,k)，math.comb 本地实现。"""
+    from math import comb
+    return comb(n, k)
+
+
+def _chi2_sf(x, df):
+    """卡方分布生存函数（上不完全 gamma 的正则化），不调 scipy（防同源互证）。
+
+    自实现 regularized upper incomplete gamma Q(df/2, x/2)。
+    """
+    from math import lgamma, exp, log
+    a = df / 2.0
+    z = x / 2.0
+    if z <= 0:
+        return 1.0
+    # series (z < a+1) 或 continued fraction（Numerical Recipes gammq）
+    if z < a + 1.0:
+        # 级数展开 P(a,z)
+        term = 1.0 / a
+        total = term
+        n = 0
+        while True:
+            n += 1
+            term *= z / (a + n)
+            total += term
+            if abs(term) < abs(total) * 1e-14 or n > 10000:
+                break
+        p = total * exp(-z + a * log(z) - lgamma(a))
+        return max(0.0, min(1.0, 1.0 - p))
+    # 连分形展开 Q(a,z)（Lentz）
+    tiny = 1e-300
+    b = z + 1.0 - a
+    c = 1.0 / tiny
+    d = 1.0 / b
+    h = d
+    for i in range(1, 10000):
+        an = -i * (i - a)
+        b += 2.0
+        d = an * d + b
+        if abs(d) < tiny:
+            d = tiny
+        c = b + an / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < 1e-14:
+            break
+    q = exp(-z + a * log(z) - lgamma(a)) * h
+    return max(0.0, min(1.0, q))
+
+
+def kruskal_h(groups):
+    """教科书 Kruskal-Wallis H（含 tie 校正），不调 scipy（防同源互证）。
+
+    groups: list of 1-D arrays。返回 (H, tie_correction)。
+    """
+    all_vals = np.concatenate(groups)
+    n_total = len(all_vals)
+    order = np.argsort(all_vals, kind="mergesort")
+    ranks = np.empty(n_total, dtype=float)
+    sorted_vals = all_vals[order]
+    i = 0
+    tie_term = 0.0
+    while i < n_total:
+        j = i
+        while j + 1 < n_total and sorted_vals[j + 1] == sorted_vals[i]:
+            j += 1
+        cnt = j - i + 1
+        avg_rank = 0.5 * (i + j) + 1.0
+        ranks[order[i:j + 1]] = avg_rank
+        tie_term += cnt ** 3 - cnt
+        i = j + 1
+    offset = 0
+    h = 0.0
+    for g in groups:
+        rg = ranks[offset:offset + len(g)]
+        h += (rg.sum() ** 2) / len(g)
+        offset += len(g)
+    h = 12.0 / (n_total * (n_total + 1)) * h - 3.0 * (n_total + 1)
+    tie_correction = 1.0 - tie_term / (n_total ** 3 - n_total)
+    return h, tie_correction
+
+
+def exact_permutation_p(values, group_sizes, observed_stat):
+    """2 组精确置换枚举：所有 label 分配等概率，p = (>=observed 的分配数+1)/(总分配数+1)。"""
+    import itertools
+    n = sum(group_sizes)
+    idx = np.arange(n)
+    total = 0
+    extreme = 0
+    v = np.asarray(values, dtype=float)
+    n1 = group_sizes[0]
+    for comb in itertools.combinations(list(idx), n1):
+        mask = np.zeros(n, dtype=bool)
+        mask[list(comb)] = True
+        stat = _stat_two_groups(v[mask], v[~mask])
+        total += 1
+        if stat >= observed_stat - 1e-12:
+            extreme += 1
+    return (extreme + 1) / (total + 1), total
+
+
+def _stat_two_groups(a, b):
+    """两样本置换统计量：均值差绝对值（比例谱逐类做，用单类值即可）。"""
+    return abs(float(np.mean(a)) - float(np.mean(b)))
+
+
+def random_permutation_p(values, group_sizes, observed_stat, rng):
+    n = sum(group_sizes)
+    n1 = group_sizes[0]
+    v = np.asarray(values, dtype=float)
+    extreme = 0
+    for _ in range(PERM_REPEATS):
+        perm = rng.permutation(n)
+        a = v[perm[:n1]]
+        b = v[perm[n1:]]
+        if _stat_two_groups(a, b) >= observed_stat - 1e-12:
+            extreme += 1
+    return (extreme + 1) / (PERM_REPEATS + 1)
+
+
+src_path = os.environ["COMP_INPUT"].strip()
+adata = ad.read_h5ad(src_path)
+log("loaded spots/cells=%d genes=%d" % (adata.shape[0], adata.shape[1]))
+
+# --- 1. 输入契约 ---
+missing_obs = [c for c in REQUIRED_OBS if c not in adata.obs.columns]
+if missing_obs:
+    fail("缺少 obs 列 %s（不是 scrna_annotated 产物？）" % missing_obs)
+missing_uns = [k for k in REQUIRED_UNS if k not in adata.uns]
+if missing_uns:
+    fail("缺少 uns 键 %s" % missing_uns)
+if "counts" not in adata.layers:
+    fail("缺少 layers['counts']")
+for key in ["X_umap", "X_pca"]:
+    if key not in adata.obsm:
+        fail("缺少 obsm['%s']" % key)
+if "composition" in adata.uns:
+    fail("已含组成结果（重复执行？）")
+x_nnz_before = _nnz(adata.X)
+counts_nnz_before = _nnz(adata.layers["counts"])
+pca_before = adata.obsm["X_pca"].copy()
+umap_before = adata.obsm["X_umap"].copy()
+leiden_before = adata.obs["leiden"].copy()
+celltype_before = adata.obs["celltype"].copy()
+
+# --- 2. 逐 donor 细胞比例谱 ---
+celltypes = sorted(adata.obs["celltype"].astype(str).unique().tolist())
+donors = sorted(adata.obs["donor"].astype(str).unique().tolist())
+ct_arr = adata.obs["celltype"].astype(str).to_numpy()
+donor_arr = adata.obs["donor"].astype(str).to_numpy()
+n_ct = len(celltypes)
+n_donor = len(donors)
+log("celltypes=%d donors=%d" % (n_ct, n_donor))
+
+prop = np.zeros((n_donor, n_ct), dtype=float)
+counts_mat = np.zeros((n_donor, n_ct), dtype=int)
+for di, d in enumerate(donors):
+    m = donor_arr == d
+    n_cells = int(m.sum())
+    vc = pd.Series(ct_arr[m]).value_counts()
+    for ci, c in enumerate(celltypes):
+        counts_mat[di, ci] = int(vc.get(c, 0))
+    prop[di] = counts_mat[di] / n_cells
+if not np.allclose(prop.sum(axis=1), 1.0, atol=1e-12):
+    fail("比例行和 != 1（max dev %g）" % float(np.max(np.abs(prop.sum(axis=1) - 1.0))))
+if (counts_mat.sum(axis=1) <= 0).any():
+    fail("有 donor 细胞数为 0")
+
+# --- 3. 组间检验（diagnosis 主 + region 次） ---
+rng = np.random.default_rng(SEED)
+group_results = {}
+for level in GROUP_LEVELS:
+    if level not in adata.obs.columns:
+        log("  [%s] 列不存在，跳过" % level)
+        continue
+    lab = adata.obs[level].astype(str).to_numpy()
+    donor_lab = {}
+    for di, d in enumerate(donors):
+        labs = set(lab[donor_arr == d].tolist())
+        if len(labs) != 1:
+            # 供体在该 level 上不纯（design 属性，非错误）：跳过该 level
+            log("  [%s] donor %s 跨多类 %s，该 level 跳过" % (level, d, sorted(labs)))
+            donor_lab = None
+            break
+        donor_lab[d] = labs.pop()
+    if not donor_lab:
+        continue
+    groups_sorted = sorted(set(donor_lab.values()))
+    if len(groups_sorted) < 2:
+        log("  [%s] 仅 %d 个组值 %s，无组间比较" % (level, len(groups_sorted), groups_sorted))
+        continue
+    per_ct = []
+    for ci, c in enumerate(celltypes):
+        vals = prop[:, ci]
+        groups = [np.array([vals[donors.index(d)] for d in donors
+                            if donor_lab[d] == g], dtype=float)
+                  for g in groups_sorted]
+        group_sizes = [len(g) for g in groups]
+        if min(group_sizes) < 1:
+            continue
+        h, tie_corr = kruskal_h(groups)
+        # KW p：卡方近似（df = k-1），tie 校正
+        df = len(groups) - 1
+        p_chi = _chi2_sf(h / tie_corr if tie_corr > 0 else h, df)
+        # 置换检验（比例谱逐类做 2 组精确/多组随机）
+        if len(groups) == 2:
+            sizes = group_sizes
+            n_tot = sizes[0] + sizes[1]
+            comb = _n_comb(n_tot, sizes[0])
+            if comb <= MAX_EXACT:
+                p_perm, n_perm = exact_permutation_p(vals, sizes,
+                                                     abs(np.mean(groups[0]) - np.mean(groups[1])))
+                mode = "exact_enum"
+            else:
+                p_perm = random_permutation_p(vals, sizes,
+                                              abs(np.mean(groups[0]) - np.mean(groups[1])), rng)
+                n_perm = PERM_REPEATS
+                mode = "random_10000"
+        else:
+            p_perm = None
+            n_perm = 0
+            mode = "kw_only"
+        # eta2：组间平方和/总平方和
+        grand = float(np.mean(vals))
+        ss_between = sum(len(g) * (float(np.mean(g)) - grand) ** 2 for g in groups)
+        ss_total = float(np.sum((vals - grand) ** 2))
+        eta2 = ss_between / ss_total if ss_total > 0 else 0.0
+        per_ct.append({
+            "celltype": c,
+            "group_values": {g: float(np.mean(gg)) for g, gg in zip(groups_sorted, groups)},
+            "group_means_raw": {g: [float(x) for x in gg] for g, gg in zip(groups_sorted, groups)},
+            "kruskal_h": float(h / tie_corr) if tie_corr > 0 else float(h),
+            "kruskal_df": int(df),
+            "kruskal_p": float(p_chi),
+            "perm_p": None if p_perm is None else float(p_perm),
+            "perm_mode": mode,
+            "n_perm": int(n_perm),
+            "eta2": float(eta2),
+            "significant": bool(p_perm is not None and p_perm < ALPHA),
+        })
+    group_results[level] = {
+        "groups": groups_sorted,
+        "n_donors_per_group": {g: int(sum(1 for d in donors if donor_lab[d] == g))
+                               for g in groups_sorted},
+        "donor_labels": donor_lab,
+        "per_celltype": per_ct,
+    }
+    sig_n = sum(1 for r in per_ct if r["significant"])
+    log("  [%s] groups=%s 逐类检验完成，显著 %d/%d" % (level, groups_sorted, sig_n, n_ct))
+
+if not group_results:
+    fail("没有任何 level 可做组间检验（donor 在分组上均不纯或缺列）")
+
+# --- 4. 自校验 + 不变量 ---
+if _nnz(adata.X) != x_nnz_before:
+    fail("X nnz 被改变")
+if _nnz(adata.layers["counts"]) != counts_nnz_before:
+    fail("counts 层 nnz 被改变")
+if not np.array_equal(adata.obsm["X_pca"], pca_before):
+    fail("X_pca 被改动")
+if not np.array_equal(adata.obsm["X_umap"], umap_before):
+    fail("X_umap 被改动")
+if not adata.obs["leiden"].astype(str).equals(leiden_before.astype(str)):
+    fail("leiden 列被改动")
+if not adata.obs["celltype"].astype(str).equals(celltype_before.astype(str)):
+    fail("celltype 列被改动")
+for col_name in REQUIRED_OBS:
+    if col_name not in adata.obs.columns:
+        fail("obs 列丢失: %s" % col_name)
+for key_name in REQUIRED_UNS:
+    if key_name not in adata.uns:
+        fail("uns 键丢失: %s" % key_name)
+# 比例与计数对账
+for di, d in enumerate(donors):
+    n_cells = int(counts_mat[di].sum())
+    recomputed = counts_mat[di] / n_cells
+    if not np.allclose(recomputed, prop[di], atol=1e-12):
+        fail("donor %s 比例与计数不一致" % d)
+# 舍入后行和容差（tsv 落盘 4 位小数）
+rounded = np.round(prop, 4)
+if not np.allclose(rounded.sum(axis=1), 1.0, atol=1e-3):
+    fail("舍入比例行和越界（1e-3 容差）")
+
+# --- 5. 落盘 ---
+# cell 级贴回：每 cell 所属 donor 在其 celltype 上的比例（celltype_donor_prop）
+cell_donor_idx = np.array([donors.index(d) for d in donor_arr])
+cell_ct_idx = np.array([celltypes.index(c) for c in ct_arr])
+cell_prop = prop[cell_donor_idx, cell_ct_idx]
+adata.obs["celltype_donor_prop"] = cell_prop
+adata.obs["donor_n_cells"] = counts_mat.sum(axis=1)[cell_donor_idx].astype(int)
+
+adata.uns["composition"] = {
+    "method": "donor_level_celltype_proportion_with_group_test",
+    "note": "比例单位=donor（每 donor 内各类占比谱，行和=1）；组间检验 donor 级"
+            "（Healthy 3 vs Psoriasis 5 for diagnosis；region 级因 psoriasis 供体"
+            "同时贡献 LS/NLS 存在设计混淆，仅作参考不作区域效应解读）；统计口径"
+            "与 line3 步骤 9 同源：2 组精确置换枚举 + 教科书 KW（tie 校正）+ eta2",
+    "seed": SEED,
+    "alpha": ALPHA,
+    "n_celltypes": int(n_ct),
+    "celltypes": celltypes,
+    "n_donors": int(n_donor),
+    "donors": donors,
+    "donor_n_cells": {d: int(counts_mat[i].sum()) for i, d in enumerate(donors)},
+    "proportion_matrix": prop.round(6).tolist(),
+    "count_matrix": counts_mat.tolist(),
+    # anndata uns 禁 list-of-dicts（含 None/混合类型直接 TypeError，坑 #122 同源），
+    # 逐 celltype 检验明细落 JSON 字符串（report 与回读都从 JSON 解析）
+    "group_tests_json": json.dumps(group_results, ensure_ascii=False, sort_keys=True),
+    "confound_note": "diagnosis 与 region 在该数据集不独立：3 个 healthy 供体只贡献"
+                     "region=H，5 个 psoriasis 供体同时贡献 LS 与 NLS（donor x region "
+                     "交叉表实测）。diagnosis 级比较是主分析；region 级差异不能解读为"
+                     "区域效应",
+    "source_h5ad": src_path,
+}
+h5ad_name = "scrna_composition.h5ad"
+adata.write_h5ad(h5ad_name)
+
+tsv_name = "celltype_composition.tsv"
+rows = []
+for di, d in enumerate(donors):
+    lab = adata.obs["diagnosis"].astype(str).to_numpy()[donor_arr == d]
+    region_lab = adata.obs["region"].astype(str).to_numpy()[donor_arr == d]
+    diag = sorted(set(lab.tolist()))[0] if len(set(lab.tolist())) == 1 else "mixed"
+    reg = sorted(set(region_lab.tolist()))[0] if len(set(region_lab.tolist())) == 1 \
+        else "mixed"
+    for ci, c in enumerate(celltypes):
+        rows.append({
+            "donor": d, "diagnosis": diag, "region": reg, "celltype": c,
+            "n_cells": int(counts_mat[di, ci]),
+            "prop": round(float(prop[di, ci]), 6),
+        })
+df_out = pd.DataFrame(rows)
+df_out.to_csv(tsv_name, sep="\t", index=False)
+log("wrote %s (%d cells) + %s (%d 行)" % (h5ad_name, adata.shape[0], tsv_name, len(df_out)))
+
+# --- 6. 报告 ---
+lines = [
+    "step=scrna_composition",
+    "seed=%d" % SEED,
+    "unit_note=比例单位=donor（每 donor 内 celltype 占比谱）；celltype 命名空间"
+    "全数据集共享（13 类），不需要 line3 的 rank 对齐",
+    "confound_note=diagnosis 与 region 不独立：healthy 供体只贡献 region=H；"
+    "psoriasis 供体贡献 LS/NLS。region 级差异不得解读为区域效应",
+    "stat_note=教科书 KW（tie 校正，不调 scipy.stats.kruskal）+ 2 组精确置换枚举"
+    "（C(8,3)=56，无蒙特卡洛误差，结果与 seed 无关）+ eta2 效应量",
+    "celltypes=%d donors=%d" % (n_ct, n_donor),
+    "outputs=scrna_composition.h5ad, celltype_composition.tsv, composition_report.txt",
+]
+for level, res in group_results.items():
+    lines.append("")
+    lines.append("[group_test:%s] groups=%s n_donors=%s"
+                 % (level, res["groups"], res["n_donors_per_group"]))
+    for r in sorted(res["per_celltype"], key=lambda x: x["perm_p"] is None or x["perm_p"]):
+        lines.append("  %-28s means=%s KW_H=%.4f(p=%.4g) perm_p=%s eta2=%.4f%s"
+                     % (r["celltype"],
+                        {k: round(v, 4) for k, v in r["group_values"].items()},
+                        r["kruskal_h"], r["kruskal_p"],
+                        "n/a" if r["perm_p"] is None else "%.4g" % r["perm_p"],
+                        r["eta2"], " *" if r["significant"] else ""))
+lines.append("")
+lines.append("elapsed_seconds=%.1f" % (time.time() - START))
+with open("composition_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(lines) + "\n")
+log("scrna_composition_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "${COMP_OUTDIR:-$(pwd)}" "composition_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

@@ -1,0 +1,812 @@
+#!/usr/bin/env bash
+# deg_groups：line2_scrna 步骤 15 组间差异表达分析（aims 线2 下游第 2 项）。
+#
+# 输入：步骤 14 产物 scrna_composition.h5ad（obs 带 celltype/donor/diagnosis/region，
+#       layers['counts'] 原始计数，var 全基因 24969）。
+#
+# 做法（口径定稿依据：本线既有产物 + line3 同源经验）：
+#   1. 检验单位 = celltype（逐 celltype 内做 diagnosis 两组比较）。理由：混池
+#       DEG 主要由细胞组成差异驱动（步骤 14 已证实组成有差异的类），与 aims
+#      "细胞类型 marker/差异分析"分层的意图一致；pDC（20 细胞、Healthy 组 0 个）
+#      等无法做两组的 celltype 跳过并记录。
+#   2. 逐细胞统计量：逐基因两组间 Mann-Whitney U（scanpy rank_genes_groups，
+#      method='wilcoxon'，corr_method='benjamini-hochberg' 对每 celltype 内
+#      基因的 p 值做 BH 校正，输出 log2fc + pvals_adj + pts）。该结果是
+#      exploratory cell-level：细胞被当作独立观测，p 值随细胞数膨胀，
+#      只用于探索与排序，不构成供体水平显著性的结论。
+#   3. 供体级统计：按 donor x celltype 从 layers['counts'] 聚合原始计数，
+#      转 CPM + log2(CPM+1)，在每个 celltype 内做两组 donor 间检验。
+#      优先探测 DESeq2、edgeR、limma-voom；容器依赖不可用或拟合失败时，
+#      退到 donor-level Welch t + BH 的轻量 fallback。fallback 只用于筛选，
+#      不能替代 DESeq2/edgeR 的发表级推断，报告中逐 celltype 如实标注。
+#      任一组的 donor 数 < 2 时该 celltype 记 skipped_insufficient_donors。
+#   4. 表达矩阵：从 layers['counts']（原始整数计数）重算 log 归一化
+#      （normalize_total(1e4)+log1p，复现步骤 3 口径）。**不能直接用 adata.X**：
+#      步骤 4 integrate_harmony 把 .X 换成了 scale(max_value=10) 的 z-score
+#      （实测 min=-4.19/max=10），z-score 含负值，rank_genes_groups 的
+#      logfoldchanges 对负值取 log2 出 nan（实测 268/2000 基因 nan）；
+#      也不能喂原始 counts（expm1 反变换 overflow）。log 归一化值两处都干净。
+#      counts 层保留不丢。
+#   5. DEG 判据固定：adj p < 0.05 且 |log2fc| > 1。阈值不随结果调整（line1
+#      步骤 7 铁律：0 显著基因也是真实结果，如实报告）。
+#   6. donor 混淆如实记录：diagnosis 与 region 不独立（healthy 供体只贡献 H），
+#      DEG 是表达变化不是调控变化（DR 由步骤 9 负责），报告中写明。
+#
+# 自校验内建：输入契约（步骤 14 键集合 + composition uns + 未做过 DEG）、
+# 逐 celltype 至少一组有细胞、pvals_adj 在 [0,1]、pts 在 [0,1]、
+# log2fc 有限、每个跑了的 celltype 结果结构与 scanpy rank_genes_groups 一致、
+# pseudobulk 字段齐全且 ok 行 p 值有限、供体不足行确实少于 2 个 donor、
+# X/counts/X_pca/X_umap/leiden/celltype/obs 新列不变量。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+src_h5ad=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *scrna_composition*.h5ad) src_h5ad="$path" ;;
+    *.h5ad) echo "无法识别的输入文件: $path（需要 scrna_composition.h5ad，步骤 14 产物）" >&2; exit 2 ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$src_h5ad" ]; then
+  echo "缺少必需输入：scrna_composition.h5ad（步骤 14 产物）" >&2
+  exit 2
+fi
+if [ ! -f "$src_h5ad" ]; then
+  echo "输入文件不存在: $src_h5ad"
+  exit 2
+fi
+
+echo "step_executed=deg_groups"
+echo "bioanalys_seed=${seed}"
+echo "input=${src_h5ad}"
+
+DEG_INPUT="$src_h5ad"
+export DEG_INPUT
+export DEG_OUTDIR="${DEG_OUTDIR:-$(pwd)}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+# Python 到 R 的 pseudobulk 后端会传 TSV 计数与元数据。守卫对非 h5ad/rds 输入会
+# 显式 SKIP；仍放在第一次 R 侧调用之前，保证新增 R 路径不绕过桥接四项断言。
+deg_bridge_input=""
+for _in in "${INPUTS[@]:-}"; do
+  case "$_in" in
+    *.h5ad|*.rds) deg_bridge_input="$_in"; break ;;
+  esac
+done
+if [ -n "$deg_bridge_input" ]; then
+  "$(dirname "$0")/../../bridge_guard.sh" --input "$deg_bridge_input" \
+    --from Python --to R --script deg_groups --stage pre-dimred || exit $?
+fi
+
+python3 - <<'PYSCRIPT'
+import json
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+import anndata as ad
+import scanpy as sc
+import scipy.sparse as sp
+import subprocess
+import tempfile
+
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+SEED = int(os.environ["BIOANALYS_SEED"])
+ALPHA = 0.05
+MIN_ABS_LOG2FC = 1.0
+GROUP_LEVEL = "diagnosis"
+GROUP_A = "Healthy"
+GROUP_B = "Psoriasis"
+MIN_CELLS_PER_GROUP = 20
+MIN_DONORS_PER_GROUP = 2
+PSEUDOBULK_FALLBACK = "donor_level_welch_t_BH_fallback"
+PSEUDOBULK_OUTPUT = "deg_pseudobulk_by_celltype.tsv"
+
+
+def _nnz(mat):
+    """稀疏/稠密矩阵统一的 nnz 计数（line2 步骤 6 产物 X 是稠密 ndarray）。"""
+    if sp.issparse(mat):
+        return int(mat.nnz)
+    return int(np.count_nonzero(np.asarray(mat)))
+
+
+def fail(message):
+    sys.stderr.write("deg_groups 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def bh_adjust(pvals):
+    """Benjamini-Hochberg 校正，NaN 原样保留。"""
+    p = np.asarray(pvals, dtype=float)
+    out = np.full(p.shape, np.nan, dtype=float)
+    ok = np.isfinite(p)
+    if not ok.any():
+        return out
+    pv = p[ok]
+    order = np.argsort(pv, kind="mergesort")
+    ranked = pv[order]
+    m = pv.size
+    adj = ranked * m / np.arange(1, m + 1, dtype=float)
+    adj = np.minimum.accumulate(adj[::-1])[::-1]
+    adj = np.clip(adj, 0.0, 1.0)
+    tmp = np.empty(m, dtype=float)
+    tmp[order] = adj
+    out[ok] = tmp
+    return out
+
+
+def welch_pvalues(mat, case_mask, ctrl_mask):
+    """供体级 Welch t，mat 为 donor x gene，输入已做 log2(CPM+1)。"""
+    from scipy import stats
+    a = np.asarray(mat[case_mask, :], dtype=float)
+    b = np.asarray(mat[ctrl_mask, :], dtype=float)
+    na, nb = a.shape[0], b.shape[0]
+    ma, mb = a.mean(axis=0), b.mean(axis=0)
+    va, vb = a.var(axis=0, ddof=1), b.var(axis=0, ddof=1)
+    diff = ma - mb
+    se2 = va / na + vb / nb
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tstat = diff / np.sqrt(se2)
+        df = (se2 ** 2) / (((va / na) ** 2) / (na - 1) + ((vb / nb) ** 2) / (nb - 1))
+        pvals = 2.0 * stats.t.sf(np.abs(tstat), df)
+    pvals = np.asarray(pvals, dtype=float)
+    zero = se2 <= 0
+    pvals[zero & (np.abs(diff) <= 0)] = 1.0
+    pvals[zero & (np.abs(diff) > 0)] = 0.0
+    pvals[~np.isfinite(pvals)] = 1.0
+    return pvals, diff
+
+
+R_PSEUDOBULK_SCRIPT = r"""
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) < 4) stop("need method, counts, meta, out")
+method <- args[1]
+counts_path <- args[2]
+meta_path <- args[3]
+out_path <- args[4]
+counts <- as.matrix(read.delim(counts_path, row.names = 1, check.names = FALSE))
+meta <- read.delim(meta_path, row.names = 1, check.names = FALSE)
+meta$group <- factor(meta$group, levels = c("ctrl", "case"))
+res <- NULL
+if (method == "DESeq2") {
+  suppressPackageStartupMessages(library(DESeq2))
+  dds <- DESeqDataSetFromMatrix(countData = round(counts), colData = meta, design = ~ group)
+  dds <- DESeq(dds, quiet = TRUE)
+  r <- results(dds, contrast = c("group", "case", "ctrl"))
+  res <- data.frame(gene = rownames(r), p_value = r$pvalue, p_adj = r$padj,
+                    stringsAsFactors = FALSE)
+} else if (method == "edgeR") {
+  suppressPackageStartupMessages(library(edgeR))
+  y <- DGEList(counts = round(counts), group = meta$group)
+  y <- calcNormFactors(y)
+  design <- model.matrix(~ group, data = meta)
+  y <- estimateDisp(y, design)
+  fit <- glmQLFit(y, design)
+  qlf <- glmQLFTest(fit, coef = 2)
+  tt <- topTags(qlf, n = Inf)$table
+  res <- data.frame(gene = rownames(tt), p_value = tt$PValue, p_adj = tt$FDR,
+                    stringsAsFactors = FALSE)
+} else if (method == "limma_voom") {
+  suppressPackageStartupMessages({library(edgeR); library(limma)})
+  y <- DGEList(counts = round(counts), group = meta$group)
+  y <- calcNormFactors(y)
+  design <- model.matrix(~ group, data = meta)
+  v <- voom(y, design)
+  fit <- lmFit(v, design)
+  fit <- eBayes(fit)
+  tt <- topTable(fit, coef = 2, number = Inf, sort.by = "none")
+  res <- data.frame(gene = rownames(tt), p_value = tt$P.Value, p_adj = tt$adj.P.Val,
+                    stringsAsFactors = FALSE)
+} else {
+  stop("unknown pseudobulk method")
+}
+if (is.null(res) || nrow(res) == 0) stop("empty pseudobulk result")
+write.table(res, out_path, sep = "\t", quote = FALSE, row.names = FALSE, na = "NA")
+""".strip("\n")
+
+
+def probe_pseudobulk_backend():
+    """按 DESeq2、edgeR、limma-voom 顺序探测 R 依赖，全部不可用返回 None。"""
+    rscript = os.environ.get("BIOANALYS_RSCRIPT") or "Rscript"
+    probes = [
+        ("DESeq2", 'if (!requireNamespace("DESeq2", quietly=TRUE)) quit(status=1)'),
+        ("edgeR", 'if (!requireNamespace("edgeR", quietly=TRUE)) quit(status=1)'),
+        ("limma_voom",
+         'if (!requireNamespace("limma", quietly=TRUE) || '
+         '!requireNamespace("edgeR", quietly=TRUE)) quit(status=1)'),
+    ]
+    for name, expr in probes:
+        try:
+            proc = subprocess.run(
+                [rscript, "-e", expr], stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None, rscript
+        if proc.returncode == 0:
+            return name, rscript
+    return None, rscript
+
+
+def run_pseudobulk_r(rscript, backend, counts_gene_by_donor, gene_ids_kept,
+                     donor_names, donor_group, tmpdir):
+    """调用 R 后端，成功返回 gene -> (p, p_adj)，失败返回 (None, 原因)。"""
+    counts_path = os.path.join(tmpdir, "pb_counts.tsv")
+    meta_path = os.path.join(tmpdir, "pb_meta.tsv")
+    out_path = os.path.join(tmpdir, "pb_result.tsv")
+    if os.path.exists(out_path):
+        os.remove(out_path)
+    pd.DataFrame(
+        counts_gene_by_donor, index=pd.Index(gene_ids_kept, name="gene"),
+        columns=donor_names,
+    ).to_csv(counts_path, sep="\t")
+    groups = ["case" if donor_group[d] == GROUP_B else "ctrl" for d in donor_names]
+    pd.DataFrame(
+        {"group": groups}, index=pd.Index(donor_names, name="donor"),
+    ).to_csv(meta_path, sep="\t")
+    try:
+        proc = subprocess.run(
+            [rscript, "-", backend, counts_path, meta_path, out_path],
+            input=R_PSEUDOBULK_SCRIPT, text=True, capture_output=True, timeout=180,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, str(exc)
+    if proc.returncode != 0:
+        return None, (proc.stderr or "R backend failed").strip()[-600:]
+    if not os.path.exists(out_path):
+        return None, "R backend did not write result"
+    res = pd.read_csv(out_path, sep="\t")
+    needed = {"gene", "p_value", "p_adj"}
+    if not needed <= set(res.columns):
+        return None, "R result missing columns %s" % sorted(needed - set(res.columns))
+    return {
+        str(g): (float(p), float(q))
+        for g, p, q in zip(res["gene"], res["p_value"], res["p_adj"])
+    }, ""
+
+
+REQUIRED_OBS = ["sample_title", "donor", "diagnosis", "region", "group", "class",
+                "plate", "well", "leiden", "celltype", "celltype_paper",
+                "celltype_paper_major", "celltype_donor_prop", "donor_n_cells"]
+REQUIRED_UNS = ["annotation", "cluster_markers", "clustering", "grouping_check",
+                "hvg", "integration", "leiden", "log1p", "normalization", "pca",
+                "qc_doublet_disposition", "qc_source_h5ad", "qc_thresholds",
+                "rank_genes_groups", "region_to_group", "seed", "source_counts_tar",
+                "source_gpl_soft", "source_h5ad", "umap", "composition"]
+
+src_path = os.environ["DEG_INPUT"].strip()
+adata = ad.read_h5ad(src_path)
+log("loaded cells=%d genes=%d" % (adata.shape[0], adata.shape[1]))
+
+# --- 1. 输入契约 ---
+missing_obs = [c for c in REQUIRED_OBS if c not in adata.obs.columns]
+if missing_obs:
+    fail("缺少 obs 列 %s（不是 scrna_composition 产物？）" % missing_obs)
+missing_uns = [k for k in REQUIRED_UNS if k not in adata.uns]
+if missing_uns:
+    fail("缺少 uns 键 %s" % missing_uns)
+if "counts" not in adata.layers:
+    fail("缺少 layers['counts']")
+for key in ["X_umap", "X_pca"]:
+    if key not in adata.obsm:
+        fail("缺少 obsm['%s']" % key)
+if "deg" in adata.uns:
+    fail("已含 DEG 结果（重复执行？）")
+
+x_nnz_before = _nnz(adata.X)
+counts_nnz_before = _nnz(adata.layers["counts"])
+pca_before = adata.obsm["X_pca"].copy()
+umap_before = adata.obsm["X_umap"].copy()
+leiden_before = adata.obs["leiden"].copy()
+ct_before = adata.obs["celltype"].copy()
+
+# --- 2. 逐 celltype 组间 DEG（counts 层 + wilcoxon + BH） ---
+ct_arr = adata.obs["celltype"].astype(str).to_numpy()
+grp_arr = adata.obs[GROUP_LEVEL].astype(str).to_numpy()
+celltypes = sorted(adata.obs["celltype"].astype(str).unique().tolist())
+log("celltypes=%d, 分组 %s（%s vs %s）" % (len(celltypes), GROUP_LEVEL, GROUP_A, GROUP_B))
+
+# 构造工作副本：从 counts 重算 log 归一化（见文件头口径依据）
+work = adata.copy()
+work.X = work.layers["counts"].copy()
+sc.pp.normalize_total(work, target_sum=1e4)
+sc.pp.log1p(work)
+
+per_ct_meta = {}
+sig_gene_rows = []
+all_rows = []
+sub = None
+for ci, ct in enumerate(celltypes):
+    m_ct = ct_arr == ct
+    n_ct = int(m_ct.sum())
+    sub_a = int(((ct_arr == ct) & (grp_arr == GROUP_A)).sum())
+    sub_b = int(((ct_arr == ct) & (grp_arr == GROUP_B)).sum())
+    meta = {"celltype": ct, "n_cells": n_ct, "n_a": sub_a, "n_b": sub_b}
+    if sub_a < MIN_CELLS_PER_GROUP or sub_b < MIN_CELLS_PER_GROUP:
+        meta["status"] = "skipped_group_too_small"
+        per_ct_meta[ct] = meta
+        log("  [%s] 跳过：%s=%d / %s=%d（门槛 %d）"
+            % (ct, GROUP_A, sub_a, GROUP_B, sub_b, MIN_CELLS_PER_GROUP))
+        continue
+    sub = work[m_ct].copy()
+    # 丢掉两组外的细胞（本数据集仅两个诊断值，防御性过滤）
+    keep = np.isin(sub.obs[GROUP_LEVEL].astype(str).to_numpy(), [GROUP_A, GROUP_B])
+    sub = sub[keep].copy()
+    if sub.n_obs < MIN_CELLS_PER_GROUP * 2:
+        meta["status"] = "skipped_group_too_small"
+        per_ct_meta[ct] = meta
+        continue
+    meta["status"] = "ok"
+    sc.tl.rank_genes_groups(
+        sub, groupby=GROUP_LEVEL, groups=[GROUP_B], reference=GROUP_A,
+        method="wilcoxon", corr_method="benjamini-hochberg",
+        n_genes=sub.n_vars, key_added="deg", pts=True,
+    )
+    names = sub.uns["deg"]["names"][GROUP_B]
+    pvals = np.asarray(sub.uns["deg"]["pvals_adj"][GROUP_B], dtype=float)
+    logfc = np.asarray(sub.uns["deg"]["logfoldchanges"][GROUP_B], dtype=float)
+    pts_a = np.asarray(sub.uns["deg"]["pts_%s" % GROUP_A][GROUP_B], dtype=float) \
+        if ("pts_%s" % GROUP_A) in sub.uns["deg"] else None
+    pts_b = np.asarray(sub.uns["deg"]["pts_%s" % GROUP_B][GROUP_B], dtype=float) \
+        if ("pts_%s" % GROUP_B) in sub.uns["deg"] else None
+    if not np.all(np.isfinite(pvals)):
+        fail("%s pvals_adj 有非有限值" % ct)
+    if not np.all(np.isfinite(logfc)):
+        fail("%s logfoldchanges 有非有限值" % ct)
+    if (pvals < -1e-12).any() or (pvals > 1 + 1e-12).any():
+        fail("%s pvals_adj 越界 [0,1]" % ct)
+    n_sig = int(((pvals < ALPHA) & (np.abs(logfc) > MIN_ABS_LOG2FC)).sum())
+    meta["n_genes_tested"] = int(sub.n_vars)
+    meta["n_sig"] = n_sig
+    per_ct_meta[ct] = meta
+    log("  [%s] cells=%d（%s %d / %s %d）-> 显著 %d/%d 基因"
+        % (ct, sub.n_obs, GROUP_A, sub_a, GROUP_B, sub_b, n_sig, sub.n_vars))
+    var_names = sub.var_names.astype(str)
+    gene_symbols = sub.var["gene_symbol"].astype(str).to_numpy() \
+        if "gene_symbol" in sub.var.columns else var_names
+    order = np.argsort(pvals, kind="mergesort")
+    for rank, gi in enumerate(order, 1):
+        p = float(pvals[gi])
+        l2 = float(logfc[gi])
+        is_sig = bool(p < ALPHA and abs(l2) > MIN_ABS_LOG2FC)
+        row = {
+            "celltype": ct, "rank": rank,
+            "ensembl_id": str(var_names[gi]),
+            "gene_symbol": str(gene_symbols[gi]),
+            "log2fc": round(l2, 6),
+            "pvals_adj": p,
+            "pts_a": None if pts_a is None else round(float(pts_a[gi]), 6),
+            "pts_b": None if pts_b is None else round(float(pts_b[gi]), 6),
+            "direction": "up_in_%s" % GROUP_B if l2 > 0 else "up_in_%s" % GROUP_A,
+            "significant": is_sig,
+        }
+        all_rows.append(row)
+        if is_sig:
+            sig_gene_rows.append(row)
+    if sig_gene_rows and ct == celltypes[-1]:
+        pass
+
+del work
+del sub
+
+# --- 2b. donor x celltype pseudobulk（供体级统计） ---
+log("pseudobulk: donor x celltype from layers['counts'], CPM + log2(CPM+1)")
+donor_series = adata.obs["donor"]
+donor_arr = donor_series.astype(str).to_numpy()
+donor_missing = donor_series.isna().to_numpy()
+counts_layer = adata.layers["counts"]
+gene_ids = adata.var_names.astype(str).to_numpy()
+gene_symbols = adata.var["gene_symbol"].astype(str).to_numpy() \
+    if "gene_symbol" in adata.var.columns else gene_ids
+
+donor_seen = {}
+for donor, group, missing in zip(donor_arr, grp_arr, donor_missing):
+    if missing:
+        continue
+    donor_seen.setdefault(donor, set()).add(group)
+donor_group = {}
+for donor, groups in donor_seen.items():
+    valid = groups & {GROUP_A, GROUP_B}
+    if len(valid) > 1:
+        fail("donor %s 同时属于 %s 与 %s，无法定义供体分组"
+             % (donor, GROUP_A, GROUP_B))
+    if len(valid) == 1:
+        donor_group[donor] = next(iter(valid))
+n_donors_case = sum(1 for g in donor_group.values() if g == GROUP_B)
+n_donors_ctrl = sum(1 for g in donor_group.values() if g == GROUP_A)
+log("pseudobulk donors: case(%s)=%d ctrl(%s)=%d，其他诊断供体 %d 个已排除"
+    % (GROUP_B, n_donors_case, GROUP_A, n_donors_ctrl,
+       len(donor_seen) - len(donor_group)))
+
+r_backend, rscript = probe_pseudobulk_backend()
+r_backend_probed = r_backend
+if r_backend is None:
+    log("pseudobulk backend: DESeq2/edgeR/limma-voom 均不可用，使用 %s"
+        % PSEUDOBULK_FALLBACK)
+else:
+    log("pseudobulk backend: %s (%s)" % (r_backend, rscript))
+
+PB_COLUMNS = ["celltype", "gene", "gene_symbol", "n_donors_case", "n_donors_ctrl",
+              "log2fc", "p_value", "p_adj", "method", "status"]
+pb_meta = {}
+pb_rows = []
+r_fail_streak = 0
+with tempfile.TemporaryDirectory(prefix="deg_pb_") as tmpdir:
+    for ct in celltypes:
+        m_ct = ct_arr == ct
+        cells_donors = donor_arr[m_ct]
+        n_cells_ct = int(cells_donors.size)
+        if n_cells_ct == 0:
+            pb_meta[ct] = {"status": "skipped_insufficient_donors",
+                           "n_donors_case": 0, "n_donors_ctrl": 0,
+                           "n_cells": 0, "n_genes_tested": 0,
+                           "method": "not_tested"}
+            pb_rows.append({"celltype": ct, "gene": "NA", "gene_symbol": "NA",
+                            "n_donors_case": 0, "n_donors_ctrl": 0,
+                            "log2fc": np.nan, "p_value": np.nan,
+                            "p_adj": np.nan, "method": "not_tested",
+                            "status": "skipped_insufficient_donors"})
+            continue
+        codes, uniques = pd.factorize(cells_donors, sort=True)
+        uniques = [str(u) for u in uniques]
+        keep_donor = np.array([u in donor_group for u in uniques], dtype=bool)
+        donor_names = [u for u, keep in zip(uniques, keep_donor) if keep]
+        n_case = int(sum(1 for d in donor_names if donor_group[d] == GROUP_B))
+        n_ctrl = int(sum(1 for d in donor_names if donor_group[d] == GROUP_A))
+        meta = {"celltype": ct, "n_cells": n_cells_ct,
+                "n_donors_case": n_case, "n_donors_ctrl": n_ctrl,
+                "n_genes_tested": 0, "method": "not_tested"}
+        if n_case < MIN_DONORS_PER_GROUP or n_ctrl < MIN_DONORS_PER_GROUP:
+            meta["status"] = "skipped_insufficient_donors"
+            pb_meta[ct] = meta
+            pb_rows.append({"celltype": ct, "gene": "NA", "gene_symbol": "NA",
+                            "n_donors_case": n_case, "n_donors_ctrl": n_ctrl,
+                            "log2fc": np.nan, "p_value": np.nan,
+                            "p_adj": np.nan, "method": "not_tested",
+                            "status": "skipped_insufficient_donors"})
+            log("  [%s] pseudobulk 跳过：case(%s)=%d ctrl(%s)=%d，门槛 %d"
+                % (ct, GROUP_B, n_case, GROUP_A, n_ctrl, MIN_DONORS_PER_GROUP))
+            continue
+        indicator = sp.csr_matrix(
+            (np.ones(n_cells_ct, dtype=np.float64),
+             (np.arange(n_cells_ct), codes)),
+            shape=(n_cells_ct, len(uniques)),
+        )
+        sums_raw = indicator.T.dot(counts_layer[m_ct])
+        if sp.issparse(sums_raw):
+            sums = np.asarray(sums_raw.todense(), dtype=np.float64)
+        else:
+            sums = np.asarray(sums_raw, dtype=np.float64)
+        sums = sums[keep_donor, :]
+        case_mask = np.array([donor_group[d] == GROUP_B for d in donor_names],
+                             dtype=bool)
+        ctrl_mask = np.array([donor_group[d] == GROUP_A for d in donor_names],
+                             dtype=bool)
+        keep_gene = sums.sum(axis=0) > 0
+        if not keep_gene.any():
+            meta["status"] = "skipped_no_counts"
+            pb_meta[ct] = meta
+            pb_rows.append({"celltype": ct, "gene": "NA", "gene_symbol": "NA",
+                            "n_donors_case": n_case, "n_donors_ctrl": n_ctrl,
+                            "log2fc": np.nan, "p_value": np.nan,
+                            "p_adj": np.nan, "method": "not_tested",
+                            "status": "skipped_no_counts"})
+            log("  [%s] pseudobulk 跳过：聚合 counts 全为 0" % ct)
+            continue
+        sums = sums[:, keep_gene]
+        libs = sums.sum(axis=1)
+        if (libs <= 0).any():
+            fail("%s pseudobulk 存在 counts 总量为 0 的供体" % ct)
+        logcpm = np.log2(sums / libs[:, None] * 1e6 + 1.0)
+        log2fc = (logcpm[case_mask, :].mean(axis=0)
+                  - logcpm[ctrl_mask, :].mean(axis=0))
+        kept_positions = np.flatnonzero(keep_gene)
+        kept_ids = gene_ids[kept_positions]
+        method_used = PSEUDOBULK_FALLBACK
+        pvals = None
+        padj = None
+        if r_backend is not None:
+            rmap, rerr = run_pseudobulk_r(
+                rscript, r_backend, sums.T, kept_ids, donor_names,
+                donor_group, tmpdir,
+            )
+            if rmap is None:
+                log("  [%s] R backend %s 失败，回落 %s: %s"
+                    % (ct, r_backend, PSEUDOBULK_FALLBACK,
+                       rerr.replace("\n", " ")[:300]))
+                r_fail_streak += 1
+                if r_fail_streak >= 3:
+                    log("R backend 连续失败 %d 次，后续 celltype 改用 %s"
+                        % (r_fail_streak, PSEUDOBULK_FALLBACK))
+                    r_backend = None
+            else:
+                r_fail_streak = 0
+                raw_p = np.array(
+                    [rmap.get(str(g), (np.nan, np.nan))[0] for g in kept_ids],
+                    dtype=float,
+                )
+                raw_q = np.array(
+                    [rmap.get(str(g), (np.nan, np.nan))[1] for g in kept_ids],
+                    dtype=float,
+                )
+                if np.isfinite(raw_p).sum() == 0:
+                    log("  [%s] R backend %s 返回全 NA p 值，回落 %s"
+                        % (ct, r_backend, PSEUDOBULK_FALLBACK))
+                else:
+                    # DESeq2 独立过滤会给低计数基因 NA，保守按 1.0 记录。
+                    finite_both = np.isfinite(raw_p) & np.isfinite(raw_q)
+                    pvals = np.where(finite_both, raw_p, 1.0)
+                    padj = np.where(finite_both, raw_q, 1.0)
+                    pvals = np.clip(pvals, 0.0, 1.0)
+                    padj = np.clip(padj, 0.0, 1.0)
+                    method_used = r_backend
+        if pvals is None:
+            pvals, _ = welch_pvalues(logcpm, case_mask, ctrl_mask)
+            padj = bh_adjust(pvals)
+        n_adj = int((padj < ALPHA).sum())
+        meta.update({"status": "ok", "method": method_used,
+                     "n_genes_tested": int(keep_gene.sum()),
+                     "n_p_adj_lt_alpha": n_adj})
+        pb_meta[ct] = meta
+        for pos, gid in enumerate(kept_ids):
+            pb_rows.append({
+                "celltype": ct, "gene": str(gid),
+                "gene_symbol": str(gene_symbols[kept_positions[pos]]),
+                "n_donors_case": n_case, "n_donors_ctrl": n_ctrl,
+                "log2fc": round(float(log2fc[pos]), 6),
+                "p_value": float(pvals[pos]), "p_adj": float(padj[pos]),
+                "method": method_used, "status": "ok",
+            })
+        log("  [%s] pseudobulk case(%s)=%d ctrl(%s)=%d genes=%d adj_p<%.2f=%d method=%s"
+            % (ct, GROUP_B, n_case, GROUP_A, n_ctrl, int(keep_gene.sum()),
+               ALPHA, n_adj, method_used))
+
+pb_df = pd.DataFrame(pb_rows, columns=PB_COLUMNS)
+pb_methods = sorted({str(m.get("method")) for m in pb_meta.values()
+                     if m.get("status") == "ok"})
+if not pb_methods:
+    pb_method_summary = ("not_tested_no_celltype_with_%d_donors_per_group"
+                         % MIN_DONORS_PER_GROUP)
+else:
+    pb_method_summary = ",".join(pb_methods)
+log("pseudobulk method summary: %s" % pb_method_summary)
+
+# --- 3. 自校验 + 不变量 ---
+n_ok = sum(1 for m in per_ct_meta.values() if m["status"] == "ok")
+if n_ok == 0:
+    fail("没有任何 celltype 达到细胞数门槛（%s vs %s）" % (GROUP_A, GROUP_B))
+
+if not set(PB_COLUMNS) <= set(pb_df.columns):
+    fail("pseudobulk 缺列 %s" % sorted(set(PB_COLUMNS) - set(pb_df.columns)))
+if len(pb_df) == 0:
+    fail("pseudobulk 产物为空")
+allowed_pb_status = {"ok", "skipped_insufficient_donors", "skipped_no_counts"}
+bad_pb_status = sorted(set(pb_df["status"].astype(str)) - allowed_pb_status)
+if bad_pb_status:
+    fail("pseudobulk 出现未知 status %s" % bad_pb_status)
+missing_pb_ct = sorted(set(celltypes) - set(pb_df["celltype"].astype(str)))
+if missing_pb_ct:
+    fail("pseudobulk 缺 celltype %s" % missing_pb_ct)
+ok_pb = pb_df[pb_df["status"] == "ok"]
+if len(ok_pb):
+    pv_ok = ok_pb["p_value"].to_numpy(dtype=float)
+    qv_ok = ok_pb["p_adj"].to_numpy(dtype=float)
+    fc_ok = ok_pb["log2fc"].to_numpy(dtype=float)
+    if not (np.all(np.isfinite(pv_ok)) and np.all(np.isfinite(qv_ok))):
+        fail("pseudobulk ok 行 p 值有非有限值")
+    if not np.all(np.isfinite(fc_ok)):
+        fail("pseudobulk ok 行 log2fc 有非有限值")
+    if ((pv_ok < -1e-12) | (pv_ok > 1 + 1e-12)).any():
+        fail("pseudobulk p_value 越界 [0,1]")
+    if ((qv_ok < -1e-12) | (qv_ok > 1 + 1e-12)).any():
+        fail("pseudobulk p_adj 越界 [0,1]")
+skip_pb = pb_df[pb_df["status"] == "skipped_insufficient_donors"]
+for _, row in skip_pb.iterrows():
+    if (int(row["n_donors_case"]) >= MIN_DONORS_PER_GROUP
+            and int(row["n_donors_ctrl"]) >= MIN_DONORS_PER_GROUP):
+        fail("pseudobulk 把供体充足的 celltype %s 标成 skipped"
+             % row["celltype"])
+
+if _nnz(adata.X) != x_nnz_before:
+    fail("X nnz 被改变")
+if _nnz(adata.layers["counts"]) != counts_nnz_before:
+    fail("counts 层 nnz 被改变")
+if not np.array_equal(adata.obsm["X_pca"], pca_before):
+    fail("X_pca 被改动")
+if not np.array_equal(adata.obsm["X_umap"], umap_before):
+    fail("X_umap 被改动")
+if not adata.obs["leiden"].astype(str).equals(leiden_before.astype(str)):
+    fail("leiden 列被改动")
+if not adata.obs["celltype"].astype(str).equals(ct_before.astype(str)):
+    fail("celltype 列被改动")
+
+# --- 4. 落盘 ---
+# 4.1 全表 tsv（含未显著行便于复查）
+df_all = pd.DataFrame(all_rows, columns=[
+    "celltype", "rank", "ensembl_id", "gene_symbol", "log2fc", "pvals_adj",
+    "pts_a", "pts_b", "direction", "significant"])
+df_all.to_csv("deg_all_by_celltype.tsv", sep="\t", index=False)
+log("wrote deg_all_by_celltype.tsv (%d 行)" % len(df_all))
+
+# 4.2 显著表 tsv
+df_sig = pd.DataFrame(sig_gene_rows, columns=[
+    "celltype", "rank", "ensembl_id", "gene_symbol", "log2fc", "pvals_adj",
+    "pts_a", "pts_b", "direction", "significant"])
+if len(df_sig):
+    df_sig = df_sig.sort_values(["celltype", "pvals_adj"])
+df_sig.to_csv("deg_significant_by_celltype.tsv", sep="\t", index=False)
+log("wrote deg_significant_by_celltype.tsv (%d 行)" % len(df_sig))
+
+# 4.3 供体级 pseudobulk 表
+pb_df.to_csv(PSEUDOBULK_OUTPUT, sep="\t", index=False)
+log("wrote %s (%d 行)" % (PSEUDOBULK_OUTPUT, len(pb_df)))
+
+# 4.4 h5ad：obs 贴 cell 级 + uns 口径
+# cell 级列：该 cell 所在 celltype 的显著基因数与其本人在显著表的排名（无则 -1）
+sig_count_by_ct = {ct: int(m["n_sig"]) for ct, m in per_ct_meta.items()
+                   if m.get("status") == "ok"}
+adata.obs["deg_sig_gene_count"] = [sig_count_by_ct.get(c, 0) for c in ct_arr]
+adata.obs["deg_group_level"] = GROUP_LEVEL
+
+top_by_ct = {}
+for ct in sorted({r["celltype"] for r in sig_gene_rows}):
+    rows = [r for r in sig_gene_rows if r["celltype"] == ct]
+    rows = sorted(rows, key=lambda r: r["pvals_adj"])[:20]
+    top_by_ct["ct%d" % (sorted({r["celltype"] for r in sig_gene_rows}).index(ct) + 1)] = {
+        "celltype": ct,
+        # pts 缺失统一用 -1（anndata uns 禁 None）
+        "top": [{"gene": r["gene_symbol"], "ensembl_id": r["ensembl_id"],
+                 "log2fc": r["log2fc"], "adj_p": r["pvals_adj"],
+                 "pts_a": -1.0 if r["pts_a"] is None else r["pts_a"],
+                 "pts_b": -1.0 if r["pts_b"] is None else r["pts_b"]} for r in rows],
+    }
+
+adata.uns["deg"] = {
+    "method": "per_celltype_wilcoxon_lognorm_BH",
+    "note": "逐 celltype 内做 %s 两组比较（%s vs %s）；表达矩阵从 layers['counts']"
+            "重算 log 归一化（normalize_total(1e4)+log1p，复现步骤 3 口径；"
+            "不用 adata.X 因步骤 4 已把它换成 scale z-score 会致 log2 出 nan）；"
+            "wilcoxon 秩检验对单调变换不变；BH 校正作用于每 celltype 内全部基因；"
+            "DEG 判据固定 adj p<%.2f 且 |log2fc|>%.1f，阈值不随结果调整"
+            % (GROUP_LEVEL, GROUP_A, GROUP_B, ALPHA, MIN_ABS_LOG2FC),
+    "seed": SEED,
+    "alpha": ALPHA,
+    "min_abs_log2fc": MIN_ABS_LOG2FC,
+    "group_level": GROUP_LEVEL,
+    "group_a": GROUP_A,
+    "group_b": GROUP_B,
+    "min_cells_per_group": MIN_CELLS_PER_GROUP,
+    "n_celltypes": len(celltypes),
+    "n_celltypes_ok": int(n_ok),
+    # anndata uns 禁 list-of-dicts（含 None 时 TypeError，坑 #122 同源），落 JSON
+    "per_celltype_json": json.dumps(per_ct_meta, ensure_ascii=False, sort_keys=True),
+    "n_sig_total": int(len(df_sig)),
+    # top_by_celltype 是嵌套 list-of-dicts，anndata uns 无法序列化（坑 #122 同源）
+    "top_by_celltype_json": json.dumps(top_by_ct, ensure_ascii=False, sort_keys=True),
+    "confound_note": "DEG 是表达变化不是调控变化；%s 与 region 不独立（healthy 供体"
+                     "只贡献 region=H），组间差异含供体结构效应；DR 基因由步骤 9 负责"
+                     % GROUP_LEVEL,
+    "source_h5ad": src_path,
+}
+adata.uns["deg"].update({
+    "cell_level_scope": "exploratory_cell_level",
+    "cell_level_caveat": "逐细胞 Wilcoxon 把细胞当独立观测，p 值随细胞数膨胀，"
+                         "仅用于探索与排序，不构成供体水平显著性结论",
+    "pseudobulk_output": PSEUDOBULK_OUTPUT,
+    "pseudobulk_design": "donor x celltype raw counts aggregated from "
+                         "layers['counts']；log2fc 与轻量 fallback 用 "
+                         "CPM + log2(CPM+1)，DESeq2/edgeR/limma-voom 用原始计数",
+    "pseudobulk_method": pb_method_summary,
+    "pseudobulk_r_backend_available": r_backend_probed or "none",
+    "n_donors_case": int(n_donors_case),
+    "n_donors_ctrl": int(n_donors_ctrl),
+    "min_donors_per_group": MIN_DONORS_PER_GROUP,
+    "pseudobulk_limitations": "供体级检验以 donor 为独立单位；fallback"
+                              "（donor-level Welch t + BH）只用于筛选，不能替代 "
+                              "DESeq2/edgeR/limma-voom 的发表级推断；R 侧独立过滤"
+                              "产生的 NA p 值按 1.0 记录；零计数基因不进入检验",
+    "pseudobulk_per_celltype_json": json.dumps(pb_meta, ensure_ascii=False,
+                                               sort_keys=True),
+})
+adata.write_h5ad("scrna_deg.h5ad")
+log("wrote scrna_deg.h5ad (%d cells)" % adata.shape[0])
+
+# 4.5 报告
+lines = [
+    "step=deg_groups",
+    "seed=%d" % SEED,
+    "method=exploratory cell-level per_celltype wilcoxon on counts + BH"
+    "（cell-level 筛选阈值 adj p<%.2f 且 |log2fc|>%.1f）" % (ALPHA, MIN_ABS_LOG2FC),
+    "cell_level_scope=exploratory_cell_level",
+    "cell_level_caveat=逐细胞 Wilcoxon 把细胞当独立观测，p 值随细胞数膨胀，"
+    "仅用于探索与排序，不构成供体水平显著性结论",
+    "group=%s（%s vs %s）" % (GROUP_LEVEL, GROUP_A, GROUP_B),
+    "pseudobulk_method=%s" % pb_method_summary,
+    "pseudobulk_r_backend_available=%s" % (r_backend_probed or "none"),
+    "pseudobulk_design=donor x celltype raw counts from layers['counts']；"
+    "log2fc 与轻量 fallback 用 CPM + log2(CPM+1)，DESeq2/edgeR/limma-voom "
+    "用原始计数",
+    "n_donors_case=%d（%s）" % (n_donors_case, GROUP_B),
+    "n_donors_ctrl=%d（%s）" % (n_donors_ctrl, GROUP_A),
+    "min_donors_per_group=%d" % MIN_DONORS_PER_GROUP,
+    "pseudobulk_limitations=fallback（donor-level Welch t + BH）只用于筛选，"
+    "不能替代 DESeq2/edgeR/limma-voom 的发表级推断；R 侧独立过滤产生的 NA p 值"
+    "按 1.0 记录；零计数基因不进入检验",
+    "confound_note=diagnosis 与 region 不独立（healthy 供体只贡献 region=H）；"
+    "DEG 是表达变化不是调控变化，DR 基因由步骤 9 scTenifoldKnk 负责",
+    "n_celltypes=%d ok=%d" % (len(celltypes), n_ok),
+    "n_sig_total=%d" % len(df_sig),
+    "per_celltype:",
+]
+for ct in sorted(per_ct_meta):
+    m = per_ct_meta[ct]
+    lines.append("  %-28s status=%-24s cells=%-5d (%s=%d/%s=%d) sig=%d"
+                 % (ct, m["status"], m["n_cells"], GROUP_A, m["n_a"], GROUP_B, m["n_b"],
+                    m.get("n_sig", 0)))
+lines.append("")
+lines.append("pseudobulk_by_celltype:")
+for ct in sorted(pb_meta):
+    m = pb_meta[ct]
+    lines.append("  %-28s status=%-26s n_donors_case=%-3d n_donors_ctrl=%-3d "
+                 "genes=%-5d adj_p<%.2f=%d method=%s"
+                 % (ct, m["status"], m["n_donors_case"], m["n_donors_ctrl"],
+                    m.get("n_genes_tested", 0), ALPHA,
+                    m.get("n_p_adj_lt_alpha", 0), m.get("method", "not_tested")))
+if top_by_ct:
+    lines.append("")
+    lines.append("top_sig_by_celltype:")
+    for key in sorted(top_by_ct, key=lambda k: int(k[2:])):
+        entry = top_by_ct[key]
+        lines.append("  [%s]" % entry["celltype"])
+        for r in entry["top"][:10]:
+            lines.append("    %-14s log2fc=%+.3f adj_p=%.4g pts(%s)=%.3f pts(%s)=%.3f"
+                         % (r["gene"], r["log2fc"], r["adj_p"], GROUP_A, r["pts_a"] or 0,
+                            GROUP_B, r["pts_b"] or 0))
+lines.append("")
+lines.append("elapsed_seconds=%.1f" % (time.time() - START))
+lines.append("outputs=scrna_deg.h5ad, deg_all_by_celltype.tsv, "
+             "deg_significant_by_celltype.tsv, deg_pseudobulk_by_celltype.tsv")
+with open("deg_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(lines) + "\n")
+log("deg_groups_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "${DEG_OUTDIR:-$(pwd)}" "deg_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

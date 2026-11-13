@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+# scenic_figures：line2_scrna SCENIC 结果出图（读步骤 19 产物，产 PNG 供目视审核）。
+#
+# PROVENANCE: INDEPENDENT  本脚本出图代码为独立实现，未派生自 reference/05.可参考出图代码 的源码；
+#   参考库仅用于风格与手法借鉴，不构成代码派生关系。
+# 输入（同 cwd）：scenic_regulon_by_celltype.tsv + scenic_tf_summary.tsv
+# 输出（写到 ../figures/）：
+#   l2_scenic_01_regulon_heatmap.png   top-30 regulon x celltype 活性热图
+#   l2_scenic_02_top_regulons.png      top-20 regulon 特异性 z 条形图（标注首选 celltype）
+# 口径：docs/figure_spec.md（Agg/300dpi/英文标签；图注置于坐标轴框外，
+#       横版图在下方横向一行，竖版图在右上角纵向多行）。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+declare -a INPUTS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+for f in scenic_regulon_by_celltype.tsv scenic_tf_summary.tsv; do
+  [ -f "$f" ] || { echo "缺少必需输入：$f（步骤 19 产物）" >&2; exit 2; }
+done
+
+echo "step_executed=scenic_figures"
+echo "bioanalys_seed=${seed}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+python3 - <<'PYSCRIPT'
+import os
+import sys
+import time
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+plt.rcParams.update({
+    "figure.dpi": 300, "savefig.dpi": 300, "font.size": 8, "font.family": "sans-serif", "font.sans-serif": ["Arial", "Helvetica", "Liberation Sans", "DejaVu Sans"], "axes.labelsize": 8, "xtick.labelsize": 8, "ytick.labelsize": 8, "legend.fontsize": 8, "legend.title_fontsize": 8,
+    "axes.titlesize": 9, "axes.grid": False,
+    "figure.autolayout": True, "savefig.bbox": "tight",
+    "image.cmap": "viridis",
+})
+
+START = time.time()
+OUT = "../figures"
+D = os.getcwd()
+os.makedirs(OUT, exist_ok=True)
+made = []
+render_ms = []   # 逐图渲染耗时 (name, ms)，写进 figures_manifest 供超时审计
+
+def log(m):
+    print(m, flush=True)
+
+def save(fig, name):
+    # 逐图计时（Argon 第 65 轮 Q3/Q4）：单图 30s 设计目标 / 60s 硬上限。
+    # 计时进 manifest，超时从「不可见」变成「回执可查」，不必为查超时连 K40 真跑。
+    _t0 = time.perf_counter()
+    fig.savefig(os.path.join(OUT, name))
+    plt.close(fig)
+    _ms = (time.perf_counter() - _t0) * 1000.0
+    made.append(name)
+    render_ms.append((name, _ms))
+    log("wrote %s render_ms=%.1f" % (name, _ms))
+
+def caption(fig, *parts):
+    """图注默认置于图幅左下角、轴框之外（y<0），靠 savefig(bbox="tight")
+    向下扩边容纳，因此不占用、也不挤压主图数据区（2026-11-06 用户裁定）。
+    不再按图幅横竖分支选位置：旧规范把竖版图注放右上，会与图例列抢空间。"""
+    parts = [str(p) for p in parts if p not in (None, "")]
+    if not parts:
+        return
+    text = "\n".join(parts)
+    fig.text(0.01, -0.02, text, ha="left", va="top", fontsize=8, linespacing=1.5)
+def wrap_label(text, width=18):
+    """长标签换行：超宽标签优先按 _ 边界折行，仍超宽再按字符折行，防溢出图框。"""
+    import textwrap
+
+    s = str(text)
+    if len(s) <= width:
+        return s
+    lines, cur = [], ""
+    for part in s.split("_"):
+        joined = part if not cur else cur + "_" + part
+        if cur and len(joined) > width:
+            lines.append(cur)
+            cur = part
+        else:
+            cur = joined
+    if cur:
+        lines.append(cur)
+    if max(len(x) for x in lines) <= width:
+        return "\n".join(lines)
+    out = []
+    for line in lines:
+        out.extend(textwrap.wrap(line, width=width) or [line])
+    return "\n".join(out)
+
+def fit_text_edges(fig, ax, gap=6.0, rounds=5):
+    """把越出坐标轴框的轴内文本收进框内：右缘/顶缘/左缘/下缘越界时自动扩 xlim/ylim。
+    实测像素宽度迭代收敛（至少留 6px 边距，比审计容差 3px 更严），柱顶数值标注与条形
+    末端外挂标注都按同一规则留位；若扩一轮越界没有改善（文本框锚在轴坐标而非数据坐标）
+    就停手，防无意义放大把主图压扁。"""
+    prev = None
+    for _ in range(rounds):
+        fig.canvas.draw()
+        rend = fig.canvas.get_renderer()
+        bb = ax.get_window_extent()
+        boxes = [t.get_window_extent(renderer=rend) for t in ax.texts
+                 if t.get_text().strip()]
+        if not boxes:
+            return
+        bw = max(bb.width, 1e-6)
+        bh = max(bb.height, 1e-6)
+        right = max(b.x1 for b in boxes) - bb.x1
+        top = max(b.y1 for b in boxes) - bb.y1
+        left = bb.x0 - min(b.x0 for b in boxes)
+        bottom = bb.y0 - min(b.y0 for b in boxes)
+        if max(right, top, left, bottom) <= gap:
+            return
+        worst = max(right / bw, top / bh, left / bw, bottom / bh)
+        if prev is not None and worst >= prev * 0.98:
+            return
+        prev = worst
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
+        if right > gap:
+            ax.set_xlim(x0, x1 + (x1 - x0) * (right / bw) * 1.15)
+            x0, x1 = ax.get_xlim()
+        if left > gap:
+            ax.set_xlim(x0 - (x1 - x0) * (left / bw) * 1.15, x1)
+            x0, x1 = ax.get_xlim()
+        if top > gap:
+            ax.set_ylim(y0, y1 + (y1 - y0) * (top / bh) * 1.15)
+            y0, y1 = ax.get_ylim()
+        if bottom > gap:
+            ax.set_ylim(y0 - (y1 - y0) * (bottom / bh) * 1.15, y1)
+
+def legend_out(ax, fig, leg, slot=0):
+    """图例统一置坐标轴框外右侧、纵向排列（用户 2026-11-07 定稿）。
+    多组图例按 slot 依次向右横排（每组各自纵向单列），互不重叠。
+    不再按图幅横竖分支把图例放到轴框下方。"""
+    handles = list(leg.legend_handles)
+    labels = [t.get_text() for t in leg.get_texts()]
+    title = leg.get_title().get_text() or None
+    fig.set_layout_engine("none")
+    x = 1.02 + 0.30 * slot
+    ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(x, 1.0),
+              ncol=1, fontsize=8, frameon=False, title=title)
+    fig.subplots_adjust(right=max(0.60, 0.80 - 0.06 * slot))
+
+def layout_fix(fig):
+    """落盘前统一收口（docs/figure_spec.md v2.2 §三之三）：
+    1) 单坐标轴图的图例外置：一律置轴框外右侧，纵向排布、不压数据；
+    2) 轴内文本右缘/顶缘/左缘/下缘越出坐标轴框时自动扩 xlim/ylim 收进框内。
+    多子图（分面）图不做图例搬迁：分面各有自己的图例，统一外移会互相压扁。
+    tick 标签一律不动：它本就在轴框外，savefig.bbox="tight" 会把画布扩到装下它；
+    强行换行反而让多行标签在密集类目轴上互相压字（实测见踩坑台账）。"""
+    from matplotlib.colorbar import Colorbar
+
+    axes = [a for a in fig.get_axes() if not isinstance(a, Colorbar)]
+    if not axes:
+        return
+    if len(axes) == 1:
+        legs = [l for l in (axes[0].get_legend(),) if l is not None]
+        for slot, leg in enumerate(legs):
+            legend_out(axes[0], fig, leg, slot=slot)
+        fit_text_edges(fig, axes[0])
+
+# 输入数据溯源（Argon 第 65 轮 B4）：只记产物清单时，「这张图由哪份数据渲染」不可证。
+# 大文件分级：超 500MB 全量读哈希会把 K40 的 I/O 拖死，改为 size + 首尾各 1MB 采样。
+LARGE_FILE_BYTES = 500 * 1024 * 1024
+SAMPLE_WINDOW = 1024 * 1024
+
+
+def _sha256_of(path):
+    """常规文件全量 sha256；超大文件退回「size + 首尾各 1MB」指纹。"""
+    import hashlib
+    size = os.path.getsize(path)
+    h = hashlib.sha256()
+    if size <= LARGE_FILE_BYTES:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(SAMPLE_WINDOW), b""):
+                h.update(chunk)
+        return "full:" + h.hexdigest()
+    h.update(("size=%d;" % size).encode("utf-8"))
+    with open(path, "rb") as fh:
+        h.update(fh.read(SAMPLE_WINDOW))
+        if size > 2 * SAMPLE_WINDOW:
+            fh.seek(-SAMPLE_WINDOW, os.SEEK_END)
+            h.update(fh.read(SAMPLE_WINDOW))
+    return "sampled:" + h.hexdigest()
+
+
+def input_fingerprints(workdir, names):
+    """把本步读取的输入表算成指纹，键按文件名稳定排序。"""
+    rows = []
+    for name in sorted(names):
+        p = os.path.join(workdir, name)
+        if not os.path.isfile(p):
+            continue
+        try:
+            rows.append((name, _sha256_of(p)))
+        except OSError as exc:
+            rows.append((name, "unreadable:" + type(exc).__name__))
+    return rows
+
+
+def _install_layout_guard():
+
+    """装一次全局收口：脚本内任何 fig.savefig 落盘前先走 layout_fix()，
+    以后新增图自动套版式规则，不靠人记得调用（docs/figure_spec.md v2.2 §三之三）。"""
+    from matplotlib.figure import Figure
+
+    if getattr(Figure.savefig, "_layout_guard", False):
+        return
+    orig = Figure.savefig
+
+    def guarded(self, fname, *a, **kw):
+        layout_fix(self)
+        return orig(self, fname, *a, **kw)
+
+    guarded._layout_guard = True
+    guarded._orig_savefig = orig
+    Figure.savefig = guarded
+
+_install_layout_guard()
+
+byct = pd.read_csv("scenic_regulon_by_celltype.tsv", sep="\t", index_col=0)
+summary = pd.read_csv("scenic_tf_summary.tsv", sep="\t")
+log("by_celltype=%s summary=%d" % (byct.shape, len(summary)))
+
+# --- 01 top-30 regulon x celltype 活性热图（列 z-score 便于跨 regulon 比较） ---
+top30 = summary.head(30)["regulon"].tolist()
+
+# 产物清单落盘：只打 stdout 的话，任务重跑与事后核对时清单就沦了。
+# 写一份 manifest 到 figures/，让“exit 0 但产物落别处”可核对。
+try:
+    _man = os.path.join(OUT, "figures_manifest.txt")
+    with open(_man, "w", encoding="utf-8") as _fh:
+        _fh.write("step=%s seed=%s out=%s count=%d elapsed=%.1fs%s" % (
+            os.path.basename(sys.argv[0]),
+            os.environ.get("BIOANALYS_SEED", "UNSET"),
+            OUT, len(made), time.time() - START, chr(10)))
+        for _name, _digest in input_fingerprints(D, ["scenic_regulons.csv","scenic_auc.csv","scenic_tf_summary.tsv","scenic_regulon_by_celltype.tsv"]):
+            _fh.write("input_sha256=%s=%s%s" % (_name, _digest, chr(10)))
+        for _rn, _rms in render_ms:
+            _fh.write("render_ms=%s=%.1f%s" % (_rn, _rms, chr(10)))
+        for _n in made:
+            _p = os.path.join(OUT, _n)
+            _sz = os.path.getsize(_p) if os.path.exists(_p) else -1
+            _fh.write("%s%s%d%s" % (_n, chr(9), _sz, chr(10)))
+    log("wrote figures_manifest.txt (%d entries)" % len(made))
+    try:
+        with open(_man, "a", encoding="utf-8") as _fh:
+            _fh.write("outputs=%s\n" % ", ".join(["figures_manifest.txt"] + list(made)))
+    except OSError as _exc:
+        log("WARN outputs append failed: %s" % _exc)
+except OSError as _exc:
+    log("WARN 产物清单落盘失败: %s" % _exc)
+mat = byct[top30]
+z = (mat - mat.mean(axis=0)) / (mat.std(axis=0) + 1e-12)
+fig, ax = plt.subplots(figsize=(13, 10))
+im = ax.imshow(z.T.to_numpy(), aspect="auto", cmap="RdBu_r", vmin=-2, vmax=2)
+ax.set_yticks(range(len(top30)))
+ax.set_yticklabels(top30, fontsize=8)
+ax.set_xticks(range(byct.shape[0]))
+ax.set_xticklabels(byct.index.tolist(), rotation=45, ha="right", fontsize=8)
+caption(fig, "line2 SCENIC: top-30 regulons (by specificity) x celltype activity",
+        "row = regulon, col = celltype, z-scored per regulon")
+fig.colorbar(im, ax=ax, shrink=0.6, label="z")
+save(fig, "l2_scenic_01_regulon_heatmap.png")
+
+# --- 02 top-20 regulon 特异性 z 条形图（标注首选 celltype） ---
+top20 = summary.head(20).iloc[::-1]
+fig, ax = plt.subplots(figsize=(9, 7))
+y = np.arange(len(top20))
+ax.barh(y, top20["specificity_z"].to_numpy(), color="#4C72B0")
+ax.set_yticks(y)
+ax.set_yticklabels(top20["regulon"].tolist(), fontsize=8)
+ax.set_xlabel("specificity z (top celltype vs mean)")
+for i, (_, r) in enumerate(top20.iterrows()):
+    ax.text(r["specificity_z"] + 0.03, i, wrap_label(r["top_celltype"]),
+            va="center", fontsize=8)
+caption(fig, "line2 SCENIC: top-20 regulons by celltype specificity",
+        "label = celltype with highest AUCell activity")
+save(fig, "l2_scenic_02_top_regulons.png")
+
+log("scenic_figures_done count=%d elapsed=%.1fs" % (len(made), time.time() - START))
+# 句柄兜底（figure_spec 第 3 节 / Argon 第 65 轮 Q3）：逐图 close(fig) 已在 save() 内执行，
+# 这里再 close("all") 兜住异常分支的残留图，防单步跑多图时峰值内存叠加。
+plt.close("all")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "$PWD/../figures" "figures_manifest.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

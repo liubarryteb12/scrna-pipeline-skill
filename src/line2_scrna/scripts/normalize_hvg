@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# normalize_hvg：line2_scrna 步骤 3 归一化 / 高变基因。
+#
+# 输入：步骤 2 产物 scrna_qc.h5ad（4587 细胞，含 ERCC 基因与 var['ercc'] 标志）。
+#
+# 做三件事：
+#   1. ERCC spike-in 剔除：spike-in 不是内源基因，留在库里会扭曲库大小归一化
+#      与高变基因选择（ERCC 等高表达会把 library size 和目标 sum 带偏）。
+#      剔除数量落报告，var['ercc'] 标志随行保留可追溯（本步从矩阵移除，不再保留行）。
+#   2. 归一化：scanpy normalize_total(target_sum=1e4) + log1p（Scanpy 流程标准口径，
+#      与 BJD 论文 Seurat 侧 LogNormalize(type='count') 数值等价：每细胞缩放到 1e4 后取 log）。
+#      原始整数计数存 layers['counts']，不丢。
+#   3. 高变基因：seurat flavor，n_top_genes=2000（论文默认口径；按 dispersion 选，
+#      不按均值，高表达管家基因不必然入选）。全数据集选取，未按供体分batch；
+#      步骤 4 整合如需 per-batch HVG 再重选，参数与结论以本步报告为准。
+#
+# 自校验内建：输入契约（qc_thresholds/disposition 在 uns）、库大小归一化后全等于
+# 1e4（1e-4 容差）、X 全有限非负、HVG 数精确 2000、无 ERCC 残留、
+# layers['counts'] 与 X 同形且为整数、obs 19 列不丢。任一不过非零退出。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入分流：一个 h5ad（步骤 2 产物）。模式前后都带 *：拿到的是绝对路径，
+# 前缀匹配永远不中（坑 #99）。
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+h5ad_file=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *.h5ad) h5ad_file="$path" ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad，即步骤 2 qc_cells 产物）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$h5ad_file" ]; then
+  echo "缺少必需输入：scrna_qc.h5ad（步骤 2 产物）未提供" >&2
+  exit 2
+fi
+if [ ! -f "$h5ad_file" ]; then
+  echo "输入文件不存在: $h5ad_file"
+  exit 2
+fi
+
+echo "step_executed=normalize_hvg"
+echo "bioanalys_seed=${seed}"
+echo "input_h5ad=${h5ad_file}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+H5AD_FILE="$h5ad_file" BIOANALYS_SEED="$seed" \
+python3 - <<'PYSCRIPT'
+import hashlib
+import os
+import sys
+import time
+
+import numpy as np
+import anndata as ad
+import scanpy as sc
+
+# pandas 3 与 2 的 infer_string 默认值不同，会导致 anndata 0.13 写 obs 字符串列时
+# 因 nullable strings 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+TARGET_SUM = 1e4
+N_TOP_GENES = 2000
+
+
+def fail(message):
+    sys.stderr.write("normalize_hvg 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+h5ad_file = os.environ["H5AD_FILE"]
+seed = os.environ["BIOANALYS_SEED"]
+
+adata = ad.read_h5ad(h5ad_file)
+log("loaded cells=%d genes=%d" % adata.shape)
+
+# --- 1. 输入契约校验：必须是步骤 2 产物 ---
+required_obs = ["donor", "diagnosis", "region", "group", "class", "plate", "well",
+                "celltype_paper", "seurat_cluster_paper"]
+missing_obs = [col for col in required_obs if col not in adata.obs.columns]
+if missing_obs:
+    fail("输入 h5ad 缺少 obs 列 %s（不是 qc_cells 产物？）" % missing_obs)
+if "ercc" not in adata.var.columns:
+    fail("输入 h5ad 缺少 var['ercc']（不是 ingest_counts/qc_cells 产物？）")
+for key in ["qc_thresholds", "qc_doublet_disposition"]:
+    if key not in adata.uns:
+        fail("输入 h5ad 缺少 uns['%s']（不是 qc_cells 产物？）" % key)
+if (adata.obs["class"] == "doublet").any():
+    fail("输入 h5ad 仍含 doublet 细胞（qc_cells 应已排除）")
+
+# --- 2. ERCC 剔除（在归一化前）---
+ercc_mask = adata.var["ercc"].to_numpy(dtype=bool)
+ercc_count = int(ercc_mask.sum())
+adata = adata[:, ~ercc_mask].copy()
+log("ercc removed=%d genes_after=%d" % (ercc_count, adata.shape[1]))
+
+# --- 3. 原始计数存 layers（normalize_total 会原地改 X，必须先存）---
+counts_layer = adata.X.copy()
+if not np.issubdtype(counts_layer.dtype, np.integer):
+    fail("layers['counts'] 不是整数 dtype（qc_cells 产物应为 int32 计数）")
+adata.layers["counts"] = counts_layer
+
+# --- 4. 归一化 + log ---
+# 库大小检查必须在 log1p 之前：归一化后每细胞总和才等于 target_sum，
+# log1p 之后求和对象变成 log 值，没有 1e4 语义。
+#
+# 为什么不用 sc.pp.normalize_total：它的实现是
+#   x.data = op(x.data, np.repeat(scaling_array, np.diff(x.indptr)))
+# 会造一个与 nnz 等长的临时数组。nnz 2.1 亿时该临时数组 802 MiB，叠加原始矩阵与
+# layers['counts'] 后顶破 7.5GB RLIMIT（2026-11-05 在 k40 上以 GSE185100 实测
+# _ArrayMemoryError）。这里按行块就地缩放，临时量只有块大小，数值语义与
+# normalize_total(target_sum=1e4) 逐字等价（每细胞先除以自身库大小再乘 target_sum）。
+BLOCK_ROWS = 4000
+X = adata.X.tocsr()
+if not np.issubdtype(X.dtype, np.floating):
+    X = X.astype(np.float32)
+indptr = X.indptr
+row_nnz = np.diff(indptr)
+lib_size = np.asarray(X.sum(axis=1)).ravel().astype(np.float64)
+if (lib_size <= 0).any():
+    fail("有 %d 个细胞库大小为 0，归一化会出 NaN" % int((lib_size <= 0).sum()))
+scaling = (TARGET_SUM / lib_size).astype(np.float32)
+data = X.data
+for start in range(0, adata.n_obs, BLOCK_ROWS):
+    stop = min(start + BLOCK_ROWS, adata.n_obs)
+    lo, hi = int(indptr[start]), int(indptr[stop])
+    block_scale = np.repeat(scaling[start:stop], row_nnz[start:stop])
+    data[lo:hi] *= block_scale
+    del block_scale
+adata.X = X
+lib_after = np.asarray(X.sum(axis=1)).ravel()
+if not np.allclose(lib_after, TARGET_SUM, rtol=1e-4, atol=1e-2):
+    fail("归一化后库大小不都等于 %g（min=%.6f max=%.6f）" % (TARGET_SUM, lib_after.min(), lib_after.max()))
+np.log1p(data, out=data)
+if not np.isfinite(adata.X.data).all():
+    fail("log1p 后 X 含非有限值")
+if adata.X.data.size and adata.X.data.min() < 0:
+    fail("log1p 后 X 含负值")
+log("normalize_total+log1p OK lib=%.4f" % float(np.median(lib_after)))
+
+# --- 5. 高变基因（seurat flavor， dispersion 口径，无随机性）---
+sc.pp.highly_variable_genes(adata, flavor="seurat", n_top_genes=N_TOP_GENES)
+hvg_mask = adata.var["highly_variable"].to_numpy(dtype=bool)
+hvg_count = int(hvg_mask.sum())
+if hvg_count != N_TOP_GENES:
+    fail("HVG 数量 %d != 预期 %d" % (hvg_count, N_TOP_GENES))
+if "ercc" in adata.var.columns and bool(adata.var["ercc"].any()):
+    fail("HVG 步骤仍含 ERCC 基因行（步骤 2 应已剔除）")
+log("hvg=%d / %d" % (hvg_count, adata.shape[1]))
+
+# --- 6. 自校验 ---
+if adata.layers["counts"].shape != adata.X.shape:
+    fail("layers['counts'] 与 X 形状不一致")
+if not np.issubdtype(adata.layers["counts"].dtype, np.integer):
+    fail("layers['counts'] dtype 非整数")
+current_obs = list(adata.obs.columns)
+for col in required_obs:
+    if col not in current_obs:
+        fail("obs 列丢失: %s" % col)
+if adata.shape[0] == 0 or adata.shape[1] == 0:
+    fail("输出矩阵为空")
+log("self_check 契约/库大小/HVG/整数层/obs 列 OK")
+
+# --- 7. 落盘 ---
+adata.uns["normalization"] = {"method": "scanpy_normalize_total_log1p",
+                              "target_sum": TARGET_SUM}
+adata.uns["hvg"] = {"method": "scanpy_seurat_flavor", "n_top_genes": N_TOP_GENES,
+                    "batch_key": None}
+adata.uns["ercc_removed_count"] = ercc_count
+adata.uns["seed"] = int(seed)
+adata.uns["source_h5ad"] = h5ad_file
+adata.write_h5ad("scrna_norm.h5ad")
+
+hvg_table = adata.var.loc[hvg_mask, ["means", "dispersions", "dispersions_norm"]].copy()
+hvg_table = hvg_table.sort_values("dispersions_norm", ascending=False)
+hvg_table.to_csv("hvg_genes.tsv", sep="\t")
+
+report_lines = [
+    "step=normalize_hvg",
+    "seed=%s" % seed,
+    "input_h5ad=%s" % h5ad_file,
+    "cells=%d genes_in=%d" % (adata.shape[0], adata.shape[1] + ercc_count),
+    "ercc_removed=%d（spike-in 不进归一化与 HVG；剔除数如实记录）" % ercc_count,
+    "genes_after_ercc_removal=%d" % adata.shape[1],
+    "normalization=scanpy normalize_total(target_sum=%g) + log1p（与 Seurat LogNormalize 数值等价）" % TARGET_SUM,
+    "lib_size_after=全部细胞 %g（min=%.6f max=%.6f）" % (TARGET_SUM, lib_after.min(), lib_after.max()),
+    "counts_layer=layers['counts'] 原始整数计数已保留",
+    "hvg_method=seurat flavor, n_top_genes=%d（dispersion 口径，全数据集选取未分 batch）" % N_TOP_GENES,
+    "hvg_count=%d / %d" % (hvg_count, adata.shape[1]),
+    "hvg_mean_range=%.4f - %.4f" % (float(adata.var["means"][hvg_mask].min()),
+                                    float(adata.var["means"][hvg_mask].max())),
+    "hvg_dispersions_norm_range=%.4f - %.4f" % (float(adata.var["dispersions_norm"][hvg_mask].min()),
+                                                float(adata.var["dispersions_norm"][hvg_mask].max())),
+    "top20_hvg=%s" % " ".join(list(hvg_table.index[:20])),
+    "elapsed_seconds=%.0f" % (time.time() - START),
+    "outputs=scrna_norm.h5ad, hvg_genes.tsv, norm_report.txt",
+]
+with open("norm_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+for _artifact in sorted(os.listdir(".")):
+    if not os.path.isfile(_artifact):
+        continue
+    if _artifact == 'norm_report.txt':
+        continue
+    with open(_artifact, "rb") as _fh:
+        _digest = hashlib.sha256(_fh.read()).hexdigest()
+    with open('norm_report.txt', "a", encoding="utf-8") as _fh:
+        _fh.write("%s_sha256=%s\n" % (_artifact, _digest))
+log("normalize_hvg_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "$PWD" "norm_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

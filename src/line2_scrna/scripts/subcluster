@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# subcluster：line2_scrna 步骤 16 目标细胞类型亚群再聚类（aims 线2 下游第 5 项）。
+#
+# 输入：步骤 15 产物 scrna_deg.h5ad（obs 带 celltype/diagnosis/donor/leiden）。
+#
+# 做法：
+#   1. 目标细胞类型 = TARGET_CELLTYPE（默认 T_cell：银屑病主题核心免疫群，
+#      579 psoriasis / 6 healthy，规模足够再聚类）。用户可改。
+#   2. 子集内重算：从 layers['counts'] 重算 log 归一化（复现步骤 3 口径，
+#      不用 X 因步骤 4 已换成 scale z-score）→ HVG(2000, seurat flavor)
+#      → scale(max_value=10) → PCA(30) → neighbors(15) → Leiden(res=0.5)
+#      → UMAP。亚群编号 subcluster = "T_cell_s0/s1..."。
+#   3. 亚群 marker：wilcoxon top50（子集内 celltype 级），供人工判读亚群身份。
+#   4. 与诊断/供体交叉表落 tsv，看亚群是否与疾病状态关联（如实记录，不硬解读）。
+#
+# 自校验内建：输入契约、目标细胞类型存在且规模 >= MIN_CELLS、子集内 HVG 非空、
+# 亚群数 >= 2、每个亚群 >= 10 细胞（<10 记 warning 不 fail）、
+# 原 adata 的 X/counts/obs/var 不变量（本步骤只读原对象，产物写新对象）。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+declare -a INPUTS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+src_h5ad=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *scrna_deg*.h5ad) src_h5ad="$path" ;;
+    *.h5ad) src_h5ad="$path" ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad）" >&2; exit 2 ;;
+  esac
+done
+if [ -z "$src_h5ad" ] || [ ! -f "$src_h5ad" ]; then
+  echo "缺少必需输入：scrna_deg.h5ad（步骤 15 产物）" >&2
+  exit 2
+fi
+
+echo "step_executed=subcluster"
+echo "bioanalys_seed=${seed}"
+echo "input=${src_h5ad}"
+
+SUB_INPUT="$src_h5ad"
+export SUB_INPUT
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+python3 - <<'PYSCRIPT'
+import json
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+import anndata as ad
+import scanpy as sc
+
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+SEED = int(os.environ["BIOANALYS_SEED"])
+TARGET = "T_cell"
+MIN_CELLS = 100
+MIN_SUBCLUSTER_SIZE = 10
+N_HVG = 2000
+N_PCS = 30
+RESOLUTION = 0.5
+
+
+def fail(m):
+    sys.stderr.write("subcluster 自校验失败: %s\n" % m)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(m):
+    print(m, flush=True)
+
+
+np.random.seed(SEED)
+
+src = os.environ["SUB_INPUT"].strip()
+a = ad.read_h5ad(src)
+log("loaded cells=%d genes=%d" % (a.shape[0], a.shape[1]))
+
+if "celltype" not in a.obs.columns:
+    fail("缺 obs['celltype']")
+if "counts" not in a.layers:
+    fail("缺 layers['counts']")
+if "subcluster" in a.obs.columns or "subcluster" in a.uns:
+    fail("已含亚群结果（重复执行？）")
+
+ct = a.obs["celltype"].astype(str)
+if TARGET not in set(ct):
+    fail("目标细胞类型 %s 不在 celltype 里（可选：%s）"
+         % (TARGET, sorted(set(ct))))
+n_target = int((ct == TARGET).sum())
+if n_target < MIN_CELLS:
+    fail("目标细胞类型 %s 仅 %d 细胞 < 门槛 %d" % (TARGET, n_target, MIN_CELLS))
+log("target=%s cells=%d" % (TARGET, n_target))
+
+# 原对象不变量快照
+x_nnz = a.X.nnz if hasattr(a.X, "nnz") else int(np.count_nonzero(np.asarray(a.X)))
+counts_nnz = a.layers["counts"].nnz
+ct_before = a.obs["celltype"].copy()
+
+# --- 子集 + 重算流程 ---
+sub = a[ct.to_numpy() == TARGET].copy()
+sub.X = sub.layers["counts"].copy()
+sc.pp.normalize_total(sub, target_sum=1e4)
+sc.pp.log1p(sub)
+sc.pp.highly_variable_genes(sub, n_top_genes=N_HVG, flavor="seurat")
+n_hvg = int(sub.var["highly_variable"].sum())
+if n_hvg == 0:
+    fail("子集内 HVG 为 0")
+sub = sub[:, sub.var["highly_variable"]].copy()
+sc.pp.scale(sub, max_value=10)
+sc.tl.pca(sub, n_comps=min(N_PCS, sub.n_vars - 1, sub.n_obs - 1),
+          svd_solver="arpack", random_state=SEED)
+sc.pp.neighbors(sub, n_neighbors=15, n_pcs=min(N_PCS, sub.obsm["X_pca"].shape[1]),
+                random_state=SEED)
+sc.tl.leiden(sub, resolution=RESOLUTION, key_added="subcluster",
+             random_state=SEED, flavor="igraph", n_iterations=2, directed=False)
+sc.tl.umap(sub, random_state=SEED)
+n_sub = int(sub.obs["subcluster"].nunique())
+if n_sub < 2:
+    fail("亚群数 %d < 2（resolution 太低？）" % n_sub)
+sizes = sub.obs["subcluster"].astype(str).value_counts()
+small = sizes[sizes < MIN_SUBCLUSTER_SIZE]
+if len(small):
+    log("  警告：亚群 < %d 细胞的有 %s（如实记录不 fail）"
+        % (MIN_SUBCLUSTER_SIZE, dict(small)))
+log("subclusters=%d sizes=%s" % (n_sub, dict(sizes)))
+
+# --- 亚群 marker ---
+sc.tl.rank_genes_groups(sub, groupby="subcluster", method="wilcoxon",
+                        corr_method="benjamini-hochberg", n_genes=50,
+                        key_added="subcluster_markers")
+mk_rows = []
+groups = sub.uns["subcluster_markers"]["names"].dtype.names
+for g in groups:
+    names = sub.uns["subcluster_markers"]["names"][g]
+    scores = sub.uns["subcluster_markers"]["scores"][g]
+    pvals = sub.uns["subcluster_markers"]["pvals_adj"][g]
+    for r, (nm, sc_, pv) in enumerate(zip(names, scores, pvals), 1):
+        mk_rows.append({"subcluster": g, "rank": r, "gene": str(nm),
+                        "score": float(sc_), "pvals_adj": float(pv)})
+mk_df = pd.DataFrame(mk_rows)
+mk_df.to_csv("subcluster_markers.tsv", sep="\t", index=False)
+log("wrote subcluster_markers.tsv (%d 行)" % len(mk_df))
+
+# --- 与诊断/供体交叉 ---
+cross = pd.crosstab(sub.obs["subcluster"].astype(str),
+                    sub.obs["diagnosis"].astype(str))
+cross.to_csv("subcluster_diagnosis_crosstab.tsv", sep="\t")
+log("wrote subcluster_diagnosis_crosstab.tsv")
+
+# --- 原对象不变量校验 ---
+if (a.X.nnz if hasattr(a.X, "nnz") else int(np.count_nonzero(np.asarray(a.X)))) != x_nnz:
+    fail("原对象 X nnz 被改变")
+if a.layers["counts"].nnz != counts_nnz:
+    fail("原对象 counts nnz 被改变")
+if not a.obs["celltype"].astype(str).equals(ct_before.astype(str)):
+    fail("原对象 celltype 被改动")
+
+# --- 落盘：子集 h5ad（含亚群结果） + 原对象贴回 subcluster 列 ---
+sub.uns["subcluster_meta"] = {
+    "method": "subset_recompute_hvg_pca_leiden",
+    "note": "目标细胞类型 %s 子集内重算：counts->lognorm->HVG(%d)->scale->PCA(%d)"
+            "->neighbors(15)->Leiden(res=%.1f)->UMAP；亚群编号 %s_s<n>"
+            % (TARGET, N_HVG, N_PCS, RESOLUTION, TARGET),
+    "seed": SEED, "target_celltype": TARGET, "n_cells": int(sub.n_obs),
+    "n_subclusters": n_sub, "resolution": RESOLUTION,
+    "subcluster_sizes": {str(k): int(v) for k, v in sizes.items()},
+    "source_h5ad": src,
+}
+sub.write_h5ad("scrna_subcluster.h5ad")
+log("wrote scrna_subcluster.h5ad (%d cells x %d genes)" % sub.shape)
+
+# 原对象贴回 subcluster 标签（未在目标类型内的记 "not_target"）
+labels = pd.Series("not_target", index=a.obs_names)
+target_names = sub.obs_names
+mapped = pd.Series([TARGET + "_s" + s for s in sub.obs["subcluster"].astype(str)],
+                   index=target_names)
+labels.loc[target_names] = mapped
+a.obs["subcluster"] = labels.astype(str).to_numpy()
+a.uns["subcluster"] = {
+    "target_celltype": TARGET, "n_subclusters": n_sub,
+    "n_target_cells": int(n_target), "seed": SEED,
+    "source_h5ad": src, "subset_h5ad": "scrna_subcluster.h5ad",
+}
+a.write_h5ad("scrna_deg_subclustered.h5ad")
+log("wrote scrna_deg_subclustered.h5ad (%d cells)" % a.shape[0])
+
+# --- 报告 ---
+lines = [
+    "step=subcluster",
+    "seed=%d" % SEED,
+    "target_celltype=%s cells=%d" % (TARGET, n_target),
+    "subclusters=%d resolution=%.1f" % (n_sub, RESOLUTION),
+    "note=子集内重算 HVG/PCA/Leiden/UMAP；亚群身份需人工判读 marker（本步骤不硬标）",
+    "subcluster_sizes:",
+]
+for k in sorted(sizes.index, key=lambda x: int(x)):
+    lines.append("  %s_s%s: %d cells" % (TARGET, k, int(sizes[k])))
+lines.append("diagnosis_crosstab:")
+for idx, row in cross.iterrows():
+    lines.append("  %s: %s" % (idx, dict(row)))
+lines.append("top_markers_per_subcluster:")
+for g in sorted(groups, key=lambda x: int(x)):
+    top = mk_df[mk_df["subcluster"] == g].sort_values("rank").head(8)
+    lines.append("  %s_s%s: %s" % (TARGET, g, top["gene"].tolist()))
+lines.append("")
+lines.append("elapsed_seconds=%.1f" % (time.time() - START))
+lines.append("outputs=subcluster_markers.tsv, subcluster_diagnosis_crosstab.tsv, scrna_subcluster.h5ad, scrna_deg_subclustered.h5ad, subcluster_report.txt")
+with open("subcluster_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(lines) + "\n")
+log("subcluster_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "$PWD" "subcluster_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

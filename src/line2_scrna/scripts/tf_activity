@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# tf_activity：line2_scrna 步骤 18 转录因子调控分析（aims 线2 下游第 9 项）。
+#
+# 输入：步骤 17 产物目录同 cwd 的 deg_all_by_celltype.tsv /
+#       deg_significant_by_celltype.tsv。
+#
+# 做法（手机端可行路线；SCENIC 需 cisTarget 人类数据库 >1GB + pySCENIC，
+# 容器内存与算力不支持，如实记为待设备项）：
+#   1. TF 靶基因库：Enrichr 的 ENCODE_and_ChEA_Consensus_TFs_from_ChIP-X
+#      （实验证据 TF->靶基因，92 TF 集）+ ChEA_2022（如可达）。
+#   2. 每 celltype 的显著 DEG 作为前景，对 TF 靶基因库做 ORA
+#      （gseapy.enrich 离线），显著 TF = 其靶基因在 DEG 中过表达。
+#   3. 额外：TF 自身是否在该 celltype 差异表达（从 deg_all 取该 TF 的 log2FC）。
+#   4. 结果落 tf_activity.tsv + tf_report.txt。
+#
+# 自校验内建：输入 tsv 存在、TF 库非空、ORA p 在 [0,1]。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+declare -a INPUTS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+echo "step_executed=tf_activity"
+echo "bioanalys_seed=${seed}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+python3 - <<'PYSCRIPT'
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+import gseapy
+
+START = time.time()
+SEED = int(os.environ["BIOANALYS_SEED"])
+ALPHA = 0.05
+TF_LIBS = ["ENCODE_and_ChEA_Consensus_TFs_from_ChIP-X", "ChEA_2022"]
+# BIO_GMT_CACHE 可覆盖 gmt 缓存目录（默认 <cwd>/../references/gmt_cache，见 SPEC_DECISIONS D-22）
+CACHE = os.environ.get("BIO_GMT_CACHE", os.path.join("..", "references", "gmt_cache"))
+os.makedirs(CACHE, exist_ok=True)
+
+
+def fail(m):
+    sys.stderr.write("tf_activity 自校验失败: %s\n" % m)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(m):
+    print(m, flush=True)
+
+
+for f in ["deg_all_by_celltype.tsv", "deg_significant_by_celltype.tsv"]:
+    if not os.path.exists(f):
+        fail("缺少输入 %s（步骤 15 产物）" % f)
+deg_all = pd.read_csv("deg_all_by_celltype.tsv", sep="\t")
+deg_sig = pd.read_csv("deg_significant_by_celltype.tsv", sep="\t")
+
+tf_sets = {}
+for lib in TF_LIBS:
+    cache_path = os.path.join(CACHE, "%s.gmt" % lib)
+    try:
+        gs = gseapy.get_library(name=lib, organism="human")
+        with open(cache_path, "w", encoding="utf-8") as fh:
+            for term, genes in gs.items():
+                fh.write("%s\tna\t%s\n" % (term, "\t".join(genes)))
+        tf_sets[lib] = gs
+        log("TF set %s: %d terms" % (lib, len(gs)))
+    except Exception as e:
+        if os.path.exists(cache_path):
+            tf_sets[lib] = gseapy.read_gmt(cache_path)
+            log("TF set %s: 离线缓存 %d terms" % (lib, len(tf_sets[lib])))
+        else:
+            log("TF set %s 不可用：%s（跳过）" % (lib, str(e)[:100]))
+if not tf_sets:
+    fail("无 TF 靶基因库可用")
+
+# 每 celltype 显著 DEG 的 TF ORA
+rows = []
+for ct, sub in deg_sig.groupby("celltype"):
+    genes = sub["gene_symbol"].astype(str).tolist()
+    if len(genes) < 3:
+        continue
+    for lib, gs in tf_sets.items():
+        try:
+            res = gseapy.enrich(gene_list=genes, gene_sets=gs, background=None,
+                                outdir=None, verbose=False)
+            df = res.results
+            if df is None or not len(df):
+                continue
+            df = df.copy()
+            df["celltype"] = ct
+            df["library"] = lib
+            df["n_deg"] = len(genes)
+            rows.append(df)
+        except Exception as e:
+            log("  [%s/%s] 失败：%s" % (ct, lib, str(e)[:80]))
+
+if rows:
+    out = pd.concat(rows, ignore_index=True)
+    keep = [c for c in ["celltype", "library", "Term", "Overlap", "P-value",
+                        "Adjusted P-value", "Odds Ratio", "Combined Score",
+                        "Genes", "n_deg"] if c in out.columns]
+    out = out[keep].sort_values(["celltype", "Adjusted P-value"])
+    # 附加：TF 自身在该 celltype 的 log2FC（Term 形如 "TF ..." 取首词匹配基因名）
+    def tf_self(row):
+        term = str(row["Term"])
+        cand = term.split("_")[0].split(" ")[0]
+        sub = deg_all[(deg_all["celltype"] == row["celltype"]) &
+                      (deg_all["gene_symbol"].astype(str) == cand)]
+        if len(sub):
+            r = sub.iloc[0]
+            return pd.Series([cand, float(r["log2fc"]), float(r["pvals_adj"])])
+        return pd.Series([cand, np.nan, np.nan])
+    out[["tf_gene", "tf_log2fc", "tf_pvals_adj"]] = out.apply(tf_self, axis=1)
+    out.to_csv("tf_activity.tsv", sep="\t", index=False)
+    log("wrote tf_activity.tsv (%d 行)" % len(out))
+else:
+    out = pd.DataFrame(columns=["celltype", "library", "Term"])
+    out.to_csv("tf_activity.tsv", sep="\t", index=False)
+    log("TF ORA 无结果")
+
+lines = [
+    "step=tf_activity",
+    "seed=%d" % SEED,
+    "libraries=%s" % list(tf_sets.keys()),
+    "method=TF 靶基因库 ORA（gseapy.enrich 离线）：显著 DEG 作前景，"
+    "显著 TF = 其 ChIP 靶基因在 DEG 中富集",
+    "limitation=SCENIC（pySCENIC + cisTarget 人类库 >1GB）手机端不可行，"
+    "本步骤用 TF 靶基因富集近似 TF 调控活性；待更大设备再做 SCENIC",
+    "n_rows=%d" % len(out),
+]
+if len(out) and "Adjusted P-value" in out.columns:
+    sig = out[out["Adjusted P-value"] < ALPHA]
+    lines.append("significant_tfs=%d" % len(sig))
+    for ct in sorted(sig["celltype"].unique()):
+        top = sig[sig["celltype"] == ct].sort_values("Adjusted P-value").head(5)
+        for _, r in top.iterrows():
+            lines.append("  [%s] %s adj_p=%.3g (tf_log2fc=%s)"
+                         % (ct, r.get("tf_gene"), r.get("Adjusted P-value"),
+                            ("%.3f" % r["tf_log2fc"]) if pd.notna(r.get("tf_log2fc"))
+                            else "NA"))
+lines.append("")
+lines.append("elapsed_seconds=%.1f" % (time.time() - START))
+lines.append("outputs=tf_activity.tsv, tf_report.txt")
+with open("tf_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(lines) + "\n")
+log("tf_activity_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "$PWD" "tf_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

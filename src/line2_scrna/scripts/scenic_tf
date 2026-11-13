@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+# scenic_tf：line2_scrna 步骤 19 SCENIC 转录因子调控网络（TF 调控分析精度升级版）。
+#
+# 背景：步骤 18 tf_activity 用"TF 靶基因库 ORA"近似 TF 调控活性（显著 TF = 其
+# ChIP 靶基因在 DEG 中富集）。本步骤升级为**标准 SCENIC 三步**：
+#   1. GRN 推断（arboreto GRNBoost2）：每个 TF 用梯度提升树从其余基因预测其表达，
+#      取特征重要性 top 作为候选靶基因；
+#   2. cisTarget motif 富集（pyscenic ctx）：候选靶基因集在 hg38 启动子/增强子
+#      区域 motif 排名库上做富集，筛掉无 motif 支持的边，得到 regulon；
+#   3. AUCell：每个细胞的 regulon 活性打分。
+# 使用 cisTarget hg38 官方库（10kbp + 500bp rankings feather + motif 注释 tbl，
+# 共约 722MB，已常驻 public_references/cistarget/）。
+#
+# 输入（cwd 下）：
+#   scrna_norm.h5ad（步骤 3 产物，log 归一化表达，24969 基因）
+#   scrna_annotated.h5ad（步骤 6 产物，obs['celltype']）
+#   cisTarget 库目录（env CISTARGET_DIR，默认 /mnt/ssd/bio_data/public_references/cistarget）
+#
+# 输出（cwd 下）：
+#   scenic_adjacencies.tsv          GRN 推断的 TF-靶基因-重要性全表
+#   scenic_regulons.csv             cisTarget 富集后的 regulon（pyscenic 标准格式）
+#   scenic_auc_mtx.tsv              细胞 x regulon 的 AUCell 活性矩阵
+#   scenic_regulon_by_celltype.tsv  celltype x regulon 平均活性
+#   scenic_tf_summary.tsv           每 regulon 的靶基因数/首选 celltype/活性/特异性
+#   scenic_report.txt               口径、参数、结论与局限
+#
+# 口径与算力（手机端约束）：
+#   - 基因空间 = 表达广度 top N（env SCENIC_N_GENES，默认 5000）。全基因（20990
+#     个 >=10 细胞）在手机端 GRNBoost2 约需 90 小时，不可行；top5000 覆盖全部
+#     高表达 TF 与主要靶基因，是精度与算力的折中，报告如实记录。
+#   - GRNBoost2 n_estimators=5000（SCENIC 论文默认），不降树数。
+#   - dask 用线程模式（processes=False）：proot 容器内 Nanny 无法 fork worker。
+#   - 削峰：外部 taskset -c 4,5,6 + nice -n 10，OMP/OPENBLAS=3。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+declare -a INPUTS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+norm_h5ad=""
+anno_h5ad=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *annotated*.h5ad) anno_h5ad="$path" ;;
+    *norm*.h5ad) norm_h5ad="$path" ;;
+    *.h5ad) echo "无法识别的输入文件: $path（需要 norm / annotated 命名）" >&2; exit 2 ;;
+    *) echo "无法识别的输入: $path（需要 *.h5ad）" >&2; exit 2 ;;
+  esac
+done
+if [ -z "$norm_h5ad" ] || [ ! -f "$norm_h5ad" ]; then
+  echo "缺少必需输入：scrna_norm.h5ad" >&2
+  exit 2
+fi
+if [ -z "$anno_h5ad" ] || [ ! -f "$anno_h5ad" ]; then
+  echo "缺少必需输入：scrna_annotated.h5ad（celltype 标签来源）" >&2
+  exit 2
+fi
+
+CISTARGET_DIR="${CISTARGET_DIR:-/mnt/ssd/bio_data/public_references/cistarget}"
+N_GENES="${SCENIC_N_GENES:-5000}"
+N_WORKERS="${SCENIC_WORKERS:-3}"
+
+R10="$CISTARGET_DIR/hg38_10kbp_up_10kbp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather"
+R500="$CISTARGET_DIR/hg38_500bp_up_100bp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather"
+TBL="$CISTARGET_DIR/motifs-v10nr_clust-nr.hgnc-m0.001-o0.0.tbl"
+for f in "$R10" "$R500" "$TBL"; do
+  [ -f "$f" ] || { echo "cisTarget 库文件缺失: $f" >&2; exit 2; }
+done
+
+echo "step_executed=scenic_tf"
+echo "bioanalys_seed=${seed}"
+echo "input_norm=${norm_h5ad}"
+echo "input_anno=${anno_h5ad}"
+echo "cistarget_dir=${CISTARGET_DIR}"
+echo "n_genes=${N_GENES}"
+echo "n_workers=${N_WORKERS}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+NORM_H5AD="$norm_h5ad" ANNO_H5AD="$anno_h5ad" R10="$R10" R500="$R500" TBL="$TBL" \
+N_GENES="$N_GENES" N_WORKERS="$N_WORKERS" BIOANALYS_SEED="$seed" \
+python3 - <<'PYSCRIPT'
+import json
+import os
+import sys
+import time
+
+# np.object 补丁必须最先执行：pyscenic 0.12.1 的 transform.py 仍用 numpy 旧别名，
+# numpy>=1.24 已移除；补丁只在本进程内生效，不改已安装包源码。
+import numpy as np
+if not hasattr(np, "object"):
+    np.object = object
+
+import pandas as pd
+import anndata as ad
+
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+SEED = int(os.environ["BIOANALYS_SEED"])
+N_GENES = int(os.environ["N_GENES"])
+N_WORKERS = int(os.environ["N_WORKERS"])
+R10 = os.environ["R10"]
+R500 = os.environ["R500"]
+TBL = os.environ["TBL"]
+OUT_ADJ = "scenic_adjacencies.tsv"
+OUT_REG = "scenic_regulons.csv"
+OUT_AUC = "scenic_auc_mtx.tsv"
+OUT_CT = "scenic_regulon_by_celltype.tsv"
+OUT_SUM = "scenic_tf_summary.tsv"
+OUT_RPT = "scenic_report.txt"
+
+
+def fail(m):
+    sys.stderr.write("scenic_tf 自校验失败: %s\n" % m)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(m):
+    print("[%7.1fs] %s" % (time.time() - START, m), flush=True)
+
+
+# --- 1. 数据与基因空间 ---
+log("loading %s" % os.environ["NORM_H5AD"])
+a = ad.read_h5ad(os.environ["NORM_H5AD"])
+anno = ad.read_h5ad(os.environ["ANNO_H5AD"])
+if a.n_obs != anno.n_obs or not (a.obs_names == anno.obs_names).all():
+    fail("norm 与 annotated 的细胞索引不一致")
+if "celltype" not in anno.obs.columns:
+    fail("annotated 缺 obs['celltype']")
+celltype = anno.obs["celltype"].astype(str)
+log("cells=%d genes=%d" % (a.shape[0], a.shape[1]))
+
+X = a.X.tocsc()
+nnz = np.diff(X.indptr)
+if N_GENES > a.n_vars:
+    fail("N_GENES=%d 超过基因总数 %d" % (N_GENES, a.n_vars))
+sel = np.argsort(-nnz)[:N_GENES]
+sel = np.sort(sel)
+if "gene_symbol" in a.var.columns:
+    gene_sel = np.array(a.var["gene_symbol"].astype(str))[sel]
+else:
+    gene_sel = np.array(a.var_names)[sel]
+sub = a[:, sel]
+Xd = np.asarray(sub.X.todense(), dtype=np.float32)
+expr = pd.DataFrame(Xd, index=sub.obs_names, columns=gene_sel)
+del Xd, sub
+log("gene space: top%d by expression breadth; min breadth=%d"
+    % (N_GENES, int(nnz[sel].min())))
+
+# --- 2. TF gene list from motif annotation tbl ---
+tf_all = set()
+with open(TBL, encoding="utf-8") as fh:
+    header = fh.readline().rstrip("\n").split("\t")
+    gi = header.index("gene_name")
+    for line in fh:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) > gi and parts[gi].strip() not in ("", "None"):
+            tf_all.add(parts[gi].strip())
+tf_names = [g for g in gene_sel if g in tf_all]
+if len(tf_names) < 10:
+    fail("gene space TF < 10 (%d)" % len(tf_names))
+log("annotated TFs in space: %d" % len(tf_names))
+tf_names = [g for g in gene_sel if g in tf_all]
+if len(tf_names) < 10:
+    fail("基因空间内 TF 数 < 10（%d），无法推断 GRN" % len(tf_names))
+log("annotated TFs in space: %d" % len(tf_names))
+
+# --- 3. GRN 推断（复用有效 checkpoint，否则运行 GRNBoost2） ---
+if os.path.isfile(OUT_ADJ) and os.path.getsize(OUT_ADJ) > 1024:
+    adj = pd.read_csv(OUT_ADJ, sep="\t")
+    if list(adj.columns) != ["TF", "target", "importance"] or adj.empty:
+        fail("已有 %s 结构不合口径" % OUT_ADJ)
+    log("GRN checkpoint reused: %d edges, %d TFs"
+        % (len(adj), adj["TF"].nunique()))
+else:
+    from distributed import Client, LocalCluster
+    from arboreto.algo import grnboost2
+
+    cluster = LocalCluster(n_workers=1, threads_per_worker=N_WORKERS,
+                           processes=False, dashboard_address=None)
+    client = Client(cluster)
+    log("dask threads=%s processes=%s" % (client.nthreads(), cluster.processes))
+    try:
+        adj = grnboost2(expression_data=expr, tf_names=tf_names, seed=SEED,
+                        client_or_address=client, verbose=False)
+    finally:
+        client.close()
+        cluster.close()
+    if adj is None or not len(adj):
+        fail("GRNBoost2 返回空邻接表")
+    adj = adj.copy()
+    adj.columns = ["TF", "target", "importance"]
+    adj = adj.sort_values(["TF", "importance"], ascending=[True, False])
+    adj.to_csv(OUT_ADJ, sep="\t", index=False)
+    log("GRN done: %d edges, %d TFs -> %s"
+        % (len(adj), adj["TF"].nunique(), OUT_ADJ))
+
+# --- 4. cisTarget motif 富集（复用有效 checkpoint，否则运行 pyscenic ctx） ---
+TMP_EXPR = "_scenic_expr_tmp.csv"
+if os.path.isfile(OUT_REG) and os.path.getsize(OUT_REG) > 1024:
+    log("ctx checkpoint reused: %s" % OUT_REG)
+else:
+    # CLI 需要表达矩阵文件；写临时 csv（细胞 x 基因），跑完删除。
+    expr.to_csv(TMP_EXPR)
+    log("wrote %s (%.1f MB)" % (TMP_EXPR, os.path.getsize(TMP_EXPR) / 1e6))
+
+    from pyscenic.cli.pyscenic import main as pyscenic_main
+
+    argv_backup = list(sys.argv)
+    sys.argv = ["pyscenic", "ctx", OUT_ADJ, R10, R500,
+                "--annotations_fname", TBL,
+                "--expression_mtx_fname", TMP_EXPR,
+                "--output", OUT_REG,
+                "--num_workers", str(N_WORKERS)]
+    try:
+        pyscenic_main()
+    except SystemExit as e:
+        if e.code not in (0, None):
+            raise
+    finally:
+        sys.argv = argv_backup
+    if not os.path.exists(OUT_REG):
+        fail("ctx 未产出 %s" % OUT_REG)
+    log("ctx done -> %s (%.1f MB)"
+        % (OUT_REG, os.path.getsize(OUT_REG) / 1e6))
+
+# --- 5. AUCell 活性 ---
+from pyscenic.utils import load_motifs
+from pyscenic.transform import df2regulons
+from pyscenic.aucell import aucell
+
+# ctx 输出的 regulons.csv 是双行表头（(Enrichment, Context/TargetGenes)），
+# 必须用 load_motifs 读，直接 read_csv 会把第二行表头当数据。
+reg_df = load_motifs(OUT_REG, sep=",")
+regulons = df2regulons(reg_df)
+if not regulons:
+    fail("regulon 数为 0（motif 富集未通过任何 TF）")
+auc = aucell(expr, regulons, num_workers=N_WORKERS, seed=SEED)
+auc.to_csv(OUT_AUC, sep="\t")
+log("AUCell done: %s regulons x %s cells -> %s"
+    % (auc.shape[1], auc.shape[0], OUT_AUC))
+
+# --- 6. 按 celltype 汇总活性 ---
+ct_aligned = celltype.reindex(auc.index)
+if ct_aligned.isna().any():
+    fail("celltype 与 AUCell 矩阵细胞对不齐")
+by_ct = auc.groupby(ct_aligned.values).mean()
+by_ct.index.name = "celltype"
+by_ct.to_csv(OUT_CT, sep="\t")
+log("celltype mean activity: %s" % (by_ct.shape,))
+
+# --- 7. 每 regulon 摘要：靶基因数 / 首选 celltype / 活性 / 特异性 ---
+n_targets = {r.name: len(r) for r in regulons}
+rows = []
+for reg in by_ct.columns:
+    col = by_ct[reg]
+    top_ct = col.idxmax()
+    top_val = float(col.max())
+    mean_val = float(col.mean())
+    std_val = float(col.std())
+    spec = (top_val - mean_val) / std_val if std_val > 0 else 0.0
+    rows.append({
+        "regulon": reg,
+        "n_targets": n_targets.get(reg, 0),
+        "top_celltype": top_ct,
+        "top_activity": top_val,
+        "mean_activity": mean_val,
+        "specificity_z": spec,
+    })
+summary = pd.DataFrame(rows).sort_values("specificity_z", ascending=False)
+summary.to_csv(OUT_SUM, sep="\t", index=False)
+log("tf summary rows=%d" % len(summary))
+
+# --- 8. 报告 ---
+lines = [
+    "step=scenic_tf",
+    "method=SCENIC (GRNBoost2 GRN inference -> cisTarget hg38 motif enrichment -> AUCell)",
+    "seed=%d" % SEED,
+    "cells=%d" % a.n_obs,
+    "gene_space=top%d by expression breadth (of %d genes total)" % (N_GENES, a.n_vars),
+    "n_tfs=%d" % len(tf_names),
+    "grn_edges=%d" % len(adj),
+    "regulons=%d" % len(regulons),
+    "cisTarget_libs=hg38_10kbp_up_10kbp_down_full_tx_v10_clust + "
+    "hg38_500bp_up_100bp_down_full_tx_v10_clust",
+    "motif_annotations=%s" % os.path.basename(TBL),
+    "grnboost2_n_estimators=5000 (SCENIC default)",
+    "dask_mode=threads (processes=False; proot cannot fork Nanny workers)",
+    "",
+    "top regulons by celltype specificity (z of top celltype vs mean):",
+]
+for _, r in summary.head(15).iterrows():
+    lines.append("  %-22s n_targets=%-4d top=%-24s activity=%.4f z=%.2f"
+                 % (r["regulon"], r["n_targets"], r["top_celltype"],
+                    r["top_activity"], r["specificity_z"]))
+lines += [
+    "",
+    "limitations:",
+    "  1. 基因空间受手机算力限制为表达广度 top%d（全基因 GRNBoost2 约需 90h）；"
+    "低表达 TF 的 regulon 可能缺失。" % N_GENES,
+    "  2. GRNBoost2 是计算推断，regulon 是 motif 支持下的统计关联，非实验验证。",
+    "  3. AUCell 活性为相对打分，跨样本比较需谨慎。",
+    "  4. 本步骤取代步骤 18 tf_activity 的 ORA 近似路线；tf_activity 产物保留为对照。",
+    "",
+    "elapsed_seconds=%.1f" % (time.time() - START),
+    "outputs=scenic_adjacencies.tsv, scenic_regulons.csv, scenic_auc_mtx.tsv, scenic_regulon_by_celltype.tsv, scenic_tf_summary.tsv",
+]
+with open(OUT_RPT, "w", encoding="utf-8") as fh:
+    fh.write("\n".join(lines) + "\n")
+
+
+# 清理临时表达矩阵（可从 h5ad 重建）
+try:
+    os.remove(TMP_EXPR)
+except OSError:
+    pass
+
+log("scenic_tf_done regulons=%d elapsed=%.1fs" % (len(regulons), time.time() - START))
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "$PWD" "scenic_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

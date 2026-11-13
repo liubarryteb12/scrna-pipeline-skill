@@ -1,0 +1,562 @@
+{
+  "schema_version": "1.0",
+  "manifest_version": 2,
+  "manifest_kind": "workspace_module_registry",
+  "updated": "2026-10-28",
+  "notes": [
+    "mod 注册表：客户端、服务台、runner 三方共读的唯一事实源（SSOT）。",
+    "依赖用产物名表达，不用绝对路径，路径由运行方按项目拼接。",
+    "series 之间默认硬隔离（aims 铁律二）：不同系列不可穿插、不可跨系列取产物；唯一例外是 constraints.allowed_cross_series_bridges 声明的冻结签名桥。",
+    "stage 内 optional=true 的 mod 可自由勾选；跨 stage 只允许按 order 递增的标准序。",
+    "est_minutes / peak_mem_mb 为参考算力节点实测值，用于组合前的成本预估与拦截。",
+    "运行时内存上限由 BIO_MEM_LIMIT_GB 控制：生产默认 7.5GB，单任务最高 8.0GB；constraints.mem_quota_mb=7680 是规划默认值。"
+  ],
+  "constraints": {
+    "max_concurrent_series": 1,
+    "mem_quota_mb": 7680,
+    "disk_fail_free_pct": 20,
+    "ko_gene_required_mods": [
+      "l2_ko_virtual",
+      "l3_ko_spatial"
+    ],
+    "forbidden_cross_series": true,
+    "allowed_cross_series_bridges": [
+      {
+        "id": "l2_to_l3_celltype_signature",
+        "from": "line2_scrna",
+        "to": "line3_spatial",
+        "scope": "same_project",
+        "producers": [
+          "l2_export_celltype_signature"
+        ],
+        "consumers": [
+          "l3_branches_celltype"
+        ],
+        "path": "public_references/celltype_signatures/<project_id>/signatures.tsv",
+        "manifest": "public_references/celltype_signatures/<project_id>/bridge_manifest.json",
+        "requires": [
+          "sha256",
+          "species_mapping",
+          "seed",
+          "project_id",
+          "value_domain",
+          "gene_symbol_namespace"
+        ]
+      }
+    ]
+  },
+  "series": [
+    {
+      "id": "line2_scrna",
+      "name": "单细胞转录组 + 虚拟敲除",
+      "data_form": "单细胞计数（按细胞文件 / mtx / h5ad）+ soft 元数据 + 分组表",
+      "language_profile": "Python 1-8 + Python 9-10（pyscenic / scTenifoldpy），线内桥接 0 次",
+      "seed": 20261013,
+      "stages": [
+        {
+          "id": "ingest",
+          "name": "数据接入",
+          "order": 1,
+          "required": true,
+          "mods": [
+            {
+              "id": "l2_ingest_counts",
+              "name": "计数装配与元数据对账",
+              "desc": "读取单细胞原始计数与元数据，装配成可供下游分析的对象",
+              "tool": "Scanpy",
+              "language": "Python",
+              "requires": [
+                "raw_tar",
+                "gpl_soft",
+                "grouping.txt"
+              ],
+              "produces": [
+                "scrna_counts.h5ad",
+                "ingest_report.txt"
+              ],
+              "est_minutes": 8,
+              "peak_mem_mb": 2500,
+              "notes": "逐细胞解析、__ 汇总行排除、soft 元数据 1% 容差对账。",
+              "script": "ingest_counts"
+            }
+          ]
+        },
+        {
+          "id": "qc",
+          "name": "质控与标准化",
+          "order": 2,
+          "required": true,
+          "mods": [
+            {
+              "id": "l2_qc_cells",
+              "name": "细胞 QC",
+              "desc": "按检出基因、计数和线粒体比例过滤低质量细胞，并识别双细胞",
+              "tool": "Scanpy",
+              "language": "Python",
+              "requires": [
+                "scrna_counts.h5ad"
+              ],
+              "produces": [
+                "scrna_qc.h5ad",
+                "qc_cell_metrics.tsv",
+                "qc_report.txt"
+              ],
+              "est_minutes": 5,
+              "peak_mem_mb": 2200,
+              "notes": "nCount>50000 / nFeature>1500 / ERCC<15%；doublet 排除出主矩阵。",
+              "script": "qc_cells"
+            },
+            {
+              "id": "l2_qc_normalize",
+              "name": "归一化与高变基因",
+              "desc": "完成文库大小归一化和对数转换，并筛选下游聚类所需的高变基因",
+              "tool": "Scanpy",
+              "language": "Python",
+              "requires": [
+                "scrna_qc.h5ad"
+              ],
+              "produces": [
+                "scrna_norm.h5ad",
+                "hvg_genes.tsv",
+                "norm_report.txt"
+              ],
+              "est_minutes": 4,
+              "peak_mem_mb": 2400,
+              "notes": "ERCC 剔除在归一化前；原始整数计数存 layers['counts']。",
+              "script": "normalize_hvg"
+            }
+          ]
+        },
+        {
+          "id": "integrate",
+          "name": "整合与聚类",
+          "order": 3,
+          "required": true,
+          "mods": [
+            {
+              "id": "l2_integrate_harmony",
+              "name": "Harmony 去批次",
+              "desc": "用 Harmony 在低维空间校正样本批次差异，生成整合后的表达对象",
+              "tool": "harmonypy",
+              "language": "Python",
+              "requires": [
+                "scrna_norm.h5ad"
+              ],
+              "produces": [
+                "scrna_integrated.h5ad",
+                "integrate_report.txt"
+              ],
+              "est_minutes": 10,
+              "peak_mem_mb": 3000,
+              "notes": "batch=donor；配对设计混淆已写入报告警告。",
+              "script": "integrate_harmony"
+            },
+            {
+              "id": "l2_integrate_cluster",
+              "name": "聚类与降维",
+              "desc": "基于主成分进行 Leiden 聚类，并用 UMAP 展示细胞群结构",
+              "tool": "Scanpy",
+              "language": "Python",
+              "requires": [
+                "scrna_integrated.h5ad"
+              ],
+              "produces": [
+                "scrna_clustered.h5ad",
+                "cluster_report.txt"
+              ],
+              "est_minutes": 8,
+              "peak_mem_mb": 2800,
+              "script": "cluster_umap"
+            },
+            {
+              "id": "l2_integrate_annotate",
+              "name": "细胞类型注释",
+              "desc": "为聚类得到的细胞群分配类型标签，并保留支持判定的标记基因结果",
+              "tool": "Scanpy",
+              "language": "Python",
+              "requires": [
+                "scrna_clustered.h5ad"
+              ],
+              "produces": [
+                "scrna_annotated.h5ad",
+                "cluster_markers.tsv",
+                "annotate_report.txt"
+              ],
+              "est_minutes": 6,
+              "peak_mem_mb": 2600,
+              "notes": "先出 marker 证据后下结论，不过阈记 unknown 不硬猜。",
+              "script": "annotate_celltypes"
+            }
+          ]
+        },
+        {
+          "id": "profile",
+          "name": "构成与差异",
+          "order": 4,
+          "required": true,
+          "mods": [
+            {
+              "id": "l2_profile_composition",
+              "name": "细胞组成统计",
+              "desc": "统计各分组和样本中的细胞类型比例，并检验组成变化是否显著",
+              "tool": "Scanpy, scipy",
+              "language": "Python",
+              "requires": [
+                "scrna_annotated.h5ad"
+              ],
+              "produces": [
+                "scrna_composition.h5ad",
+                "celltype_composition.tsv",
+                "composition_report.txt"
+              ],
+              "est_minutes": 4,
+              "peak_mem_mb": 2000,
+              "script": "scrna_composition"
+            },
+            {
+              "id": "l2_profile_deg",
+              "name": "组间 DEG",
+              "desc": "在固定细胞类型内比较处理组与对照组，识别组间差异表达基因",
+              "tool": "Scanpy",
+              "language": "Python",
+              "requires": [
+                "scrna_composition.h5ad"
+              ],
+              "produces": [
+                "scrna_deg.h5ad",
+                "deg_all_by_celltype.tsv",
+                "deg_significant_by_celltype.tsv",
+                "deg_report.txt"
+              ],
+              "est_minutes": 10,
+              "peak_mem_mb": 2800,
+              "notes": "DEG 与 DR Genes 严禁混写（aims 铁律三）。",
+              "script": "deg_groups"
+            },
+            {
+              "id": "l2_profile_subcluster",
+              "name": "亚群再聚类",
+              "desc": "提取目标细胞群重新选择高变基因并聚类，识别更细的亚群结构",
+              "tool": "Scanpy",
+              "language": "Python",
+              "requires": [
+                "scrna_deg.h5ad"
+              ],
+              "produces": [
+                "scrna_subcluster.h5ad",
+                "scrna_deg_subclustered.h5ad",
+                "subcluster_markers.tsv",
+                "subcluster_report.txt"
+              ],
+              "est_minutes": 8,
+              "peak_mem_mb": 2600,
+              "optional": true,
+              "script": "subcluster"
+            }
+          ]
+        },
+        {
+          "id": "branches",
+          "name": "可选分析支线（可多选）",
+          "order": 5,
+          "required": false,
+          "notes": "本阶段内各 mod 互不依赖，可任意组合；每个都是独立支线。",
+          "mods": [
+            {
+              "id": "l2_branches_enrich",
+              "name": "功能富集（GO/KEGG/Reactome/GSEA）",
+              "desc": "对差异基因或域标记基因执行 GO、KEGG 和 Reactome 富集分析",
+              "tool": "gseapy",
+              "language": "Python",
+              "requires": [
+                "deg_all_by_celltype.tsv",
+                "deg_significant_by_celltype.tsv"
+              ],
+              "produces": [
+                "enrichment_ora.tsv",
+                "enrichment_gsea.tsv",
+                "enrichment_report.txt"
+              ],
+              "est_minutes": 12,
+              "peak_mem_mb": 2400,
+              "script": "enrichment"
+            },
+            {
+              "id": "l2_branches_enrich_fig",
+              "name": "富集图件",
+              "desc": "把富集分析结果整理为条形图等图件，突出主要功能条目与显著性",
+              "tool": "matplotlib",
+              "language": "Python",
+              "requires": [
+                "enrichment_ora.tsv",
+                "enrichment_gsea.tsv"
+              ],
+              "produces": [
+                "l2_enrich_top.png",
+                "figures_manifest.txt"
+              ],
+              "est_minutes": 2,
+              "peak_mem_mb": 1400,
+              "outputs_dir": "figures",
+              "script": "enrichment_figures"
+            },
+            {
+              "id": "l2_branches_pseudotime",
+              "name": "拟时序（DPT）",
+              "desc": "构建细胞状态转移轨迹并计算拟时序，展示细胞分化与转换过程",
+              "tool": "Scanpy",
+              "language": "Python",
+              "requires": [
+                "scrna_annotated.h5ad"
+              ],
+              "produces": [
+                "scrna_pseudotime.h5ad",
+                "pseudotime_report.txt"
+              ],
+              "est_minutes": 10,
+              "peak_mem_mb": 2800,
+              "notes": "走 scanpy 内置 DPT，零新依赖；非表皮谱系 dpt=inf 是正常输出。",
+              "script": "pseudotime"
+            },
+            {
+              "id": "l2_branches_cellcomm",
+              "name": "细胞通讯（LIANA）",
+              "desc": "根据配受体表达推断细胞群间通讯，并比较组间信号强度变化",
+              "tool": "liana",
+              "language": "Python",
+              "requires": [
+                "scrna_annotated.h5ad",
+                "scrna_norm.h5ad"
+              ],
+              "produces": [
+                "scrna_cellcomm.h5ad",
+                "cellcomm_interactions.tsv",
+                "cellcomm_report.txt"
+              ],
+              "est_minutes": 20,
+              "peak_mem_mb": 3200,
+              "notes": "表达矩阵取 norm 全基因产物，不用 2000 HVG。",
+              "script": "cell_communication"
+            },
+            {
+              "id": "l2_branches_gsva",
+              "name": "GSVA 通路活性",
+              "desc": "对样本或细胞群做通路活性打分，比较不同状态下的通路变化",
+              "tool": "GSVA",
+              "language": "Python",
+              "requires": [
+                "scrna_integrated.h5ad",
+                "scrna_deg.h5ad"
+              ],
+              "produces": [
+                "scrna_gsva.h5ad",
+                "gsva_scores.tsv",
+                "gsva_report.txt"
+              ],
+              "est_minutes": 25,
+              "peak_mem_mb": 3000,
+              "risk": "历史上失败 13 次（P-29 前），建议单独跑不与长任务并行。",
+              "script": "gsva_pathways"
+            }
+          ]
+        },
+        {
+          "id": "tf",
+          "name": "转录因子调控",
+          "order": 6,
+          "required": false,
+          "mods": [
+            {
+              "id": "l2_tf_scenic",
+              "name": "SCENIC 调控网络（GRNBoost2）",
+              "desc": "用 SCENIC 推断转录因子调控网络，并计算各细胞群 regulon 活性",
+              "tool": "pySCENIC",
+              "language": "Python",
+              "requires": [
+                "scrna_annotated.h5ad",
+                "scrna_norm.h5ad"
+              ],
+              "produces": [
+                "scenic_adjacencies.tsv",
+                "scenic_regulons.csv",
+                "scenic_auc_mtx.tsv",
+                "scenic_regulon_by_celltype.tsv",
+                "scenic_tf_summary.tsv",
+                "scenic_report.txt"
+              ],
+              "est_minutes": 41,
+              "peak_mem_mb": 3600,
+              "notes": "default 项目 2026-10-14 实测 41 分钟 exit 0；基因空间取 top5000。",
+              "script": "scenic_tf"
+            },
+            {
+              "id": "l2_tf_scenic_fig",
+              "name": "SCENIC 图件",
+              "desc": "将 SCENIC 的 regulon 活性整理为热图和特异性条形图，便于比较",
+              "tool": "matplotlib",
+              "language": "Python",
+              "requires": [
+                "processed"
+              ],
+              "produces": [
+                "l2_scenic_rss.png",
+                "figures_manifest.txt"
+              ],
+              "est_minutes": 3,
+              "peak_mem_mb": 1600,
+              "outputs_dir": "figures",
+              "after": [
+                "l2_tf_scenic"
+              ],
+              "script": "scenic_figures"
+            },
+            {
+              "id": "l2_tf_activity",
+              "name": "TF 活性评分",
+              "desc": "用转录因子靶基因集合做富集打分，提供 SCENIC 之外的活性参考",
+              "tool": "gseapy",
+              "language": "Python",
+              "requires": [
+                "deg_all_by_celltype.tsv",
+                "deg_significant_by_celltype.tsv"
+              ],
+              "produces": [
+                "tf_activity.tsv",
+                "tf_report.txt"
+              ],
+              "est_minutes": 8,
+              "peak_mem_mb": 2400,
+              "script": "tf_activity"
+            }
+          ]
+        },
+        {
+          "id": "ko",
+          "name": "虚拟敲除（本线末端模块）",
+          "order": 7,
+          "required": false,
+          "notes": "aims 铁律二：虚拟敲除不是第四条线，是本线末端模块。",
+          "mods": [
+            {
+              "id": "l2_ko_virtual",
+              "name": "虚拟敲除（scTenifoldpy）",
+              "desc": "在单细胞调控网络中模拟敲除目标基因，输出受扰动影响的 DR 基因",
+              "tool": "scTenifoldKnk",
+              "language": "Python",
+              "requires": [
+                "scrna_annotated.h5ad",
+                "scrna_norm.h5ad",
+                "hvg_genes.tsv"
+              ],
+              "produces": [
+                "scrna_knockout.h5ad",
+                "ko_dr_genes.tsv",
+                "knockout_report.txt"
+              ],
+              "est_minutes": 40,
+              "peak_mem_mb": 3800,
+              "ko_gene": true,
+              "notes": "群体取 Psoriasis 2747 细胞；每轮 rm+gc 削峰。",
+              "script": "virtual_knockout"
+            },
+            {
+              "id": "l2_ko_summarize",
+              "name": "DR 基因汇总",
+              "desc": "汇总多次虚拟敲除得到的 DR 基因，按稳健交集和显著性排序",
+              "tool": "pandas",
+              "language": "Python",
+              "requires": [
+                "scrna_knockout.h5ad",
+                "ko_dr_genes.tsv"
+              ],
+              "produces": [
+                "dr_genes_summary.tsv",
+                "dr_summary_report.txt"
+              ],
+              "est_minutes": 5,
+              "peak_mem_mb": 2200,
+              "after": [
+                "l2_ko_virtual"
+              ],
+              "script": "summarize_dr"
+            },
+            {
+              "id": "l2_ko_localization",
+              "name": "靶基因细胞定位",
+              "desc": "定位目标敲除基因及相关差异基因在各细胞类型中的表达分布",
+              "tool": "Scanpy",
+              "language": "Python",
+              "requires": [
+                "scrna_deg.h5ad",
+                "deg_all_by_celltype.tsv",
+                "ko_dr_genes.tsv"
+              ],
+              "produces": [
+                "target_gene_localization.tsv",
+                "target_gene_localization_wide.tsv",
+                "localization_report.txt"
+              ],
+              "est_minutes": 6,
+              "peak_mem_mb": 2200,
+              "after": [
+                "l2_ko_virtual"
+              ],
+              "script": "target_gene_localization"
+            },
+            {
+              "id": "l2_ko_drpost",
+              "name": "DR 后分析（富集 + 网络）",
+              "desc": "对 DR 基因做富集、调控网络和交集分析，连接表达差异与调控扰动",
+              "tool": "gseapy, networkx",
+              "language": "Python",
+              "requires": [
+                "scrna_knockout.h5ad",
+                "ko_dr_genes.tsv",
+                "scenic_regulons.csv",
+                "deg_all_by_celltype.tsv"
+              ],
+              "produces": [
+                "dr_enrichment.tsv",
+                "dr_regulatory_network.tsv",
+                "dr_overlap.tsv",
+                "dr_post_report.txt"
+              ],
+              "est_minutes": 20,
+              "peak_mem_mb": 3200,
+              "after": [
+                "l2_ko_virtual"
+              ],
+              "script": "dr_post_analysis"
+            }
+          ]
+        },
+        {
+          "id": "figures",
+          "name": "图件汇总",
+          "order": 8,
+          "required": false,
+          "mods": [
+            {
+              "id": "l2_figures_scrna",
+              "name": "线 2 图件包",
+              "desc": "汇总单细胞聚类、组成、标记基因和差异结果，统一生成展示图件",
+              "tool": "matplotlib",
+              "language": "Python",
+              "requires": [
+                "scrna_deg.h5ad"
+              ],
+              "produces": [
+                "l2_01_umap.png",
+                "figures_manifest.txt"
+              ],
+              "est_minutes": 5,
+              "peak_mem_mb": 2000,
+              "outputs_dir": "figures",
+              "script": "scrna_figures"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# qc_cells：line2_scrna 步骤 2 QC（按细胞与基因双阈值过滤）。
+#
+# 输入：步骤 1 产物 scrna_counts.h5ad（cell x gene 稀疏计数矩阵，obs 带
+# donor/diagnosis/region/group/class 等元数据，var 带 ercc 标志）。
+#
+# 阈值口径（2026-10-13 定稿，来源 BJD 2024 论文，固定不随结果调整）：
+#   nCount_RNA > 50000（每细胞总计数，含 ERCC）
+#   nFeature_RNA > 1500（每细胞检出基因数，含 ERCC 基因）
+#   ERCC 比例 < 0.15（ERCC 计数 / 总计数）
+# 原型实测（服务器真实数据）：前两项 0 细胞失败（deposited 数据似已按此
+# 预过滤，min 53020/1525 恰在阈值上），ERCC 超限 216 个。
+#
+# doublet 处置（步骤设计时拍板）：**排除出主分析矩阵**。理由：作者用 CIM-seq
+# 标定的 doublet 是两个细胞的混合图谱，celltype_paper=NA 无注释，混入下游
+# 聚类/注释会制造虚假中间态。排除不等于删除：全部 4988 个细胞的指标与去留
+# 原因落 qc_cell_metrics.tsv，可审计可复查。
+#
+# 基因过滤：保留细胞中表达细胞数 >= 3 的基因（单细胞常规口径，滤掉仅在
+# 一两个细胞里出现的噪声基因）。
+#
+# 自校验内建：输入契约（obs/var/uns 必备列与键）、computed 列与矩阵重算
+# 一致、保留非空、每组每供体至少 1 个保留细胞、保留集合 == singlet 且过阈值、
+# 输出矩阵无负值、obs 列不丢。任一不过非零退出，让台账记 failed。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入分流：只要一个 h5ad（步骤 1 产物）。模式前后都带 *：拿到的是绝对
+# 路径，前缀匹配永远不中（坑 #99）。
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+h5ad_file=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *.h5ad) h5ad_file="$path" ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad，即步骤 1 ingest_counts 产物）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$h5ad_file" ]; then
+  echo "缺少必需输入：scrna_counts.h5ad（步骤 1 产物）未提供" >&2
+  exit 2
+fi
+if [ ! -f "$h5ad_file" ]; then
+  echo "输入文件不存在: $h5ad_file"
+  exit 2
+fi
+
+echo "step_executed=qc_cells"
+echo "bioanalys_seed=${seed}"
+echo "input_h5ad=${h5ad_file}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+H5AD_FILE="$h5ad_file" BIOANALYS_SEED="$seed" \
+python3 - <<'PYSCRIPT'
+import hashlib
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+import anndata as ad
+
+# pandas 3 与 2 的 infer_string 默认值不同，会导致 anndata 0.13 写 obs 字符串列时
+# 因 nullable strings 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+
+
+def fail(message):
+    sys.stderr.write("qc_cells 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+# 阈值（论文口径，固定）。改阈值 = 新分析项目，不做热切换。
+NCOUNT_MIN = 50000      # nCount_RNA > 50000
+NFEATURE_MIN = 1500     # nFeature_RNA > 1500
+ERCC_MAX = 0.15         # ERCC 比例 < 15%
+GENE_MIN_CELLS = 3      # 基因在保留细胞中表达细胞数下限
+
+h5ad_file = os.environ["H5AD_FILE"]
+seed = os.environ["BIOANALYS_SEED"]
+
+adata = ad.read_h5ad(h5ad_file)
+log("loaded cells=%d genes=%d" % adata.shape)
+
+# --- 1. 输入契约校验：必须是步骤 1 产物，列/键不齐即失败（防喂错文件）---
+required_obs = ["donor", "diagnosis", "region", "group", "class", "plate", "well",
+                "ncount_computed", "nfeature_computed", "ercc_fraction_computed",
+                "celltype_paper", "seurat_cluster_paper"]
+missing_obs = [col for col in required_obs if col not in adata.obs.columns]
+if missing_obs:
+    fail("输入 h5ad 缺少 obs 列 %s（不是 ingest_counts 产物？）" % missing_obs)
+if "ercc" not in adata.var.columns:
+    fail("输入 h5ad 缺少 var['ercc']（不是 ingest_counts 产物？）")
+required_uns = ["region_to_group", "seed", "source_counts_tar", "source_gpl_soft", "grouping_check"]
+missing_uns = [key for key in required_uns if key not in adata.uns]
+if missing_uns:
+    fail("输入 h5ad 缺少 uns 键 %s（不是 ingest_counts 产物？）" % missing_uns)
+
+X = adata.X.tocsr()
+ercc_mask = adata.var["ercc"].to_numpy(dtype=bool)
+
+# --- 2. 每细胞指标（从矩阵重算，作为判定唯一口径）---
+ncount_total = np.asarray(X.sum(axis=1)).ravel().astype(np.int64)
+nfeature_total = np.asarray((X > 0).sum(axis=1)).ravel().astype(np.int64)
+ercc_count = np.asarray(X[:, ercc_mask].sum(axis=1)).ravel().astype(np.int64)
+ercc_nnz = np.asarray((X[:, ercc_mask] > 0).sum(axis=1)).ravel().astype(np.int64)
+ercc_frac = np.where(ncount_total > 0, ercc_count / np.maximum(ncount_total, 1), 0.0)
+
+# 与 ingest 落盘的 computed 列对账（口径漂移即失败，防上下游规则不一致）
+ncount_meta_side = adata.obs["ncount_computed"].to_numpy(dtype=np.int64)
+nfeature_meta_side = adata.obs["nfeature_computed"].to_numpy(dtype=np.int64)
+if not np.array_equal(ncount_total, ncount_meta_side + ercc_count):
+    fail("ncount 口径不一致：矩阵重算总量 != ncount_computed + ercc_count")
+if not np.array_equal(nfeature_total, nfeature_meta_side + ercc_nnz):
+    fail("nfeature 口径不一致：矩阵重算检出数 != nfeature_computed + ercc 检出数")
+if not np.allclose(ercc_frac, adata.obs["ercc_fraction_computed"].to_numpy(dtype=float), rtol=1e-6, atol=1e-9):
+    fail("ercc_fraction 口径不一致：矩阵重算 != ercc_fraction_computed")
+log("computed 列口径一致 OK")
+
+# --- 3. 阈值判定（严格大于/小于，边界值判失败，与论文 > < 口径一致）---
+fail_ncount = ncount_total <= NCOUNT_MIN
+fail_nfeature = nfeature_total <= NFEATURE_MIN
+fail_ercc = ercc_frac >= ERCC_MAX
+qc_pass = ~(fail_ncount | fail_nfeature | fail_ercc)
+is_doublet = (adata.obs["class"] == "doublet").to_numpy()
+kept = qc_pass & ~is_doublet
+log("fail_ncount=%d fail_nfeature=%d fail_ercc=%d qc_pass=%d doublet=%d kept=%d"
+    % (fail_ncount.sum(), fail_nfeature.sum(), fail_ercc.sum(), qc_pass.sum(),
+       is_doublet.sum(), kept.sum()))
+
+
+def reason_of(idx):
+    parts = []
+    if is_doublet[idx]:
+        parts.append("doublet")
+    if fail_ncount[idx]:
+        parts.append("ncount<=%d" % NCOUNT_MIN)
+    if fail_nfeature[idx]:
+        parts.append("nfeature<=%d" % NFEATURE_MIN)
+    if fail_ercc[idx]:
+        parts.append("ercc>=%.2f" % ERCC_MAX)
+    return "+".join(parts) if parts else ""
+
+
+fail_reasons = [reason_of(i) for i in range(adata.shape[0])]
+
+# --- 4. 基因过滤：保留细胞中表达细胞数 >= GENE_MIN_CELLS ---
+gene_ncells = np.asarray((X[kept] > 0).sum(axis=0)).ravel()
+gene_keep = gene_ncells >= GENE_MIN_CELLS
+log("gene_filter min_cells>=%d kept=%d dropped=%d (ercc kept=%d)"
+    % (GENE_MIN_CELLS, gene_keep.sum(), (~gene_keep).sum(), (gene_keep & ercc_mask).sum()))
+
+# --- 5. 自校验 ---
+if kept.sum() == 0:
+    fail("QC 后无细胞保留")
+if gene_keep.sum() == 0:
+    fail("QC 后无基因保留")
+for col in ["group", "donor"]:
+    for value, count in adata.obs[col].value_counts().items():
+        kept_in_value = int(((adata.obs[col] == value).to_numpy() & kept).sum())
+        if kept_in_value == 0:
+            fail("%s=%s 的细胞被全部滤掉（%d 个），不允许静默清空分组" % (col, value, count))
+if not np.array_equal(kept, (adata.obs["class"] != "doublet").to_numpy() & qc_pass):
+    fail("保留集合 != singlet 且过阈值（逻辑不一致）")
+kept_matrix = X[kept][:, gene_keep]
+if kept_matrix.data.size and kept_matrix.data.min() < 0:
+    fail("输出矩阵存在负计数")
+log("self_check 保留集合/分组非空/无负值 OK")
+
+# --- 6. 落盘 ---
+out = adata[kept, gene_keep].copy()
+out.var["n_cells_expressing"] = gene_ncells[gene_keep]
+out.uns["qc_thresholds"] = {
+    "ncount_min": NCOUNT_MIN,
+    "nfeature_min": NFEATURE_MIN,
+    "ercc_max": ERCC_MAX,
+    "gene_min_cells": GENE_MIN_CELLS,
+}
+out.uns["qc_doublet_disposition"] = "excluded_from_main_matrix"
+out.uns["qc_source_h5ad"] = h5ad_file
+out.uns["seed"] = int(seed)
+out.write_h5ad("scrna_qc.h5ad")
+
+metrics = pd.DataFrame({
+    "gsm": adata.obs.index.to_numpy(),
+    "donor": adata.obs["donor"].to_numpy(),
+    "diagnosis": adata.obs["diagnosis"].to_numpy(),
+    "region": adata.obs["region"].to_numpy(),
+    "group": adata.obs["group"].to_numpy(),
+    "class": adata.obs["class"].to_numpy(),
+    "plate": adata.obs["plate"].to_numpy(),
+    "well": adata.obs["well"].to_numpy(),
+    "celltype_paper": adata.obs["celltype_paper"].to_numpy(),
+    "ncount_total": ncount_total,
+    "nfeature_total": nfeature_total,
+    "ercc_count": ercc_count,
+    "ercc_fraction": np.round(ercc_frac, 6),
+    "fail_ncount": fail_ncount,
+    "fail_nfeature": fail_nfeature,
+    "fail_ercc": fail_ercc,
+    "qc_pass": qc_pass,
+    "is_doublet": is_doublet,
+    "kept": kept,
+    "fail_reason": fail_reasons,
+})
+metrics.to_csv("qc_cell_metrics.tsv", sep="\t", index=False)
+
+kept_df = pd.DataFrame({
+    "group": adata.obs["group"].to_numpy()[kept],
+    "donor": adata.obs["donor"].to_numpy()[kept],
+    "ncount": ncount_total[kept],
+    "nfeature": nfeature_total[kept],
+    "ercc_frac": ercc_frac[kept],
+})
+
+def count_dict(series):
+    return {str(name): int(count) for name, count in series.value_counts().items()}
+
+
+report_lines = [
+    "step=qc_cells",
+    "seed=%s" % seed,
+    "input_h5ad=%s" % h5ad_file,
+    "thresholds=nCount_RNA>%d, nFeature_RNA>%d, ERCC<%.2f, gene_min_cells>=%d（论文口径，固定不随结果调整）"
+    % (NCOUNT_MIN, NFEATURE_MIN, ERCC_MAX, GENE_MIN_CELLS),
+    "cells_before=%d genes_before=%d (ercc=%d)" % (adata.shape[0], adata.shape[1], int(ercc_mask.sum())),
+    "fail_ncount=%d fail_nfeature=%d fail_ercc=%d qc_pass=%d"
+    % (fail_ncount.sum(), fail_nfeature.sum(), fail_ercc.sum(), qc_pass.sum()),
+    "doublet_disposition=排除出主分析矩阵（CIM-seq 混合图谱，celltype_paper=NA；全部细胞指标与去留原因见 qc_cell_metrics.tsv）",
+    "doublet_total=%d doublet_also_ercc_fail=%d" % (is_doublet.sum(), int((is_doublet & fail_ercc).sum())),
+    "cells_kept=%d (singlet 且过阈值)" % int(kept.sum()),
+    "gene_filter=min_cells>=%d kept=%d dropped=%d (ercc kept=%d)"
+    % (GENE_MIN_CELLS, int(gene_keep.sum()), int((~gene_keep).sum()), int((gene_keep & ercc_mask).sum())),
+    "cells_after=%d genes_after=%d" % out.shape,
+    "kept_by_group=%s" % count_dict(kept_df["group"]),
+    "kept_by_donor=%s" % count_dict(kept_df["donor"]),
+    "kept_median_ncount=%.0f kept_median_nfeature=%.0f kept_median_ercc=%.4f"
+    % (kept_df["ncount"].median(), kept_df["nfeature"].median(), kept_df["ercc_frac"].median()),
+    "note=nCount/nFeature 阈值 0 失败：deposited 数据 min 53020/1525 已在阈值上（作者预过滤）；ERCC 超限为实际剔除项",
+    "elapsed_seconds=%.0f" % (time.time() - START),
+    "outputs=scrna_qc.h5ad, qc_cell_metrics.tsv, qc_report.txt",
+]
+with open("qc_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+for _artifact in sorted(os.listdir(".")):
+    if not os.path.isfile(_artifact):
+        continue
+    if _artifact == 'qc_report.txt':
+        continue
+    with open(_artifact, "rb") as _fh:
+        _digest = hashlib.sha256(_fh.read()).hexdigest()
+    with open('qc_report.txt', "a", encoding="utf-8") as _fh:
+        _fh.write("%s_sha256=%s\n" % (_artifact, _digest))
+log("qc_cells_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "$PWD" "qc_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

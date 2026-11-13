@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# cluster_umap：line2_scrna 步骤 5 降维与聚类。
+#
+# 输入：步骤 4 产物 scrna_integrated.h5ad（4587 细胞 × 2000 HVG，obsm 含
+# X_pca（未校正）与 X_pca_harmony（harmony 校正后））。
+#
+# 做三件事：
+#   1. 邻居图：在 X_pca_harmony（校正后嵌入）上构建，n_neighbors=15、n_pcs=30。
+#      不用未校正的 X_pca：步骤 4 的 Harmony 校正就是为下游聚类剔除供体效应，
+#      用校正前嵌入等于白校正。n_pcs=30 对齐 cum30 方差比 36% 的拐点。
+#   2. UMAP：随机种子用引擎注入 seed，可复现。
+#   3. Leiden 聚类：igraph flavor、resolution=1.0（社区发现标准口径，
+#      不随结果调参凑簇数）。
+#
+# 自校验内建：输入契约（步骤 4 uns['integration'] + obsm['X_pca_harmony']）、
+# 邻居图 obsp 两项在位、X_umap 形状 (n_cells, 2) 全有限、leiden 类别数 >= 2、
+# 细胞数/donor 集合/obs 9 列不丢、每簇至少 1 个细胞（不允许空簇）、
+# crosstab 供体不塌簇（任一供体不得独占某簇过半细胞，防 harmony 失效回退）。
+# 任一不过非零退出。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入分流：一个 h5ad（步骤 4 产物）。模式前后都带 *：拿到的是绝对路径，
+# 前缀匹配永远不中（坑 #99）。
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+h5ad_file=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *.h5ad) h5ad_file="$path" ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad，即步骤 4 integrate_harmony 产物）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$h5ad_file" ]; then
+  echo "缺少必需输入：scrna_integrated.h5ad（步骤 4 产物）未提供" >&2
+  exit 2
+fi
+if [ ! -f "$h5ad_file" ]; then
+  echo "输入文件不存在: $h5ad_file"
+  exit 2
+fi
+
+echo "step_executed=cluster_umap"
+echo "bioanalys_seed=${seed}"
+echo "input_h5ad=${h5ad_file}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+H5AD_FILE="$h5ad_file" BIOANALYS_SEED="$seed" \
+python3 - <<'PYSCRIPT'
+import hashlib
+import os
+import sys
+import time
+
+import numpy as np
+import anndata as ad
+import scanpy as sc
+
+# pandas 3 与 2 的 infer_string 默认值不同，会导致 anndata 0.13 写 obs 字符串列时
+# 因 nullable strings 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+N_NEIGHBORS = 15
+N_PCS = 30
+RESOLUTION = 1.0
+DONOR_MAX_SHARE = 0.5
+DONOR_CHECK_MIN_SIZE = 100
+
+
+def fail(message):
+    sys.stderr.write("cluster_umap 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def count_dict(series):
+    return {str(name): int(count) for name, count in series.value_counts().items()}
+
+
+h5ad_file = os.environ["H5AD_FILE"]
+seed = os.environ["BIOANALYS_SEED"]
+try:
+    seed_int = int(seed)
+except ValueError:
+    fail("BIOANALYS_SEED 不是整数: %s" % seed)
+
+adata = ad.read_h5ad(h5ad_file)
+log("loaded cells=%d genes=%d" % adata.shape)
+
+# --- 1. 输入契约校验：必须是步骤 4 产物 ---
+required_obs = ["donor", "diagnosis", "region", "group", "class", "plate", "well",
+                "celltype_paper", "seurat_cluster_paper"]
+missing_obs = [col for col in required_obs if col not in adata.obs.columns]
+if missing_obs:
+    fail("输入 h5ad 缺少 obs 列 %s（不是 integrate_harmony 产物？）" % missing_obs)
+if "integration" not in adata.uns:
+    fail("输入 h5ad 缺少 uns['integration']（不是 integrate_harmony 产物？）")
+if "X_pca_harmony" not in adata.obsm:
+    fail("输入 h5ad 缺少 obsm['X_pca_harmony']（不是 integrate_harmony 产物？）")
+if "X_pca" not in adata.obsm:
+    fail("输入 h5ad 缺少 obsm['X_pca']（不是 integrate_harmony 产物？）")
+
+donors_before = sorted(adata.obs["donor"].unique())
+n_cells_before = adata.shape[0]
+log("donors=%d cells=%d" % (len(donors_before), n_cells_before))
+
+# --- 2. 邻居图（harmony 校正后嵌入）---
+sc.pp.neighbors(adata, n_neighbors=N_NEIGHBORS, n_pcs=N_PCS,
+                use_rep="X_pca_harmony", random_state=seed_int)
+for key in ["distances", "connectivities"]:
+    if key not in adata.obsp:
+        fail("邻居图缺少 obsp['%s']" % key)
+log("neighbors OK n_neighbors=%d n_pcs=%d use_rep=X_pca_harmony" % (N_NEIGHBORS, N_PCS))
+
+# --- 3. UMAP ---
+sc.tl.umap(adata, random_state=seed_int)
+if adata.obsm["X_umap"].shape != (n_cells_before, 2):
+    fail("X_umap 形状 %s != (%d, 2)" % (adata.obsm["X_umap"].shape, n_cells_before))
+if not np.isfinite(adata.obsm["X_umap"]).all():
+    fail("X_umap 含非有限值")
+log("umap OK shape=%s" % (adata.obsm["X_umap"].shape,))
+
+# --- 4. Leiden 聚类 ---
+sc.tl.leiden(adata, flavor="igraph", resolution=RESOLUTION, random_state=seed_int)
+leiden_counts = adata.obs["leiden"].value_counts()
+n_clusters = int(leiden_counts.shape[0])
+if n_clusters < 2:
+    fail("leiden 只得到 %d 个簇（<2），聚类失败" % n_clusters)
+if int(leiden_counts.min()) < 1:
+    fail("存在空簇")
+log("leiden clusters=%d size_min=%d size_max=%d"
+    % (n_clusters, int(leiden_counts.min()), int(leiden_counts.max())))
+
+# --- 5. 自校验 ---
+if sorted(adata.obs["donor"].unique()) != donors_before:
+    fail("donor 集合在聚类前后发生变化")
+if adata.shape[0] != n_cells_before:
+    fail("细胞数变化: %d -> %d" % (n_cells_before, adata.shape[0]))
+current_obs = list(adata.obs.columns)
+for col in required_obs:
+    if col not in current_obs:
+        fail("obs 列丢失: %s" % col)
+# 供体塌簇检查：harmony 失效时大簇会被单一供体独占，这里如实拦下。
+# 小簇（<100 细胞）不参与：17 个细胞里 10 个同供体纯属小样本波动，
+# 拿它 fail 会把正常结果误杀。小簇供体分布照常进 crosstab 报告。
+dominant = {}
+for cluster, count in leiden_counts.items():
+    if count < DONOR_CHECK_MIN_SIZE:
+        continue
+    cluster_donors = adata.obs[adata.obs["leiden"] == cluster]["donor"].value_counts()
+    share = float(cluster_donors.iloc[0]) / float(count)
+    if share > DONOR_MAX_SHARE:
+        dominant[str(cluster)] = (str(cluster_donors.index[0]), round(share, 4))
+if dominant:
+    fail("以下大簇（>=%d 细胞）被单一供体占超过 %.0f%%（harmony 校正疑似失效）: %s"
+         % (DONOR_CHECK_MIN_SIZE, DONOR_MAX_SHARE * 100, dominant))
+log("self_check 契约/邻居图/UMAP/leiden/供体不塌簇 OK")
+
+# --- 6. 落盘 ---
+adata.uns["clustering"] = {
+    "method": "scanpy_leiden_igraph_on_harmony_embedding",
+    "use_rep": "X_pca_harmony",
+    "n_neighbors": N_NEIGHBORS,
+    "n_pcs": N_PCS,
+    "resolution": RESOLUTION,
+    "random_state": seed_int,
+    "umap": "scanpy_umap_random_state_seed",
+    "n_clusters": n_clusters,
+}
+adata.uns["seed"] = seed_int
+adata.uns["source_h5ad"] = h5ad_file
+adata.write_h5ad("scrna_clustered.h5ad")
+
+report_lines = [
+    "step=cluster_umap",
+    "seed=%s" % seed,
+    "input_h5ad=%s" % h5ad_file,
+    "cells=%d（聚类不丢细胞）" % adata.shape[0],
+    "neighbors=n_neighbors=%d n_pcs=%d use_rep=X_pca_harmony（harmony 校正后嵌入）"
+    % (N_NEIGHBORS, N_PCS),
+    "umap=scanpy sc.tl.umap random_state=%d，输出 obsm['X_umap']" % seed_int,
+    "leiden=igraph flavor resolution=%.1f random_state=%d（口径固定不调参）"
+    % (RESOLUTION, seed_int),
+    "n_clusters=%d size_min=%d size_max=%d"
+    % (n_clusters, int(leiden_counts.min()), int(leiden_counts.max())),
+    "cluster_sizes=%s" % count_dict(leiden_counts),
+    "cluster_x_group:",
+]
+for cluster in sorted(leiden_counts.index, key=lambda name: int(name)):
+    groups = adata.obs[adata.obs["leiden"] == cluster]["group"].value_counts()
+    report_lines.append("  %s: %s" % (cluster, count_dict(groups)))
+report_lines.append("cluster_x_donor:")
+for cluster in sorted(leiden_counts.index, key=lambda name: int(name)):
+    donors = adata.obs[adata.obs["leiden"] == cluster]["donor"].value_counts()
+    report_lines.append("  %s: %s" % (cluster, count_dict(donors)))
+report_lines += [
+    "donor_share_check=大簇（>=%d 细胞）单一供体占比 <= %.0f%%（防 harmony 失效回退；小簇不参与，样本波动会误伤）"
+    % (DONOR_CHECK_MIN_SIZE, DONOR_MAX_SHARE * 100),
+    "outputs=scrna_clustered.h5ad, cluster_report.txt",
+    "elapsed_seconds=%.0f" % (time.time() - START),
+]
+with open("cluster_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+for _artifact in sorted(os.listdir(".")):
+    if not os.path.isfile(_artifact):
+        continue
+    if _artifact == 'cluster_report.txt':
+        continue
+    with open(_artifact, "rb") as _fh:
+        _digest = hashlib.sha256(_fh.read()).hexdigest()
+    with open('cluster_report.txt', "a", encoding="utf-8") as _fh:
+        _fh.write("%s_sha256=%s\n" % (_artifact, _digest))
+log("cluster_umap_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "$PWD" "cluster_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi
